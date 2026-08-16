@@ -6,7 +6,12 @@
     "watchdog": "tsx src/watchdog.ts",
     "chat": "tsx src/chat.ts",
     "sniper": "tsx src/sniper.ts",
-    "scan": "tsx src/scan-historical.ts"
+    "scan": "tsx src/scan-historical.ts",
+    "twitter-bot": "tsx src/twitter-bot.ts",
+    "generate-token": "tsx src/generate-token.ts",
+    "server": "tsx src/server.ts",
+    "tunnel": "lt --port 8080",
+    "dev-server": "tsx src/server.ts"
   },
   "keywords": [],
   "author": "",
@@ -14,6 +19,9 @@
   "type": "module",
   "dependencies": {
     "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "localtunnel": "^2.0.2",
+    "twitter-api-v2": "^1.19.0",
     "viem": "^2.55.16"
   },
   "devDependencies": {

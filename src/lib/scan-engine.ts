@@ -205,6 +205,18 @@ export interface ScanResult {
   skipped: number;
 }
 
+/** Optional hooks passed to scanBlockRange */
+export interface ScanOptions {
+  /**
+   * Called once per token immediately after the rug-check report is printed.
+   * Errors thrown here are caught and logged — they never abort the scan loop.
+   */
+  onResult?: (result: import("./rugcheck-types.js").RugCheckResult, meta: {
+    name: string; symbol: string; decimals: number;
+    totalSupply: bigint; totalSupplyFormatted: string;
+  }) => Promise<void>;
+}
+
 /** Brief pause to be gentle on the RPC */
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -220,7 +232,8 @@ function sleep(ms: number): Promise<void> {
 export async function scanBlockRange(
   client: AnyClient,
   fromBlock: bigint,
-  toBlock: bigint
+  toBlock: bigint,
+  opts?: ScanOptions
 ): Promise<ScanResult> {
   const totalBlocks = toBlock - fromBlock + 1n;
   const numChunks   = Number((totalBlocks + CHUNK_SIZE - 1n) / CHUNK_SIZE);
@@ -339,6 +352,16 @@ export async function scanBlockRange(
 
     console.log(formatRugReport(rugResult, meta));
     console.log();
+
+    // Invoke the optional callback (e.g. tweet the result) — errors are
+    // isolated so one bad tweet never aborts the rest of the scan.
+    if (opts?.onResult) {
+      try {
+        await opts.onResult(rugResult, meta);
+      } catch (err) {
+        console.error(`  [scan-engine] onResult callback failed for ${newToken}: ${err}`);
+      }
+    }
 
     summary.push({
       name:    meta.name,

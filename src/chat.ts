@@ -2,13 +2,9 @@
  * chat.ts — interactive on-chain rug-check chat.
  *
  * The user types a message. If it contains a token address (0x…40 hex chars),
- * the agent:
- *   1. Resolves the token's Uniswap V3 pool via resolveTokenPool()
- *   2. Fetches ERC-20 metadata
- *   3. Finds the exact deploy block via binary search on eth_getCode (~26 calls)
- *   4. Runs the full LLM rug-check via runRugCheckLLM(), passing the user's
- *      message as userQuestion so Gemini answers it directly in the report
- *   5. Prints formatRugReport() — which includes the "Your Question" block
+ * the agent runs the full pipeline via answerTokenQuestion() and prints the
+ * formatted report (which includes the "Your Question" block when a question
+ * was asked).
  *
  * If the message has no address, a helpful prompt is printed instead.
  *
@@ -16,11 +12,10 @@
  */
 import "dotenv/config";
 import * as readline from "readline";
-import { createPublicClient, http, type Address } from "viem";
+import { createPublicClient, http } from "viem";
 import { base } from "viem/chains";
-import { fetchTokenMetadata } from "./lib/erc20.js";
-import { resolveTokenPool, findContractDeployBlock } from "./lib/scan-engine.js";
-import { runRugCheckLLM, formatRugReport } from "./lib/rugcheck.js";
+import { extractAddress, answerTokenQuestion } from "./lib/rugcheck-handler.js";
+import { formatRugReport } from "./lib/rugcheck.js";
 
 // ─── Env validation ───────────────────────────────────────────────────────────
 
@@ -43,14 +38,6 @@ const client = createPublicClient({
   transport: http(RPC_URL, { retryCount: 3, retryDelay: 1500 }),
 });
 
-// ─── Address extractor ────────────────────────────────────────────────────────
-
-/** Returns the first 0x-prefixed 40-hex-char address found in a string. */
-function extractAddress(text: string): Address | null {
-  const match = text.match(/0x[a-fA-F0-9]{40}/);
-  return match ? (match[0] as Address) : null;
-}
-
 // ─── Per-message handler ──────────────────────────────────────────────────────
 
 async function handleMessage(userInput: string): Promise<void> {
@@ -65,55 +52,17 @@ async function handleMessage(userInput: string): Promise<void> {
   }
 
   console.log(`\n  Token address detected: ${tokenAddress}`);
-
-  // ── 1. Resolve pool ───────────────────────────────────────────────────────
   console.log("  Resolving Uniswap V3 pool…");
-  const resolved = await resolveTokenPool(client as any, tokenAddress);
-  if (!resolved) {
-    console.log(
-      `\n  ⚠️  No Uniswap V3 pool found for ${tokenAddress} on Base.\n` +
-      `  The token may not have launched yet, or it uses a non-standard DEX.\n`
-    );
-    return;
-  }
-  console.log(`  Pool found: ${resolved.poolAddress}  (paired with ${resolved.pairedLabel})`);
-
-  // ── 2. Fetch ERC-20 metadata ──────────────────────────────────────────────
-  console.log("  Fetching token metadata…");
-  let meta;
-  try {
-    meta = await fetchTokenMetadata(client as any, tokenAddress);
-  } catch (err) {
-    console.error(`\n  [chat] metadata fetch failed: ${err}\n`);
-    return;
-  }
-  console.log(`  Token: ${meta.name} (${meta.symbol})`);
-
-  // ── 3. Find exact deploy block via binary search on eth_getCode ──────────
-  console.log("  Resolving deploy block (binary search on bytecode)…");
-  const deployBlock = await findContractDeployBlock(client as any, tokenAddress);
-  console.log(`  Deploy block: ${deployBlock.toLocaleString()}`);
-
-  // ── 4. Run LLM rug check with the user's question ─────────────────────────
   console.log("  Running on-chain evidence collection + LLM rug check…\n");
-  let rugResult;
-  try {
-    rugResult = await runRugCheckLLM(
-      client as any,
-      tokenAddress,
-      resolved.poolAddress,
-      resolved.pairedLabel,
-      deployBlock,
-      meta,
-      { userQuestion: userInput }
-    );
-  } catch (err) {
-    console.error(`\n  [chat] rug check failed: ${err}\n`);
+
+  const outcome = await answerTokenQuestion(client as any, tokenAddress, userInput);
+
+  if ("error" in outcome) {
+    console.log(`\n  ⚠️  ${outcome.error}\n`);
     return;
   }
 
-  // ── 5. Print full report (includes "Your Question" block if answer present)
-  console.log(formatRugReport(rugResult, meta));
+  console.log(formatRugReport(outcome.result, outcome.meta));
   console.log();
 }
 

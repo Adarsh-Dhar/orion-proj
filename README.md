@@ -5,6 +5,7 @@ A Telegram bot that monitors new token launches on Base, runs AI-powered rug che
 | Tool | What it does | Command |
 |---|---|---|
 | **Telegram Bot** | Scans new Uniswap V3 pools on Base, runs LLM rug checks, and posts alerts to Telegram | `npm run telegram-bot` |
+| **RugHound** | Monitors PoolCreated events in real-time for new token launches | `npm run rughound` |
 | **Chat** | Terminal Q&A loop backed by Gemini, primed as a DeFi / Base blockchain assistant | `npm run chat` |
 | **Sniper** | Historical scanner for analyzing past token launches | `npm run sniper` |
 | **Scan** | Scan a specific block range for token launches | `npm run scan` |
@@ -78,6 +79,16 @@ Starts the Telegram bot that:
 
 The bot will continue running until stopped with **Ctrl+C**.
 
+### RugHound
+
+```bash
+npm run rughound
+```
+
+Monitors Uniswap V3 PoolCreated events in real-time and logs new token launches as they happen. This is useful for live monitoring without the Telegram integration.
+
+The monitor will continue running until stopped with **Ctrl+C**.
+
 ### Chat
 
 ```bash
@@ -105,6 +116,7 @@ Press **Ctrl+C** to exit.
 src/
   telegram-bot.ts    # Entry point: Telegram bot with sniper + chat
   chat.ts            # Entry point: Terminal chat loop
+  rughound.ts       # Entry point: Token monitoring via PoolCreated events
   sniper.ts          # Historical sniper scanner
   scan-historical.ts # Block range scanner
   lib/

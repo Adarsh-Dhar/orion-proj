@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "",
   "scripts": {
-    "rughound": "tsx src/watchdog.ts",
+    "rughound": "tsx src/rughound.ts",
     "chat": "tsx src/chat.ts",
     "sniper": "tsx src/sniper.ts",
     "scan": "tsx src/scan-historical.ts",

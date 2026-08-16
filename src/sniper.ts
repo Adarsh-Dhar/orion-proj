@@ -108,7 +108,25 @@ function identifyTokens(
  */
 async function scanWindow(runNumber: number): Promise<void> {
   const scanTime = new Date().toISOString();
-  const toBlock = await client.getBlockNumber();
+
+  // ── Fetch current block number with retry ───────────────────────────────
+  // getBlockNumber() is the first RPC call and the most likely to hit a
+  // transient timeout. Retry once after a short delay before giving up.
+  let toBlock: bigint;
+  try {
+    toBlock = await client.getBlockNumber();
+  } catch {
+    console.warn(`[sniper] scan #${runNumber}: getBlockNumber() failed, retrying in 3s…`);
+    await new Promise((r) => setTimeout(r, 3_000));
+    try {
+      toBlock = await client.getBlockNumber();
+    } catch (err) {
+      console.error(`[sniper] scan #${runNumber}: getBlockNumber() failed twice — skipping scan, will retry next interval.`);
+      console.error(`  Reason: ${err}`);
+      // Do NOT advance lastScannedBlock — next run retries the same range
+      return;
+    }
+  }
 
   // First run → bootstrap with fixed lookback.
   // All subsequent runs → pick up exactly where we left off.

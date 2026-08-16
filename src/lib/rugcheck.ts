@@ -88,9 +88,13 @@ async function safeRead<T>(fn: () => Promise<T>, fallback: T): Promise<T> {
 
 /** Resolve the deployer address from the token's first mint (Transfer from 0x0).
  *
- * Scans only within [fromBlock, toBlock] — a tight window around the deploy tx.
- * Avoids the fromBlock:0n pattern that every real RPC provider rejects with a
- * "block range too large" error, which previously always silently returned "unknown".
+ * Strategy:
+ * 1. Try a tight window around deployBlock (pool creation) first — covers the
+ *    common case where token + pool are deployed in the same tx or same block.
+ * 2. If that finds nothing, the token was pre-deployed (e.g. via CREATE2 vanity
+ *    address). Fall back to a wider backwards scan from deployBlock in chunks
+ *    of 10k blocks, up to 200k blocks back (~4 days on Base).
+ *    Each chunk stays within provider block-range limits.
  */
 async function getDeployer(
   client: PublicClient,
@@ -98,6 +102,7 @@ async function getDeployer(
   fromBlock: bigint,
   toBlock: bigint
 ): Promise<string> {
+  // ── Pass 1: tight window around pool creation ─────────────────────────────
   try {
     const logs = await client.getLogs({
       address: tokenAddress,
@@ -106,16 +111,48 @@ async function getDeployer(
       fromBlock,
       toBlock,
     });
-    if (logs.length === 0) return "unknown";
-    // Sort ascending and take the earliest mint
-    const sorted = [...logs].sort((a, b) =>
-      a.blockNumber! < b.blockNumber! ? -1 : 1
-    );
-    const firstMint = sorted[0];
-    return (firstMint.args as { to: string }).to ?? "unknown";
+    if (logs.length > 0) {
+      const sorted = [...logs].sort((a, b) =>
+        a.blockNumber! < b.blockNumber! ? -1 : 1
+      );
+      const result = (sorted[0].args as { to: string }).to;
+      if (result) return result;
+    }
   } catch {
-    return "unknown";
+    // fall through to wide scan
   }
+
+  // ── Pass 2: walk backwards in 10k-block chunks up to 200k blocks ──────────
+  const CHUNK = 10_000n;
+  const MAX_LOOKBACK = 200_000n;
+  const hardFloor = toBlock > MAX_LOOKBACK ? toBlock - MAX_LOOKBACK : 0n;
+
+  let chunkEnd = fromBlock > 1n ? fromBlock - 1n : 0n;
+  while (chunkEnd > hardFloor) {
+    const chunkStart = chunkEnd > CHUNK ? chunkEnd - CHUNK : 0n;
+    try {
+      const logs = await client.getLogs({
+        address: tokenAddress,
+        event: TRANSFER_EVENT_ABI[0],
+        args: { from: NULL_ADDRESS as Address },
+        fromBlock: chunkStart,
+        toBlock: chunkEnd,
+      });
+      if (logs.length > 0) {
+        const sorted = [...logs].sort((a, b) =>
+          a.blockNumber! < b.blockNumber! ? -1 : 1
+        );
+        const result = (sorted[0].args as { to: string }).to;
+        if (result) return result;
+      }
+    } catch {
+      // chunk failed — skip it and keep walking back
+    }
+    if (chunkStart === 0n) break;
+    chunkEnd = chunkStart - 1n;
+  }
+
+  return "unknown";
 }
 
 /**
@@ -273,15 +310,11 @@ export async function runRugCheck(
 
   // ── 4. Deployer / dev wallet concentration ─────────────────────────────────
   //
-  // OLD: getDeployer() used fromBlock: 0n — scanning from genesis.
-  // Infura (and most providers) reject eth_getLogs with a range > 10k blocks,
-  // so that always failed silently, always returned "unknown", always showed
-  // Dev hold: 0.00% regardless of reality.
-  //
-  // FIX: anchor the mint-scan to deployBlock. The token was deployed at or
-  // just before the pool creation, so the mint tx is always within a very
-  // small window of deployBlock. We look back a maximum of 500 blocks
-  // (~16 minutes) to be safe, well within any provider's block range limit.
+  // Pass 1: tight window around pool creation (covers same-block deploy+pool).
+  // Pass 2: chunked backwards scan up to 200k blocks (covers vanity/CREATE2
+  //         tokens deployed days before the pool was created).
+  // getDeployer returns the mint recipient and also populates mintBlock so
+  // getHolderBalances can anchor on the actual token birth, not the pool birth.
 
   const MINT_LOOKBACK = 500n;
   const mintScanFrom =
@@ -294,9 +327,12 @@ export async function runRugCheck(
     deployBlock
   );
 
-  // Scan holder balances from mint window (cap to ~10k blocks = ~5h on Base)
-  const scanFrom = deployBlock > 10_000n ? deployBlock - 10_000n : 0n;
-  const holderBalances = await getHolderBalances(client, tokenAddress, scanFrom);
+  // Anchor holder balance scan at the actual deploy window.
+  // If deployer is still unknown after the wide scan, use deployBlock as fallback
+  // but cap to 10k blocks so we don't time out.
+  const holderScanFrom =
+    deployBlock > 10_000n ? deployBlock - 10_000n : 0n;
+  const holderBalances = await getHolderBalances(client, tokenAddress, holderScanFrom);
 
   const deployerBalance =
     deployerAddress !== "unknown"

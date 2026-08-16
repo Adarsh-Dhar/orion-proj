@@ -23,12 +23,16 @@ import {
   QUOTE_ASSET_LABELS,
 } from "./lib/constants.js";
 import { fetchTokenMetadata } from "./lib/erc20.js";
-import { runRugCheck, formatRugReport } from "./lib/rugcheck.js";
+import { runRugCheckLLM, formatRugReport } from "./lib/rugcheck.js";
 
 // ─── Env ─────────────────────────────────────────────────────────────────────
 
 if (!process.env.RPC_URL) {
   console.error("ERROR: RPC_URL is not set in .env");
+  process.exit(1);
+}
+if (!process.env.GEMINI_API_KEY) {
+  console.error("ERROR: GEMINI_API_KEY is not set in .env — required for LLM scoring");
   process.exit(1);
 }
 const RPC_URL = process.env.RPC_URL;
@@ -99,13 +103,14 @@ async function main(): Promise<void> {
   const toTs   = new Date(Number(toBlockData.timestamp)   * 1000).toISOString();
 
   console.log(`${"═".repeat(66)}`);
-  console.log(`  Historical Pool Scanner — Full Rug Check`);
+  console.log(`  Historical Pool Scanner — LLM Rug Check (Gemini)`);
   console.log(`  Network   : Base Mainnet (chain ID 8453)`);
   console.log(`  Window    : 5:00 PM – 7:00 PM IST (2026-08-16)`);
   console.log(`  Blocks    : ${FROM_BLOCK.toLocaleString()} → ${TO_BLOCK.toLocaleString()}`);
   console.log(`  Verified  : ${fromTs}  →  ${toTs}`);
   console.log(`  Total     : ${totalBlocks.toLocaleString()} blocks in ${numChunks} chunk(s) of ${CHUNK_SIZE}`);
   console.log(`  Factory   : ${UNISWAP_V3_FACTORY}  [Uniswap V3]`);
+  console.log(`  Scoring   : Gemini LLM (${process.env.GEMINI_MODEL ?? "gemini-2.0-flash-lite"})`);
   console.log(`  Started   : ${new Date().toISOString()}`);
   console.log(`${"═".repeat(66)}\n`);
 
@@ -207,10 +212,10 @@ async function main(): Promise<void> {
       continue;
     }
 
-    // Run rug check
+    // Run rug check (LLM)
     let rugResult;
     try {
-      rugResult = await runRugCheck(client as any, newToken, pool, pairedLabel, blockNum);
+      rugResult = await runRugCheckLLM(client as any, newToken, pool, pairedLabel, blockNum, meta);
     } catch (err) {
       console.error(`  [scanner] rug check failed for ${newToken}: ${err}\n`);
       console.log(`${"─".repeat(66)}\n`);
@@ -240,7 +245,8 @@ async function main(): Promise<void> {
 
   // ── Final summary table ─────────────────────────────────────────────────
   console.log(`\n${"═".repeat(66)}`);
-  console.log(`  SCAN COMPLETE — Summary`);
+  console.log(`  SCAN COMPLETE — LLM Summary`);
+  console.log(`  Scoring   : Gemini LLM (${process.env.GEMINI_MODEL ?? "gemini-2.0-flash-lite"})`);
   console.log(`  Window    : 5:00 PM – 7:00 PM IST (2026-08-16)`);
   console.log(`  Pools     : ${allLogs.length} found  |  ${processed} checked  |  ${skipped} skipped`);
   console.log(`${"═".repeat(66)}\n`);

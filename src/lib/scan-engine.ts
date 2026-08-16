@@ -3,14 +3,13 @@
  * scan-historical.ts.
  *
  * Exports:
- *   shortAddr(addr)              — "0x1234…abcd"
- *   formatFee(fee)               — "0.30%"
- *   identifyTokens(t0, t1)       — which token is new vs. quote asset
- *   resolveTokenPool(client, tokenAddress)
- *                                — find the Uniswap V3 pool for any token
- *   scanBlockRange(client, from, to)
- *                                — fetch PoolCreated → rug-check → print report
- *   printSummaryTable(summary)   — sorted verdict / score table
+ *   shortAddr(addr)                        — "0x1234…abcd"
+ *   formatFee(fee)                         — "0.30%"
+ *   identifyTokens(t0, t1)                 — which token is new vs. quote asset
+ *   findContractDeployBlock(client, addr)  — binary-search exact deploy block
+ *   resolveTokenPool(client, tokenAddress) — find the Uniswap V3 pool for any token
+ *   scanBlockRange(client, from, to)       — fetch PoolCreated → rug-check → print report
+ *   printSummaryTable(summary)             — sorted verdict / score table
  */
 
 import { createPublicClient, http, type Address, type PublicClient } from "viem";
@@ -66,6 +65,60 @@ export function identifyTokens(token0: Address, token1: Address): TokenIdentity 
   }
   // both known quote assets — ambiguous
   return { newToken: null, pairedWith: null, pairedLabel: "ambiguous" };
+}
+
+// ─── Contract deploy block finder ────────────────────────────────────────────
+
+/**
+ * Binary-search the exact block at which a contract was deployed by checking
+ * whether `eth_getCode` returns non-empty bytecode.
+ *
+ * - Before deployment: `getCode` returns "0x" (empty)
+ * - After deployment:  `getCode` returns the contract bytecode
+ *
+ * ~log2(chain_height) RPC calls ≈ 26 calls for Base (~50M blocks).
+ * Falls back to `currentBlock` if every call fails (e.g. RPC doesn't support
+ * the blockNumber param on eth_getCode — rare but possible on some providers).
+ */
+export async function findContractDeployBlock(
+  client: AnyClient,
+  address: Address
+): Promise<bigint> {
+  const currentBlock = await client.getBlockNumber();
+
+  // Fast-path: if there's no code at the current head, the contract doesn't
+  // exist yet — return current block as a best-effort sentinel.
+  let headCode: string;
+  try {
+    headCode = await client.getBytecode({ address }) ?? "0x";
+  } catch {
+    return currentBlock;
+  }
+  if (!headCode || headCode === "0x") return currentBlock;
+
+  // Binary search: find the lowest block where bytecode is non-empty.
+  let lo = 0n;
+  let hi = currentBlock;
+
+  while (lo < hi) {
+    const mid = (lo + hi) / 2n;
+    let code: string;
+    try {
+      code = await client.getBytecode({ address, blockNumber: mid }) ?? "0x";
+    } catch {
+      // If this specific block query fails, bias toward the upper half
+      // (assume not yet deployed at mid) so we don't stall the search.
+      lo = mid + 1n;
+      continue;
+    }
+    if (code && code !== "0x") {
+      hi = mid; // code exists at mid — deploy could be here or earlier
+    } else {
+      lo = mid + 1n; // no code yet — deploy must be after mid
+    }
+  }
+
+  return lo;
 }
 
 // ─── Pool resolver (used by chat.ts) ─────────────────────────────────────────

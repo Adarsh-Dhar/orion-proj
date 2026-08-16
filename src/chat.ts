@@ -5,15 +5,12 @@
  * the agent:
  *   1. Resolves the token's Uniswap V3 pool via resolveTokenPool()
  *   2. Fetches ERC-20 metadata
- *   3. Runs the full LLM rug-check via runRugCheckLLM(), passing the user's
+ *   3. Finds the exact deploy block via binary search on eth_getCode (~26 calls)
+ *   4. Runs the full LLM rug-check via runRugCheckLLM(), passing the user's
  *      message as userQuestion so Gemini answers it directly in the report
- *   4. Prints formatRugReport() — which now includes the "Your Question" block
+ *   5. Prints formatRugReport() — which includes the "Your Question" block
  *
  * If the message has no address, a helpful prompt is printed instead.
- *
- * Known limit: deployBlock is approximated as the current block number.
- * The deployer-finder in evidence.ts walks backwards up to 200k blocks
- * (~4 days on Base), so tokens older than ~4 days may not resolve a deployer.
  *
  * Required env vars: RPC_URL, GEMINI_API_KEY
  */
@@ -22,7 +19,7 @@ import * as readline from "readline";
 import { createPublicClient, http, type Address } from "viem";
 import { base } from "viem/chains";
 import { fetchTokenMetadata } from "./lib/erc20.js";
-import { resolveTokenPool } from "./lib/scan-engine.js";
+import { resolveTokenPool, findContractDeployBlock } from "./lib/scan-engine.js";
 import { runRugCheckLLM, formatRugReport } from "./lib/rugcheck.js";
 
 // ─── Env validation ───────────────────────────────────────────────────────────
@@ -92,10 +89,10 @@ async function handleMessage(userInput: string): Promise<void> {
   }
   console.log(`  Token: ${meta.name} (${meta.symbol})`);
 
-  // ── 3. Approximate deployBlock as current block ───────────────────────────
-  // The deployer-finder in evidence.ts walks backwards up to 200k blocks so
-  // this works for tokens launched in the last ~4 days on Base.
-  const deployBlock = await client.getBlockNumber();
+  // ── 3. Find exact deploy block via binary search on eth_getCode ──────────
+  console.log("  Resolving deploy block (binary search on bytecode)…");
+  const deployBlock = await findContractDeployBlock(client as any, tokenAddress);
+  console.log(`  Deploy block: ${deployBlock.toLocaleString()}`);
 
   // ── 4. Run LLM rug check with the user's question ─────────────────────────
   console.log("  Running on-chain evidence collection + LLM rug check…\n");
@@ -133,8 +130,8 @@ console.log("  On-Chain Rug Check Chat  (Base Mainnet + Gemini LLM)");
 console.log(`  RPC     : ${RPC_URL}`);
 console.log(`  Model   : ${process.env.GEMINI_MODEL ?? "gemini-2.0-flash-lite"}`);
 console.log("  Usage   : paste a token address in your message and ask anything.");
-console.log("            The agent runs a full evidence scan and answers in-report.");
-console.log("  Limit   : deployer resolution works for tokens launched in last ~4 days.");
+console.log("            The agent resolves the exact deploy block, collects on-chain");
+console.log("            evidence, and answers your question in the rug-check report.");
 console.log("  Exit    : Ctrl+C");
 console.log("═══════════════════════════════════════════════════════════════════\n");
 

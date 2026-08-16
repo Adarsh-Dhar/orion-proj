@@ -1,24 +1,27 @@
 /**
- * twitter-bot.ts — auto-posting sniper bot.
+ * telegram-bot.ts — auto-posting sniper bot for Telegram.
  *
  * Scans new Uniswap V3 pools on Base every 5 min, runs the full LLM rug-check
- * pipeline, and tweets HIGH/CRITICAL results as a thread.
+ * pipeline, and sends HIGH/CRITICAL results to a Telegram channel.
+ *
+ * Also handles chat messages from users who want to query token addresses.
  *
  * Required env vars:
  *   RPC_URL, GEMINI_API_KEY,
- *   TWITTER_API_KEY, TWITTER_API_SECRET,
- *   TWITTER_ACCESS_TOKEN, TWITTER_ACCESS_SECRET
- *   TWITTER_DRY_RUN=true   (set to "false" to post for real)
+ *   TELEGRAM_BOT_TOKEN,
+ *   TELEGRAM_NOTIFY_CHAT_ID — channel/group for sniper alerts
  */
 
 import "dotenv/config";
 import { createPublicClient, http } from "viem";
-import { base }                     from "viem/chains";
-import { scanBlockRange, printSummaryTable } from "./lib/scan-engine.js";
-import { formatTweetThread }        from "./lib/tweet-format.js";
-import { postThread }               from "./lib/twitter.js";
+import { base } from "viem/chains";
+import { bot } from "./lib/telegram.js";
+import { scanBlockRange } from "./lib/scan-engine.js";
+import { sendReport } from "./lib/telegram.js";
+import { registerChatHandler } from "./lib/chat-handler.js";
+import { formatRugReport } from "./lib/rugcheck.js";
 import { loadState, saveState, alreadyPosted, markPosted } from "./lib/state.js";
-import { UNISWAP_V3_FACTORY }       from "./lib/constants.js";
+import { UNISWAP_V3_FACTORY } from "./lib/constants.js";
 
 // ─── Env validation ───────────────────────────────────────────────────────────
 
@@ -30,17 +33,11 @@ function validateEnv(required: string[]): void {
   }
 }
 
-validateEnv(["RPC_URL", "GEMINI_API_KEY"]);
-
-if (process.env.TWITTER_DRY_RUN !== "true") {
-  validateEnv([
-    "TWITTER_USER_ACCESS_TOKEN",
-  ]);
-}
+validateEnv(["RPC_URL", "GEMINI_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_NOTIFY_CHAT_ID"]);
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-const SNIPER_INTERVAL_MS  = 5 * 60_000;  // 5 min
+const SNIPER_INTERVAL_MS = 5 * 60_000; // 5 min
 /**
  * Block lookback per tick — mirrors scan-historical.ts's default range.
  * 50,048,826 - 50,045,225 = 3,601 blocks ≈ 2 hours of Base history.
@@ -55,10 +52,14 @@ const POST_VERDICTS = new Set(["LOW", "MEDIUM", "HIGH", "CRITICAL"]);
 // ─── RPC client ───────────────────────────────────────────────────────────────
 
 const RPC_URL = process.env.RPC_URL!;
-const client  = createPublicClient({
+const client = createPublicClient({
   chain: base,
   transport: http(RPC_URL, { retryCount: 3, retryDelay: 1500 }),
 });
+
+// ─── Register chat handler ────────────────────────────────────────────────────
+
+registerChatHandler(bot, client as any);
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
@@ -71,7 +72,7 @@ let sniperRun = 0;
 async function sniperTick(): Promise<void> {
   sniperRun++;
   const runLabel = `#${sniperRun}`;
-  const now      = new Date().toISOString();
+  const now = new Date().toISOString();
 
   let toBlock: bigint;
   try {
@@ -81,7 +82,7 @@ async function sniperTick(): Promise<void> {
     return;
   }
 
-  const fromBlock   = lastScannedBlock !== null
+  const fromBlock = lastScannedBlock !== null
     ? lastScannedBlock + 1n
     : toBlock - BLOCKS_PER_INTERVAL;
   const windowLabel = lastScannedBlock !== null ? "watermark" : "bootstrap";
@@ -97,19 +98,21 @@ async function sniperTick(): Promise<void> {
     toBlock,
     {
       onResult: async (result, meta) => {
-        // Skip tokens we've already tweeted about
+        // Skip tokens we've already posted about
         if (alreadyPosted(state, result.tokenAddress)) {
           console.log(`  [bot] Already posted ${result.tokenAddress} — skipping`);
           return;
         }
-        // Only tweet noteworthy verdicts
+        // Only post noteworthy verdicts
         if (!POST_VERDICTS.has(result.verdict)) {
           console.log(`  [bot] ${result.verdict} for ${result.tokenAddress} — below threshold, skipping`);
           return;
         }
-        const thread = formatTweetThread(result, meta);
-        console.log(`  [bot] Posting ${thread.length}-tweet thread for ${result.tokenAddress} (${result.verdict})`);
-        await postThread(thread);
+        console.log(`  [bot] Sending report for ${result.tokenAddress} (${result.verdict})`);
+        await sendReport(
+          process.env.TELEGRAM_NOTIFY_CHAT_ID!,
+          formatRugReport(result, meta)
+        );
         markPosted(state, result.tokenAddress);
       },
     }
@@ -120,7 +123,6 @@ async function sniperTick(): Promise<void> {
 
   if (totalPools > 0) {
     console.log(`  Pools: ${totalPools} found | ${processed} checked | ${skipped} skipped`);
-    printSummaryTable(summary);
   }
 
   console.log(`  Sniper ${runLabel} complete. Next in 5 min.\n`);
@@ -140,17 +142,15 @@ async function loop(fn: () => Promise<void>, intervalMs: number): Promise<void> 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  const dryRun = process.env.TWITTER_DRY_RUN !== "false";
-
   console.log(`${"═".repeat(66)}`);
-  console.log(`  Watchdog Twitter Bot`);
+  console.log(`  Watchdog Telegram Bot`);
   console.log(`  Network  : Base Mainnet (chain ID 8453)`);
   console.log(`  RPC      : ${RPC_URL}`);
   console.log(`  Factory  : ${UNISWAP_V3_FACTORY}  [Uniswap V3]`);
   console.log(`  Scoring  : Gemini LLM (${process.env.GEMINI_MODEL ?? "gemini-2.0-flash-lite"})`);
   console.log(`  Interval : 5 min after each scan completes`);
   console.log(`  Filter   : posting ALL verdicts (LOW, MEDIUM, HIGH, CRITICAL)`);
-  console.log(`  Dry run  : ${dryRun ? "YES — tweets logged, not posted" : "NO — posting live"}`);
+  console.log(`  Notify   : ${process.env.TELEGRAM_NOTIFY_CHAT_ID}`);
   console.log(`  Started  : ${new Date().toISOString()}`);
   console.log(`${"═".repeat(66)}\n`);
 
@@ -159,6 +159,9 @@ async function main(): Promise<void> {
     console.error(`[sniper] Fatal on first run: ${err}`)
   );
   setTimeout(() => loop(sniperTick, SNIPER_INTERVAL_MS), SNIPER_INTERVAL_MS);
+
+  // Start the bot for handling chat messages
+  bot.start();
 
   process.on("SIGINT", () => {
     console.log("\n[bot] Shutting down — saving state…");

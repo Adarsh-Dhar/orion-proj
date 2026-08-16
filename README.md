@@ -1,11 +1,13 @@
-# Base Token Watchdog + Gemini Chat Agent
+# Base Token Watchdog + Telegram Bot
 
-Two independent CLI tools that share a project:
+A Telegram bot that monitors new token launches on Base, runs AI-powered rug checks, and posts alerts to channels.
 
 | Tool | What it does | Command |
 |---|---|---|
-| **Watchdog** | Listens for new token launches on Base (Uniswap V3 `PoolCreated` events), fetches ERC-20 metadata, and logs structured output | `npm run watchdog` |
+| **Telegram Bot** | Scans new Uniswap V3 pools on Base, runs LLM rug checks, and posts alerts to Telegram | `npm run telegram-bot` |
 | **Chat** | Terminal Q&A loop backed by Gemini, primed as a DeFi / Base blockchain assistant | `npm run chat` |
+| **Sniper** | Historical scanner for analyzing past token launches | `npm run sniper` |
+| **Scan** | Scan a specific block range for token launches | `npm run scan` |
 
 ---
 
@@ -16,6 +18,8 @@ Two independent CLI tools that share a project:
   The public endpoint (`https://mainnet.base.org`) works for testing but rate-limits aggressively. For sustained use, get a free dedicated URL from [Alchemy](https://alchemy.com), [QuickNode](https://quicknode.com), or [Infura](https://infura.io) — create a "Base mainnet" app and copy the HTTPS URL.
 - **A Gemini API key**
   Get one for free at [Google AI Studio](https://aistudio.google.com/).
+- **A Telegram bot**
+  Create a bot via [@BotFather](https://t.me/botfather) on Telegram and get your bot token.
 
 ---
 
@@ -46,6 +50,12 @@ GEMINI_API_KEY=your_key_here
 
 # Gemini model — swap for a more powerful model if needed
 GEMINI_MODEL=gemini-2.0-flash-lite
+
+# Telegram bot token from @BotFather
+TELEGRAM_BOT_TOKEN=your_bot_token_here
+
+# Telegram chat ID for sniper notifications (channel/group ID)
+TELEGRAM_NOTIFY_CHAT_ID=your_chat_id_here
 ```
 
 > `.env` is listed in `.gitignore` and will never be committed.
@@ -54,32 +64,19 @@ GEMINI_MODEL=gemini-2.0-flash-lite
 
 ## Running
 
-### Watchdog
+### Telegram Bot
 
 ```bash
-npm run watchdog
+npm run telegram-bot
 ```
 
-Connects to Base mainnet and listens for new Uniswap V3 pools. Each new pool triggers a metadata fetch and a structured log line:
+Starts the Telegram bot that:
+- Scans new Uniswap V3 pools on Base every 5 minutes
+- Runs AI-powered rug checks on each new token
+- Posts formatted reports to your configured Telegram channel
+- Responds to user messages with token addresses by running rug checks
 
-```
-┌─ NEW TOKEN DETECTED ─────────────────────────────────── 2025-07-10T14:32:01.000Z
-│  Address  : 0xabc...
-│  Name     : Doge2
-│  Symbol   : DOGE2
-│  Decimals : 18
-│  Supply   : 1,000,000,000 DOGE2
-│  Paired   : WETH (0x4200000000000000000000000000000000000006)
-│  Fee tier : 1.00%
-│  Pool     : 0xdef...
-│  Tx       : 0x123...
-│  BaseScan : https://basescan.org/tx/0x123...
-└──────────────────────────────────────────────────────────
-```
-
-Press **Ctrl+C** to stop cleanly.
-
-> **Note on the public RPC:** `mainnet.base.org` doesn't persist eth_filter state between polling ticks, so you may see `filter not found` errors in the log. These are harmless — the watchdog recovers automatically. Use a dedicated RPC endpoint to eliminate them.
+The bot will continue running until stopped with **Ctrl+C**.
 
 ### Chat
 
@@ -106,11 +103,19 @@ Press **Ctrl+C** to exit.
 
 ```
 src/
-  watchdog.ts        # Entry point: Base event watcher
-  chat.ts            # Entry point: Gemini chat loop
+  telegram-bot.ts    # Entry point: Telegram bot with sniper + chat
+  chat.ts            # Entry point: Terminal chat loop
+  sniper.ts          # Historical sniper scanner
+  scan-historical.ts # Block range scanner
   lib/
     constants.ts     # Contract addresses, ABIs, known quote assets
     erc20.ts         # Defensive ERC-20 metadata fetcher
+    telegram.ts      # Telegram Bot API wrapper
+    chat-handler.ts  # Grammy message handler
+    rugcheck-handler.ts # Shared token analysis pipeline
+    rugcheck.ts      # LLM-powered rug check engine
+    scan-engine.ts   # Block scanning logic
+    state.ts         # Bot state persistence
 .env                 # Secrets (never commit)
 package.json
 tsconfig.json
@@ -120,8 +125,7 @@ tsconfig.json
 
 ## What's not built yet (next layers)
 
-- **Risk scoring** — liquidity lock status, dev wallet concentration, contract renounce check
 - **Aerodrome DEX support** — `PairCreated` event on Base's dominant meme-token DEX
-- **Chat ↔ watchdog bridge** — letting the chat agent query what the watchdog has detected
-- **Twitter/X posting** — auto-tweet on new token detection
+- **Chat ↔ sniper bridge** — letting the chat agent query what the sniper has detected
+- **Advanced filtering** — more sophisticated risk thresholds and notification rules
 # orion-proj

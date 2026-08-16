@@ -1,8 +1,8 @@
 /**
- * state.ts — JSON-file persistence for the Twitter bot.
+ * state.ts — JSON-file persistence for the Telegram bot.
  *
  * Tracks postedTokens so a token discovered in overlapping scan windows
- * is never tweeted twice, and survives bot restarts.
+ * is never posted twice, and survives bot restarts.
  */
 
 import { readFileSync, writeFileSync, existsSync } from "fs";

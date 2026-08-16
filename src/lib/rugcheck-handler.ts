@@ -1,6 +1,6 @@
 /**
  * rugcheck-handler.ts — shared pipeline used by both chat.ts and the
- * Twitter bot's mention responder.
+ * Telegram bot's message handler.
  *
  * Extracts the 5-step token-analysis flow that previously lived inline in
  * chat.ts so it can be called from anywhere without copy-pasting.

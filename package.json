@@ -5,7 +5,8 @@
   "scripts": {
     "watchdog": "tsx src/watchdog.ts",
     "chat": "tsx src/chat.ts",
-    "sniper": "tsx src/sniper.ts"
+    "sniper": "tsx src/sniper.ts",
+    "scan": "tsx src/scan-historical.ts"
   },
   "keywords": [],
   "author": "",

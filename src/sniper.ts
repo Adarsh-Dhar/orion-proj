@@ -63,6 +63,35 @@ function formatFee(fee: number): string {
   return `${(fee / 10_000).toFixed(2)}%`;
 }
 
+/**
+ * Retry a flaky RPC call once after a short delay before giving up.
+ * Used for the two RPC calls that, if they fail, cost an entire 5-minute
+ * cycle rather than just one token's worth of detail (getBlockNumber and
+ * the PoolCreated getLogs scan) — everything downstream of those two already
+ * has its own per-call fallback/logging in rugcheck.ts.
+ */
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  label: string,
+  retries = 1,
+  delayMs = 3_000
+): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (attempt < retries) {
+        console.warn(`[sniper] ${label} failed (attempt ${attempt + 1}/${retries + 1}), retrying in ${delayMs / 1000}s…`);
+        console.warn(`  Reason: ${err instanceof Error ? err.message : String(err)}`);
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 function identifyTokens(
   token0: Address,
   token1: Address
@@ -114,18 +143,12 @@ async function scanWindow(runNumber: number): Promise<void> {
   // transient timeout. Retry once after a short delay before giving up.
   let toBlock: bigint;
   try {
-    toBlock = await client.getBlockNumber();
-  } catch {
-    console.warn(`[sniper] scan #${runNumber}: getBlockNumber() failed, retrying in 3s…`);
-    await new Promise((r) => setTimeout(r, 3_000));
-    try {
-      toBlock = await client.getBlockNumber();
-    } catch (err) {
-      console.error(`[sniper] scan #${runNumber}: getBlockNumber() failed twice — skipping scan, will retry next interval.`);
-      console.error(`  Reason: ${err}`);
-      // Do NOT advance lastScannedBlock — next run retries the same range
-      return;
-    }
+    toBlock = await withRetry(() => client.getBlockNumber(), `scan #${runNumber}: getBlockNumber()`);
+  } catch (err) {
+    console.error(`[sniper] scan #${runNumber}: getBlockNumber() failed twice — skipping scan, will retry next interval.`);
+    console.error(`  Reason: ${err instanceof Error ? err.message : String(err)}`);
+    // Do NOT advance lastScannedBlock — next run retries the same range
+    return;
   }
 
   // First run → bootstrap with fixed lookback.
@@ -151,14 +174,19 @@ async function scanWindow(runNumber: number): Promise<void> {
   // ── Fetch PoolCreated events in the window ──────────────────────────────
   let logs;
   try {
-    logs = await client.getLogs({
-      address: UNISWAP_V3_FACTORY,
-      event: POOL_CREATED_ABI[0],
-      fromBlock,
-      toBlock,
-    });
+    logs = await withRetry(
+      () =>
+        client.getLogs({
+          address: UNISWAP_V3_FACTORY,
+          event: POOL_CREATED_ABI[0],
+          fromBlock,
+          toBlock,
+        }),
+      `scan #${runNumber}: getLogs(PoolCreated)`
+    );
   } catch (err) {
-    console.error(`[sniper] getLogs failed: ${err}`);
+    console.error(`[sniper] scan #${runNumber}: getLogs(PoolCreated) failed twice — skipping scan, will retry next interval.`);
+    console.error(`  Reason: ${err instanceof Error ? err.message : String(err)}`);
     // Do NOT advance lastScannedBlock — next run retries the same range
     return;
   }
@@ -203,7 +231,7 @@ async function scanWindow(runNumber: number): Promise<void> {
     // ── Fetch ERC-20 metadata ────────────────────────────────────────────
     let meta;
     try {
-      meta = await fetchTokenMetadata(client, newToken);
+      meta = await fetchTokenMetadata(client as any, newToken);
     } catch (err) {
       console.error(`  [sniper] metadata fetch failed for ${newToken}: ${err}\n`);
       console.log(`${"─".repeat(66)}\n`);
@@ -214,7 +242,7 @@ async function scanWindow(runNumber: number): Promise<void> {
     let rugResult;
     try {
       rugResult = await runRugCheck(
-        client,
+        client as any,
         newToken,
         pool,
         pairedLabel,

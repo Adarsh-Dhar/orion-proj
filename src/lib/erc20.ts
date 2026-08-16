@@ -22,7 +22,8 @@ export interface TokenMetadata {
  * out the other fields. Failed calls fall back to safe placeholder values.
  */
 export async function fetchTokenMetadata(
-  client: PublicClient,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  client: PublicClient<any>,
   address: Address
 ): Promise<TokenMetadata> {
   const baseArgs = {

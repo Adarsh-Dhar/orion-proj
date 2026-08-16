@@ -122,7 +122,7 @@ const unwatch = client.watchContractEvent({
       // ── Fetch metadata for the new token ─────────────────────────────────
       let meta;
       try {
-        meta = await fetchTokenMetadata(client, newToken!);
+      meta = await fetchTokenMetadata(client as any, newToken!);
       } catch (err) {
         console.error(`[watchdog] fetchTokenMetadata failed for ${newToken}: ${err}`);
         continue;

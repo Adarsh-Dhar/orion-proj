@@ -341,7 +341,8 @@ export async function runRugCheckLLM(
   poolAddress: Address,
   pairedAsset: string,
   deployBlock: bigint,
-  meta: { name: string; symbol: string; decimals: number; totalSupply: bigint; totalSupplyFormatted: string }
+  meta: { name: string; symbol: string; decimals: number; totalSupply: bigint; totalSupplyFormatted: string },
+  opts?: { userQuestion?: string }
 ): Promise<RugCheckResult> {
 
   // ── 1. Collect evidence ───────────────────────────────────────────────────
@@ -376,7 +377,7 @@ export async function runRugCheckLLM(
 
   // ── 3. Score with LLM ─────────────────────────────────────────────────────
   console.log("  Sending evidence to Gemini for scoring...");
-  const llmResult = await scoreWithLLM(evidence);
+  const llmResult = await scoreWithLLM(evidence, opts);
 
   if (!llmResult.ok) {
     console.error(`  [LLM] Scoring failed: ${llmResult.reason}`);
@@ -417,6 +418,7 @@ export async function runRugCheckLLM(
     verdict: llmResult.verdict,
     summary: llmResult.summary,
     scoringMethod: "llm",
+    answer:  llmResult.answer,
   };
 }
 
@@ -491,6 +493,11 @@ export function formatRugReport(
   lines.push(`║  Verdict  : ${v} ${r.verdict}`);
   lines.push(`║  Summary  : ${r.summary}`);
   lines.push(`║  BaseScan : https://basescan.org/address/${r.tokenAddress}`);
+  if (r.answer) {
+    lines.push(`║`);
+    lines.push(`║  ── Your Question ──────────────────────────────────────────────`);
+    lines.push(`║  ${r.answer}`);
+  }
   lines.push(`╚════════════════════════════════════════════════════════════════`);
 
   return lines.join("\n");

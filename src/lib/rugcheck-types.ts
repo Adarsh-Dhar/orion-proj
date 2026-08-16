@@ -45,4 +45,6 @@ export interface RugCheckResult {
   // ── Metadata ───────────────────────────────────────────────────────────────
   scoringMethod?: "rules" | "llm";
   scoringError?: string;             // set when LLM scoring fails
+  /** Direct answer to the user's question, only present when asked via chat */
+  answer?: string;
 }

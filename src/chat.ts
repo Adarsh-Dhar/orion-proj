@@ -1,5 +1,29 @@
+/**
+ * chat.ts — interactive on-chain rug-check chat.
+ *
+ * The user types a message. If it contains a token address (0x…40 hex chars),
+ * the agent:
+ *   1. Resolves the token's Uniswap V3 pool via resolveTokenPool()
+ *   2. Fetches ERC-20 metadata
+ *   3. Runs the full LLM rug-check via runRugCheckLLM(), passing the user's
+ *      message as userQuestion so Gemini answers it directly in the report
+ *   4. Prints formatRugReport() — which now includes the "Your Question" block
+ *
+ * If the message has no address, a helpful prompt is printed instead.
+ *
+ * Known limit: deployBlock is approximated as the current block number.
+ * The deployer-finder in evidence.ts walks backwards up to 200k blocks
+ * (~4 days on Base), so tokens older than ~4 days may not resolve a deployer.
+ *
+ * Required env vars: RPC_URL, GEMINI_API_KEY
+ */
 import "dotenv/config";
 import * as readline from "readline";
+import { createPublicClient, http, type Address } from "viem";
+import { base } from "viem/chains";
+import { fetchTokenMetadata } from "./lib/erc20.js";
+import { resolveTokenPool } from "./lib/scan-engine.js";
+import { runRugCheckLLM, formatRugReport } from "./lib/rugcheck.js";
 
 // ─── Env validation ───────────────────────────────────────────────────────────
 
@@ -11,107 +35,90 @@ function validateEnv(required: string[]): void {
     process.exit(1);
   }
 }
+validateEnv(["RPC_URL", "GEMINI_API_KEY"]);
 
-validateEnv(["GEMINI_API_KEY"]);
+const RPC_URL = process.env.RPC_URL as string;
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY as string;
-const GEMINI_MODEL = process.env.GEMINI_MODEL ?? "gemini-2.0-flash-lite";
+// ─── RPC client ───────────────────────────────────────────────────────────────
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+const client = createPublicClient({
+  chain: base,
+  transport: http(RPC_URL, { retryCount: 3, retryDelay: 1500 }),
+});
 
-interface ContentPart {
-  text: string;
+// ─── Address extractor ────────────────────────────────────────────────────────
+
+/** Returns the first 0x-prefixed 40-hex-char address found in a string. */
+function extractAddress(text: string): Address | null {
+  const match = text.match(/0x[a-fA-F0-9]{40}/);
+  return match ? (match[0] as Address) : null;
 }
 
-interface ConversationTurn {
-  role: "user" | "model";
-  parts: ContentPart[];
-}
+// ─── Per-message handler ──────────────────────────────────────────────────────
 
-interface GeminiRequest {
-  contents: ConversationTurn[];
-}
+async function handleMessage(userInput: string): Promise<void> {
+  const tokenAddress = extractAddress(userInput);
 
-interface GeminiResponse {
-  candidates?: Array<{
-    content?: {
-      parts?: ContentPart[];
-    };
-  }>;
-  error?: {
-    code: number;
-    message: string;
-    status: string;
-  };
-}
-
-// ─── Gemini REST helper ───────────────────────────────────────────────────────
-
-const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-
-async function callGemini(history: ConversationTurn[]): Promise<string> {
-  const body: GeminiRequest = { contents: history };
-
-  const response = await fetch(GEMINI_ENDPOINT, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-
-  const data = (await response.json()) as GeminiResponse;
-
-  // Surface API-level errors clearly
-  if (data.error) {
-    throw new Error(`Gemini API error ${data.error.code}: ${data.error.message}`);
+  if (!tokenAddress) {
+    console.log(
+      "\n  Tip: paste a Base token address (0x…) anywhere in your message and I'll\n" +
+      "  run a full on-chain rug check and answer your question about it.\n"
+    );
+    return;
   }
 
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+  console.log(`\n  Token address detected: ${tokenAddress}`);
+
+  // ── 1. Resolve pool ───────────────────────────────────────────────────────
+  console.log("  Resolving Uniswap V3 pool…");
+  const resolved = await resolveTokenPool(client as any, tokenAddress);
+  if (!resolved) {
+    console.log(
+      `\n  ⚠️  No Uniswap V3 pool found for ${tokenAddress} on Base.\n` +
+      `  The token may not have launched yet, or it uses a non-standard DEX.\n`
+    );
+    return;
+  }
+  console.log(`  Pool found: ${resolved.poolAddress}  (paired with ${resolved.pairedLabel})`);
+
+  // ── 2. Fetch ERC-20 metadata ──────────────────────────────────────────────
+  console.log("  Fetching token metadata…");
+  let meta;
+  try {
+    meta = await fetchTokenMetadata(client as any, tokenAddress);
+  } catch (err) {
+    console.error(`\n  [chat] metadata fetch failed: ${err}\n`);
+    return;
+  }
+  console.log(`  Token: ${meta.name} (${meta.symbol})`);
+
+  // ── 3. Approximate deployBlock as current block ───────────────────────────
+  // The deployer-finder in evidence.ts walks backwards up to 200k blocks so
+  // this works for tokens launched in the last ~4 days on Base.
+  const deployBlock = await client.getBlockNumber();
+
+  // ── 4. Run LLM rug check with the user's question ─────────────────────────
+  console.log("  Running on-chain evidence collection + LLM rug check…\n");
+  let rugResult;
+  try {
+    rugResult = await runRugCheckLLM(
+      client as any,
+      tokenAddress,
+      resolved.poolAddress,
+      resolved.pairedLabel,
+      deployBlock,
+      meta,
+      { userQuestion: userInput }
+    );
+  } catch (err) {
+    console.error(`\n  [chat] rug check failed: ${err}\n`);
+    return;
   }
 
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) {
-    throw new Error("Gemini returned an empty response");
-  }
-
-  return text.trim();
+  // ── 5. Print full report (includes "Your Question" block if answer present)
+  console.log(formatRugReport(rugResult, meta));
+  console.log();
 }
-
-// ─── Conversation history ─────────────────────────────────────────────────────
-
-/**
- * Prime the assistant with a fake first exchange so it behaves as a
- * DeFi / Base blockchain expert from the very first real message.
- * Gemini's generateContent API is stateless — we send the full history
- * on every call, so this framing persists for the whole session.
- */
-const history: ConversationTurn[] = [
-  {
-    role: "user",
-    parts: [
-      {
-        text:
-          "You are a DeFi and Base blockchain assistant. " +
-          "You help users understand new token launches, liquidity pools, " +
-          "Uniswap V3, on-chain risk signals, and the Base ecosystem. " +
-          "Be concise, accurate, and technical where appropriate. " +
-          "When discussing token addresses or contracts, always remind users " +
-          "to verify them on BaseScan before trusting them.",
-      },
-    ],
-  },
-  {
-    role: "model",
-    parts: [
-      {
-        text:
-          "Understood. I'm your DeFi and Base blockchain assistant. " +
-          "I can help you with token launches, Uniswap V3 pools, on-chain risk signals, " +
-          "and anything else related to the Base ecosystem. What would you like to know?",
-      },
-    ],
-  },
-];
 
 // ─── Chat loop ────────────────────────────────────────────────────────────────
 
@@ -121,14 +128,16 @@ const rl = readline.createInterface({
   terminal: false,
 });
 
-console.log("═══════════════════════════════════════════════════════════");
-console.log("  Gemini DeFi Assistant");
-console.log(`  Model : ${GEMINI_MODEL}`);
-console.log("  Topic : Base blockchain, DeFi, token launches, Uniswap V3");
-console.log("  Type your question and press Enter. Ctrl+C to exit.");
-console.log("═══════════════════════════════════════════════════════════\n");
+console.log("═══════════════════════════════════════════════════════════════════");
+console.log("  On-Chain Rug Check Chat  (Base Mainnet + Gemini LLM)");
+console.log(`  RPC     : ${RPC_URL}`);
+console.log(`  Model   : ${process.env.GEMINI_MODEL ?? "gemini-2.0-flash-lite"}`);
+console.log("  Usage   : paste a token address in your message and ask anything.");
+console.log("            The agent runs a full evidence scan and answers in-report.");
+console.log("  Limit   : deployer resolution works for tokens launched in last ~4 days.");
+console.log("  Exit    : Ctrl+C");
+console.log("═══════════════════════════════════════════════════════════════════\n");
 
-// Print the prompt manually since we're in non-TTY-safe mode
 process.stdout.write("You: ");
 
 rl.on("line", async (line) => {
@@ -139,29 +148,11 @@ rl.on("line", async (line) => {
     return;
   }
 
-  // Append the user turn to history
-  const userTurn: ConversationTurn = {
-    role: "user",
-    parts: [{ text: userInput }],
-  };
-  history.push(userTurn);
-
   try {
-    process.stdout.write("Assistant: ");
-    const reply = await callGemini(history);
-
-    // Append the model turn to history so future calls have full context
-    history.push({ role: "model", parts: [{ text: reply }] });
-
-    console.log(reply);
-    console.log();
+    await handleMessage(userInput);
   } catch (err) {
-    // Remove the dangling unanswered user turn so history stays clean
-    history.pop();
-
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`\n[chat] Error: ${message}`);
-    console.log("Your question was not saved to history. Please try again.\n");
+    console.error(`\n[chat] Unexpected error: ${message}\n`);
   }
 
   process.stdout.write("You: ");

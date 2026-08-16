@@ -372,7 +372,22 @@ export async function collectEvidence(
       const sqrtPriceX96 = slot0[0];
       if (sqrtPriceX96 > 0n) {
         const Q96 = 2n ** 96n;
-        initialLiquidityEth = Number(formatEther((poolLiquidityRaw * Q96) / sqrtPriceX96));
+        const raw = Number(formatEther((poolLiquidityRaw * Q96) / sqrtPriceX96));
+
+        // Sanity bound: total ETH ever in existence is ~120M.
+        // Values above this are a sqrtPriceX96 math artifact (near-zero price
+        // → near-zero divisor → astronomically large quotient). Treat as invalid.
+        const ETH_SUPPLY_MAX = 200_000_000; // 200M — generous headroom
+        if (raw > ETH_SUPPLY_MAX) {
+          warnings.push(
+            `[pool.slot0] initialLiquidityEth computation yielded ${raw.toFixed(0)} ETH — ` +
+            `physically impossible (total ETH supply ~120M). Likely a near-zero sqrtPriceX96 ` +
+            `artifact. Value nulled; treat pool liquidity as unverified.`
+          );
+          initialLiquidityEth = null;
+        } else {
+          initialLiquidityEth = raw;
+        }
       }
     } catch (err) {
       warn(warnings, "pool.slot0", "slot0 read failed", err);

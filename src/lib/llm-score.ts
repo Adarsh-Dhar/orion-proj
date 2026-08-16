@@ -33,6 +33,8 @@ export interface LLMScoreSuccess {
   flags: RiskFlag[];
   summary: string;
   rawModelText: string;
+  /** Only present when opts.userQuestion was supplied */
+  answer?: string;
 }
 
 export interface LLMScoreFailure {
@@ -76,6 +78,12 @@ SCORING GUIDE:
 - Very low liquidity (<0.5 ETH equivalent):                 +15 pts, MEDIUM
 - Total supply = 0 (broken contract):                       +20 pts, HIGH
 - Multiple unverified fields together (3+):                 +10 pts, MEDIUM (compound uncertainty)
+
+SANITY CHECKS — apply these before scoring:
+- If initialLiquidityEth is > 1,000,000 (one million ETH), it is a math artifact, NOT real liquidity. Treat it the same as null — do NOT use it as evidence of healthy liquidity. Add a flag for it.
+- If totalSupply is an astronomically large number inconsistent with a normal token launch (e.g. trillions with 18 decimals), flag it.
+- If any numeric field appears in rpcWarnings, that field could not be fetched and must be treated as unverified risk regardless of its value.
+- Never reward implausibly large numbers. If a value seems physically impossible, it almost certainly indicates a computation error or a non-standard token — both are risk signals.
 
 Required JSON output shape:
 {
@@ -139,13 +147,17 @@ function validateParsed(parsed: unknown): LLMScoreSuccess | null {
     verdict: p.verdict as RiskLevel,
     flags,
     summary: (p.summary as string).trim(),
+    answer:  typeof p.answer === "string" ? p.answer.trim() : undefined,
     rawModelText: "",  // filled in by caller
   };
 }
 
 // ─── Main scorer ─────────────────────────────────────────────────────────────
 
-export async function scoreWithLLM(evidence: TokenEvidence): Promise<LLMScoreResult> {
+export async function scoreWithLLM(
+  evidence: TokenEvidence,
+  opts?: { userQuestion?: string }
+): Promise<LLMScoreResult> {
   // ── Guard: no API key ──────────────────────────────────────────────────────
   if (!GEMINI_API_KEY) {
     return { ok: false, reason: "GEMINI_API_KEY is not set" };
@@ -157,12 +169,19 @@ export async function scoreWithLLM(evidence: TokenEvidence): Promise<LLMScoreRes
   // model which numbers are unverified and should be treated with suspicion.
   const evidenceJson = JSON.stringify(evidence, null, 2);
 
+  const questionClause = opts?.userQuestion
+    ? `\n\nADDITIONAL USER QUESTION:\nAlso answer this specific question from the user, ` +
+      `using only the evidence above: "${opts.userQuestion}"\n` +
+      `Add an "answer" field (string) to your JSON response with the direct answer.`
+    : "";
+
   const userMessage =
     `Analyse the following on-chain evidence and return a rug-check risk score.\n\n` +
     `PAY SPECIAL ATTENTION to the "rpcWarnings" array — any field mentioned there ` +
     `could not be fetched from the chain and should be treated as unverified risk, ` +
     `not as a clean/safe reading.\n\n` +
-    `TOKEN EVIDENCE:\n${evidenceJson}`;
+    `TOKEN EVIDENCE:\n${evidenceJson}` +
+    questionClause;
 
   // ── Call Gemini ────────────────────────────────────────────────────────────
   let rawModelText = "";

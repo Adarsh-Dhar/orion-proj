@@ -18,6 +18,8 @@
 import type { TokenEvidence } from "./evidence.js";
 import type { RiskFlag, RiskLevel } from "./rugcheck-types.js";
 
+export type ScoreMode = "alert" | "chat";
+
 // ─── Env ─────────────────────────────────────────────────────────────────────
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? "";
@@ -63,6 +65,16 @@ IMPORTANT RULES:
    - CRITICAL: 75–100
 6. Each flag must have: id (snake_case string), label (short string), detail (evidence-backed sentence), severity (LOW/MEDIUM/HIGH/CRITICAL), points (integer 0–40).
 7. summary must be a single sentence citing the top 1–2 risk factors.
+8. You will be told the OUTPUT MODE for this request:
+   - "alert": 'summary' must be ONE short, punchy sentence (max ~18 words) fit for a push
+     notification. Include only the 1–3 MOST material flags in 'flags' — omit minor or
+     redundant ones even if the evidence supports more. Do not include an "answer" field.
+   - "chat" with a specific question: add an "answer" field (string). It must directly and
+     conversationally answer THAT question in 2–4 sentences, using only evidence relevant to
+     it. Do not just restate 'summary'.
+   - "chat" with no question (bare address): add an "answer" field with a natural,
+     conversational risk read of the token (2–4 sentences) — as if explaining it to someone,
+     not a formal restatement of 'summary'.
 
 SCORING GUIDE:
 - Ownership not renounced (confirmed active owner address):  +25 pts, HIGH
@@ -156,7 +168,7 @@ function validateParsed(parsed: unknown): LLMScoreSuccess | null {
 
 export async function scoreWithLLM(
   evidence: TokenEvidence,
-  opts?: { userQuestion?: string }
+  opts?: { userQuestion?: string; mode?: ScoreMode }
 ): Promise<LLMScoreResult> {
   // ── Guard: no API key ──────────────────────────────────────────────────────
   if (!GEMINI_API_KEY) {
@@ -169,11 +181,19 @@ export async function scoreWithLLM(
   // model which numbers are unverified and should be treated with suspicion.
   const evidenceJson = JSON.stringify(evidence, null, 2);
 
-  const questionClause = opts?.userQuestion
-    ? `\n\nADDITIONAL USER QUESTION:\nAlso answer this specific question from the user, ` +
-      `using only the evidence above: "${opts.userQuestion}"\n` +
-      `Add an "answer" field (string) to your JSON response with the direct answer.`
-    : "";
+  const mode = opts?.mode ?? "chat";
+
+  const modeClause = mode === "alert"
+    ? `\n\nOUTPUT MODE: "alert" — this is going straight into a push notification. Keep ` +
+      `'summary' to one short punchy sentence. Include only the 1–3 most material flags. ` +
+      `Do NOT include an "answer" field.`
+    : opts?.userQuestion
+      ? `\n\nOUTPUT MODE: "chat" — the user asked: "${opts.userQuestion}"\n` +
+        `Add an "answer" field (string) that directly and conversationally answers THIS ` +
+        `question using only the evidence above. Do not just repeat 'summary'.`
+      : `\n\nOUTPUT MODE: "chat" — no specific question was asked, just the token address. ` +
+        `Add an "answer" field (string) with a natural, conversational risk read of this ` +
+        `token (2–4 sentences), not a formal restatement of 'summary'.`;
 
   const userMessage =
     `Analyse the following on-chain evidence and return a rug-check risk score.\n\n` +
@@ -181,7 +201,7 @@ export async function scoreWithLLM(
     `could not be fetched from the chain and should be treated as unverified risk, ` +
     `not as a clean/safe reading.\n\n` +
     `TOKEN EVIDENCE:\n${evidenceJson}` +
-    questionClause;
+    modeClause;
 
   // ── Call Gemini ────────────────────────────────────────────────────────────
   let rawModelText = "";

@@ -342,7 +342,7 @@ export async function scanBlockRange(
     // Run LLM rug check
     let rugResult;
     try {
-      rugResult = await runRugCheckLLM(client, newToken, pool, pairedLabel, blockNum, meta);
+      rugResult = await runRugCheckLLM(client, newToken, pool, pairedLabel, blockNum, meta, { mode: "alert" });
     } catch (err) {
       console.error(`  [scan-engine] rug check failed for ${newToken}: ${err}\n`);
       console.log(`${"─".repeat(66)}\n`);

@@ -19,7 +19,7 @@ import { bot } from "./lib/telegram.js";
 import { scanBlockRange } from "./lib/scan-engine.js";
 import { sendReport } from "./lib/telegram.js";
 import { registerChatHandler } from "./lib/chat-handler.js";
-import { formatRugReport } from "./lib/rugcheck.js";
+import { formatAlertCard } from "./lib/rugcheck.js";
 import { loadState, saveState, alreadyPosted, markPosted } from "./lib/state.js";
 import { UNISWAP_V3_FACTORY } from "./lib/constants.js";
 
@@ -108,10 +108,10 @@ async function sniperTick(): Promise<void> {
           console.log(`  [bot] ${result.verdict} for ${result.tokenAddress} — below threshold, skipping`);
           return;
         }
-        console.log(`  [bot] Sending report for ${result.tokenAddress} (${result.verdict})`);
+        console.log(`  [bot] Sending alert for ${result.tokenAddress} (${result.verdict})`);
         await sendReport(
           process.env.TELEGRAM_NOTIFY_CHAT_ID!,
-          formatRugReport(result, meta)
+          formatAlertCard(result, meta)
         );
         markPosted(state, result.tokenAddress);
       },

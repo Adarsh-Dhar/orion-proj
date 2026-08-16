@@ -342,7 +342,7 @@ export async function runRugCheckLLM(
   pairedAsset: string,
   deployBlock: bigint,
   meta: { name: string; symbol: string; decimals: number; totalSupply: bigint; totalSupplyFormatted: string },
-  opts?: { userQuestion?: string }
+  opts?: { userQuestion?: string; mode?: "alert" | "chat" }
 ): Promise<RugCheckResult> {
 
   // ── 1. Collect evidence ───────────────────────────────────────────────────
@@ -500,5 +500,53 @@ export function formatRugReport(
   }
   lines.push(`╚════════════════════════════════════════════════════════════════`);
 
+  return lines.join("\n");
+}
+
+// ─── Alert card (sniper → notification channel) ────────────────────────────────
+
+export function formatAlertCard(
+  r: RugCheckResult,
+  meta: { name: string; symbol: string; totalSupplyFormatted: string }
+): string {
+  const v = VERDICT_EMOJI[r.verdict];
+  const lines: string[] = [];
+
+  lines.push(`${v} ${r.verdict} — ${meta.name} ($${meta.symbol})  ·  ${r.score}/100`);
+  lines.push(r.summary);
+
+  const topFlags = [...r.flags].sort((a, b) => b.points - a.points).slice(0, 2);
+  for (const f of topFlags) {
+    lines.push(`${SEVERITY_EMOJI[f.severity]} ${f.label}`);
+  }
+
+  lines.push(r.tokenAddress);
+  lines.push(`https://basescan.org/address/${r.tokenAddress}`);
+
+  return lines.join("\n");
+}
+
+// ─── Chat reply (chat.ts / Telegram DM) ─────────────────────────────────────────
+
+export function formatChatReply(
+  r: RugCheckResult,
+  meta: { name: string; symbol: string; totalSupplyFormatted: string }
+): string {
+  const v = VERDICT_EMOJI[r.verdict];
+  const lines: string[] = [];
+
+  if (r.answer) {
+    lines.push(r.answer, "");
+  }
+
+  lines.push(`${v} ${r.verdict}  ·  ${r.score}/100  ·  ${meta.name} ($${meta.symbol})`);
+
+  const topFlags = [...r.flags].sort((a, b) => b.points - a.points).slice(0, 3);
+  if (topFlags.length > 0) {
+    lines.push("");
+    for (const f of topFlags) lines.push(`${SEVERITY_EMOJI[f.severity]} ${f.label} — ${f.detail}`);
+  }
+
+  lines.push("", r.tokenAddress, `Send /full ${r.tokenAddress} for the complete report.`);
   return lines.join("\n");
 }

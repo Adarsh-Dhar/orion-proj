@@ -7,7 +7,8 @@
  *
  * Exports:
  *   extractAddress(text)                         — pull first 0x address from string
- *   answerTokenQuestion(client, address, question) — run full pipeline, return result or error
+ *   stripAddress(text, address)                  — remove address from text, return remainder
+ *   answerTokenQuestion(client, address, question, mode) — run full pipeline, return result or error
  */
 
 import { type Address, type PublicClient } from "viem";
@@ -25,6 +26,11 @@ type AnyClient = PublicClient<any>;
 export function extractAddress(text: string): Address | null {
   const match = text.match(/0x[a-fA-F0-9]{40}/);
   return match ? (match[0] as Address) : null;
+}
+
+/** Removes the first occurrence of `address` from `text`, trimmed. */
+export function stripAddress(text: string, address: Address): string {
+  return text.replace(address, "").trim();
 }
 
 // ─── Success / failure union ──────────────────────────────────────────────────
@@ -48,7 +54,7 @@ export type HandlerOutcome = HandlerSuccess | HandlerError;
  *   1. Resolve Uniswap V3 pool for the token
  *   2. Fetch ERC-20 metadata (name, symbol, supply)
  *   3. Binary-search the exact deploy block
- *   4. Run LLM rug check (optionally answering userQuestion)
+ *   4. Run LLM rug check (optionally answering userQuestion, in alert or chat mode)
  *
  * Returns either { result, meta } on success or { error } on failure so
  * callers can pattern-match without try/catch.
@@ -56,7 +62,8 @@ export type HandlerOutcome = HandlerSuccess | HandlerError;
 export async function answerTokenQuestion(
   client: AnyClient,
   tokenAddress: Address,
-  userQuestion?: string
+  userQuestion?: string,
+  mode: "alert" | "chat" = "chat"
 ): Promise<HandlerOutcome> {
 
   // ── 1. Resolve pool ─────────────────────────────────────────────────────
@@ -95,7 +102,7 @@ export async function answerTokenQuestion(
       resolved.pairedLabel,
       deployBlock,
       meta,
-      userQuestion ? { userQuestion } : undefined
+      { userQuestion, mode }
     );
     return { result, meta };
   } catch (err) {

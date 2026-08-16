@@ -3,7 +3,7 @@
  *
  * The user types a message. If it contains a token address (0x…40 hex chars),
  * the agent runs the full pipeline via answerTokenQuestion() and prints the
- * formatted report (which includes the "Your Question" block when a question
+ * formatted chat reply (which includes a conversational answer when a question
  * was asked).
  *
  * If the message has no address, a helpful prompt is printed instead.
@@ -14,8 +14,8 @@ import "dotenv/config";
 import * as readline from "readline";
 import { createPublicClient, http } from "viem";
 import { base } from "viem/chains";
-import { extractAddress, answerTokenQuestion } from "./lib/rugcheck-handler.js";
-import { formatRugReport } from "./lib/rugcheck.js";
+import { extractAddress, answerTokenQuestion, stripAddress } from "./lib/rugcheck-handler.js";
+import { formatChatReply } from "./lib/rugcheck.js";
 
 // ─── Env validation ───────────────────────────────────────────────────────────
 
@@ -55,14 +55,21 @@ async function handleMessage(userInput: string): Promise<void> {
   console.log("  Resolving Uniswap V3 pool…");
   console.log("  Running on-chain evidence collection + LLM rug check…\n");
 
-  const outcome = await answerTokenQuestion(client as any, tokenAddress, userInput);
+  const question = stripAddress(userInput, tokenAddress);
+  const outcome = await answerTokenQuestion(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    client as any,
+    tokenAddress,
+    question.length > 0 ? question : undefined,
+    "chat"
+  );
 
   if ("error" in outcome) {
     console.log(`\n  ⚠️  ${outcome.error}\n`);
     return;
   }
 
-  console.log(formatRugReport(outcome.result, outcome.meta));
+  console.log(formatChatReply(outcome.result, outcome.meta));
   console.log();
 }
 
@@ -80,7 +87,7 @@ console.log(`  RPC     : ${RPC_URL}`);
 console.log(`  Model   : ${process.env.GEMINI_MODEL ?? "gemini-2.0-flash-lite"}`);
 console.log("  Usage   : paste a token address in your message and ask anything.");
 console.log("            The agent resolves the exact deploy block, collects on-chain");
-console.log("            evidence, and answers your question in the rug-check report.");
+console.log("            evidence, and answers your question conversationally.");
 console.log("  Exit    : Ctrl+C");
 console.log("═══════════════════════════════════════════════════════════════════\n");
 

@@ -5,7 +5,7 @@ const PORT = process.env.PORT || 8080;
 
 app.get('/', (req, res) => {
   res.json({
-    message: 'Watchdog Tweet Server Running',
+    message: 'RugHound Server Running',
     timestamp: new Date().toISOString(),
     status: 'healthy'
   });

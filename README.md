@@ -1,4 +1,4 @@
-# Base Token Watchdog + Telegram Bot
+# RugHound - Base Token Rug Check Bot
 
 A Telegram bot that monitors new token launches on Base, runs AI-powered rug checks, and posts alerts to channels.
 
@@ -128,4 +128,3 @@ tsconfig.json
 - **Aerodrome DEX support** — `PairCreated` event on Base's dominant meme-token DEX
 - **Chat ↔ sniper bridge** — letting the chat agent query what the sniper has detected
 - **Advanced filtering** — more sophisticated risk thresholds and notification rules
-# orion-proj

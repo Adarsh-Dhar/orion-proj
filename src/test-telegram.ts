@@ -55,7 +55,7 @@ async function testBot() {
 
   try {
     // Try to send a test message
-    const result = await bot.api.sendMessage(chatId, "🧪 Test message from watchdog bot - setup verification successful!");
+    const result = await bot.api.sendMessage(chatId, "🧪 Test message from RugHound bot - setup verification successful!");
     console.log(`✅ Test message sent successfully! Message ID: ${result.message_id}`);
     console.log("   Your bot is properly configured and can send messages to this chat.\n");
   } catch (err: any) {

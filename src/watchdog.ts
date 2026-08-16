@@ -78,7 +78,7 @@ function formatFee(fee: number): string {
 // ─── Startup banner ───────────────────────────────────────────────────────────
 
 console.log("═══════════════════════════════════════════════════════════");
-console.log("  Base Token Watchdog");
+console.log("  RugHound - Base Token Monitor");
 console.log("  Network : Base Mainnet (chain ID 8453)");
 console.log(`  RPC     : ${RPC_URL}`);
 console.log(`  Factory : ${UNISWAP_V3_FACTORY}  [Uniswap V3]`);
@@ -124,7 +124,7 @@ const unwatch = client.watchContractEvent({
       try {
       meta = await fetchTokenMetadata(client as any, newToken!);
       } catch (err) {
-        console.error(`[watchdog] fetchTokenMetadata failed for ${newToken}: ${err}`);
+        console.error(`[rughound] fetchTokenMetadata failed for ${newToken}: ${err}`);
         continue;
       }
 
@@ -151,14 +151,14 @@ const unwatch = client.watchContractEvent({
 
   onError(error) {
     // Log but do not rethrow — the watch loop must stay alive
-    console.error(`[watchdog] RPC error: ${error.message}`);
+    console.error(`[rughound] RPC error: ${error.message}`);
   },
 });
 
 // ─── Clean shutdown ───────────────────────────────────────────────────────────
 
 process.on("SIGINT", () => {
-  console.log("\n[watchdog] Shutting down…");
+  console.log("\n[rughound] Shutting down…");
   unwatch();
   process.exit(0);
 });

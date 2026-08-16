@@ -143,7 +143,7 @@ async function loop(fn: () => Promise<void>, intervalMs: number): Promise<void> 
 
 async function main(): Promise<void> {
   console.log(`${"═".repeat(66)}`);
-  console.log(`  Watchdog Telegram Bot`);
+  console.log(`  RugHound Telegram Bot`);
   console.log(`  Network  : Base Mainnet (chain ID 8453)`);
   console.log(`  RPC      : ${RPC_URL}`);
   console.log(`  Factory  : ${UNISWAP_V3_FACTORY}  [Uniswap V3]`);

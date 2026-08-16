@@ -1,10 +1,10 @@
 #!/bin/bash
 
-# Start dev server and localtunnel for watchdog-tweet project
+# Start dev server and localtunnel for RugHound project
 
 PORT=8080
 
-echo "Starting Watchdog Tweet Server and Tunnel..."
+echo "Starting RugHound Server and Tunnel..."
 echo "=============================================="
 
 # Kill any existing process on the port

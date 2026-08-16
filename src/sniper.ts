@@ -25,12 +25,12 @@ const RPC_URL = process.env.RPC_URL as string;
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
-/** How often to scan for new pools (ms) */
+/** How often to wait between scan completions (ms) */
 const POLL_INTERVAL_MS = 5 * 60 * 1_000; // 5 minutes
 
 /**
- * Base produces a block roughly every 2 seconds.
- * 5 minutes = ~150 blocks. Add a 10-block buffer for safety.
+ * Bootstrap lookback for the very first scan only.
+ * Base produces a block every ~2 seconds → 5 min ≈ 150 blocks + 10 buffer.
  */
 const BLOCKS_PER_INTERVAL = 160n;
 
@@ -40,6 +40,18 @@ const client = createPublicClient({
   chain: base,
   transport: http(RPC_URL, { retryCount: 3, retryDelay: 1500 }),
 });
+
+// ─── State ────────────────────────────────────────────────────────────────────
+
+/**
+ * Watermark: the last block we successfully scanned.
+ * - null  → first run; use the fixed bootstrap lookback
+ * - bigint → resume from lastScannedBlock + 1 so no block is ever skipped
+ *
+ * Only advanced after a successful getLogs call — if the RPC call fails,
+ * the next run retries the exact same range.
+ */
+let lastScannedBlock: bigint | null = null;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -78,26 +90,44 @@ function identifyTokens(
   return {
     newToken: t0known && t1known ? null : token0,
     pairedWith: t1known ? token1 : null,
-    pairedLabel: t1known ? (QUOTE_ASSET_LABELS[t1] ?? shortAddr(token1)) : "unknown",
+    pairedLabel: t1known
+      ? (QUOTE_ASSET_LABELS[t1] ?? shortAddr(token1))
+      : "unknown",
   };
 }
 
 // ─── Core scan function ───────────────────────────────────────────────────────
 
 /**
- * Scan the last ~5 minutes of blocks for new PoolCreated events,
- * run the full metadata + rug-check pipeline on each token found,
- * and print a structured report for every one.
+ * Scan from the watermark (or bootstrap lookback on first run) up to the
+ * current block for new PoolCreated events, run the full metadata +
+ * rug-check pipeline on each token, and print a structured report.
+ *
+ * Watermark (`lastScannedBlock`) is only advanced after a successful getLogs,
+ * so a failed RPC call causes the same range to be retried next run.
  */
 async function scanWindow(runNumber: number): Promise<void> {
   const scanTime = new Date().toISOString();
   const toBlock = await client.getBlockNumber();
+
+  // First run → bootstrap with fixed lookback.
+  // All subsequent runs → pick up exactly where we left off.
   const fromBlock =
-    toBlock > BLOCKS_PER_INTERVAL ? toBlock - BLOCKS_PER_INTERVAL : 0n;
+    lastScannedBlock !== null
+      ? lastScannedBlock + 1n
+      : toBlock > BLOCKS_PER_INTERVAL
+        ? toBlock - BLOCKS_PER_INTERVAL
+        : 0n;
+
+  const windowLabel =
+    lastScannedBlock !== null ? "watermark" : "bootstrap";
 
   console.log(`\n${"═".repeat(66)}`);
   console.log(`  SNIPER SCAN #${runNumber}  |  ${scanTime}`);
-  console.log(`  Blocks : ${fromBlock.toLocaleString()} → ${toBlock.toLocaleString()}  (~${BLOCKS_PER_INTERVAL} blocks / 5 min)`);
+  console.log(
+    `  Blocks : ${fromBlock.toLocaleString()} → ${toBlock.toLocaleString()}` +
+    `  (${windowLabel}, ${(toBlock - fromBlock + 1n).toLocaleString()} blocks)`
+  );
   console.log(`${"═".repeat(66)}\n`);
 
   // ── Fetch PoolCreated events in the window ──────────────────────────────
@@ -111,8 +141,12 @@ async function scanWindow(runNumber: number): Promise<void> {
     });
   } catch (err) {
     console.error(`[sniper] getLogs failed: ${err}`);
+    // Do NOT advance lastScannedBlock — next run retries the same range
     return;
   }
+
+  // Advance the watermark only after a successful fetch
+  lastScannedBlock = toBlock;
 
   if (logs.length === 0) {
     console.log("  No new pools detected in this window.\n");
@@ -139,16 +173,16 @@ async function scanWindow(runNumber: number): Promise<void> {
     console.log(`  Fee: ${formatFee(fee)}  |  Tx: ${txHash}`);
     console.log(`  BaseScan: https://basescan.org/tx/${txHash}\n`);
 
-    const { newToken, pairedWith, pairedLabel } = identifyTokens(token0, token1);
+    const { newToken, pairedLabel } = identifyTokens(token0, token1);
 
-    // ── Ambiguous: both or neither are known quote assets ───────────────
+    // ── Ambiguous: both tokens are known quote assets ────────────────────
     if (!newToken) {
       console.log(`  ⚠️  Ambiguous pair — both tokens are known quote assets. Skipping.\n`);
       console.log(`${"─".repeat(66)}\n`);
       continue;
     }
 
-    // ── Fetch ERC-20 metadata ───────────────────────────────────────────
+    // ── Fetch ERC-20 metadata ────────────────────────────────────────────
     let meta;
     try {
       meta = await fetchTokenMetadata(client, newToken);
@@ -158,7 +192,7 @@ async function scanWindow(runNumber: number): Promise<void> {
       continue;
     }
 
-    // ── Run rug check ───────────────────────────────────────────────────
+    // ── Run rug check ────────────────────────────────────────────────────
     let rugResult;
     try {
       rugResult = await runRugCheck(
@@ -174,11 +208,10 @@ async function scanWindow(runNumber: number): Promise<void> {
       continue;
     }
 
-    // ── Print full report ───────────────────────────────────────────────
+    // ── Print full report ────────────────────────────────────────────────
     console.log(formatRugReport(rugResult, meta));
     console.log();
 
-    // Brief separator between tokens
     if (i < logs.length - 1) {
       console.log(`${"─".repeat(66)}\n`);
     }
@@ -187,7 +220,30 @@ async function scanWindow(runNumber: number): Promise<void> {
   console.log(`  Scan #${runNumber} complete. Next scan in 5 minutes.\n`);
 }
 
-// ─── Main loop ────────────────────────────────────────────────────────────────
+// ─── Recursive loop ───────────────────────────────────────────────────────────
+
+/**
+ * Schedules the next scan only AFTER the current one finishes.
+ *
+ * This is intentionally a recursive setTimeout rather than setInterval.
+ * setInterval fires on a fixed clock regardless of how long the previous
+ * run took — if a scan takes >5 minutes (many tokens, many RPC calls),
+ * two scans would run concurrently and hammer the RPC endpoint.
+ * With setTimeout the 5-minute pause begins after the scan completes,
+ * so scans are always sequential no matter how long they take.
+ */
+async function loop(runNumber: number): Promise<void> {
+  try {
+    await scanWindow(runNumber);
+  } catch (err) {
+    // Catch anything scanWindow didn't handle — keep the loop alive
+    console.error(`[sniper] Unhandled error in scan #${runNumber}: ${err}`);
+  }
+  // Schedule next run only after this one is fully done
+  setTimeout(() => loop(runNumber + 1), POLL_INTERVAL_MS);
+}
+
+// ─── Entry point ─────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
   console.log(`${"═".repeat(66)}`);
@@ -195,28 +251,16 @@ async function main(): Promise<void> {
   console.log(`  Network  : Base Mainnet (chain ID 8453)`);
   console.log(`  RPC      : ${RPC_URL}`);
   console.log(`  Factory  : ${UNISWAP_V3_FACTORY}  [Uniswap V3]`);
-  console.log(`  Interval : every 5 minutes`);
+  console.log(`  Interval : 5 min after each scan completes (sequential, no overlap)`);
   console.log(`  Checks   : ownership · proxy · dev wallet · top-5 holders · liquidity`);
   console.log(`  Started  : ${new Date().toISOString()}`);
   console.log(`${"═".repeat(66)}\n`);
 
-  let runNumber = 1;
+  // First scan runs immediately; loop() takes over for all subsequent scans
+  await scanWindow(1);
+  setTimeout(() => loop(2), POLL_INTERVAL_MS);
 
-  // Run immediately on startup, then on interval
-  await scanWindow(runNumber++);
-
-  const timer = setInterval(async () => {
-    try {
-      await scanWindow(runNumber++);
-    } catch (err) {
-      // Never let an uncaught error kill the interval
-      console.error(`[sniper] Unhandled error in scan: ${err}`);
-    }
-  }, POLL_INTERVAL_MS);
-
-  // ── Clean shutdown ────────────────────────────────────────────────────
   process.on("SIGINT", () => {
-    clearInterval(timer);
     console.log("\n[sniper] Shutting down…");
     process.exit(0);
   });

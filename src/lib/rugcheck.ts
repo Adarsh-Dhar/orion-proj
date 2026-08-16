@@ -86,26 +86,31 @@ async function safeRead<T>(fn: () => Promise<T>, fallback: T): Promise<T> {
   }
 }
 
-/** Resolve the deployer address from the token's creation transaction */
+/** Resolve the deployer address from the token's first mint (Transfer from 0x0).
+ *
+ * Scans only within [fromBlock, toBlock] — a tight window around the deploy tx.
+ * Avoids the fromBlock:0n pattern that every real RPC provider rejects with a
+ * "block range too large" error, which previously always silently returned "unknown".
+ */
 async function getDeployer(
   client: PublicClient,
-  tokenAddress: Address
+  tokenAddress: Address,
+  fromBlock: bigint,
+  toBlock: bigint
 ): Promise<string> {
   try {
-    // getLogs for the first Transfer event from the zero address = minting tx
     const logs = await client.getLogs({
       address: tokenAddress,
       event: TRANSFER_EVENT_ABI[0],
       args: { from: NULL_ADDRESS as Address },
-      fromBlock: 0n,
-      toBlock: "latest",
+      fromBlock,
+      toBlock,
     });
     if (logs.length === 0) return "unknown";
-    // Sort ascending and take the earliest
+    // Sort ascending and take the earliest mint
     const sorted = [...logs].sort((a, b) =>
       a.blockNumber! < b.blockNumber! ? -1 : 1
     );
-    // The 'to' of the first mint is the deployer/recipient
     const firstMint = sorted[0];
     return (firstMint.args as { to: string }).to ?? "unknown";
   } catch {
@@ -208,18 +213,47 @@ export async function runRugCheck(
   ]);
 
   // ── 2. Ownership check ─────────────────────────────────────────────────────
-  const ownerAddress = await safeRead(
-    () => client.readContract({ address: tokenAddress, abi: OWNER_ABI, functionName: "owner" }) as Promise<string>,
-    "unknown"
-  );
-  const ownershipRenounced =
-    ownerAddress === NULL_ADDRESS || ownerAddress === "unknown";
+  //
+  // Three distinct outcomes — we must not conflate them:
+  //   a) owner() returns 0x000...0000  → verified renounced  ✅
+  //   b) owner() returns a real address → owner is active    ❌
+  //   c) owner() reverts / call fails   → indeterminate      ⚠️
+  //
+  // The old code treated (c) the same as (a) — "unknown" → ownershipRenounced=true.
+  // That's the dangerous direction: a malicious token with a custom contract that
+  // doesn't implement Ownable gets a green "Renounced: ✅ Yes" for free.
+  // Now (c) raises a MEDIUM flag instead of silently passing.
 
-  if (!ownershipRenounced && ownerAddress !== "unknown") {
+  let ownerAddress: string;
+  let ownerCallFailed = false;
+  try {
+    ownerAddress = await client.readContract({
+      address: tokenAddress,
+      abi: OWNER_ABI,
+      functionName: "owner",
+    }) as string;
+  } catch {
+    ownerAddress = "unknown";
+    ownerCallFailed = true;
+  }
+
+  // Only mark renounced when we got an explicit zero address back
+  const ownershipRenounced = ownerAddress === NULL_ADDRESS;
+
+  if (ownerCallFailed) {
+    // Could not verify — flag it but keep points low (not necessarily malicious)
+    flags.push({
+      id: "ownership_indeterminate",
+      label: "Ownership indeterminate — owner() call failed",
+      detail: `owner() reverted or is not implemented. Cannot confirm renounce status — manual review recommended.`,
+      severity: "MEDIUM",
+      points: 10,
+    });
+  } else if (!ownershipRenounced) {
     flags.push({
       id: "ownership_not_renounced",
       label: "Ownership not renounced",
-      detail: `Owner is ${ownerAddress} — contract can be modified post-launch.`,
+      detail: `Owner is ${ownerAddress} — contract can be modified or rugged post-launch.`,
       severity: "HIGH",
       points: 25,
     });
@@ -238,9 +272,29 @@ export async function runRugCheck(
   }
 
   // ── 4. Deployer / dev wallet concentration ─────────────────────────────────
-  const deployerAddress = await getDeployer(client, tokenAddress);
+  //
+  // OLD: getDeployer() used fromBlock: 0n — scanning from genesis.
+  // Infura (and most providers) reject eth_getLogs with a range > 10k blocks,
+  // so that always failed silently, always returned "unknown", always showed
+  // Dev hold: 0.00% regardless of reality.
+  //
+  // FIX: anchor the mint-scan to deployBlock. The token was deployed at or
+  // just before the pool creation, so the mint tx is always within a very
+  // small window of deployBlock. We look back a maximum of 500 blocks
+  // (~16 minutes) to be safe, well within any provider's block range limit.
 
-  // Scan holder balances from deploy block (cap window to ~10k blocks = ~5h)
+  const MINT_LOOKBACK = 500n;
+  const mintScanFrom =
+    deployBlock > MINT_LOOKBACK ? deployBlock - MINT_LOOKBACK : 0n;
+
+  const deployerAddress = await getDeployer(
+    client,
+    tokenAddress,
+    mintScanFrom,
+    deployBlock
+  );
+
+  // Scan holder balances from mint window (cap to ~10k blocks = ~5h on Base)
   const scanFrom = deployBlock > 10_000n ? deployBlock - 10_000n : 0n;
   const holderBalances = await getHolderBalances(client, tokenAddress, scanFrom);
 
@@ -253,6 +307,20 @@ export async function runRugCheck(
     totalSupply > 0n
       ? Number((deployerBalance * 10_000n) / totalSupply) / 100
       : 0;
+
+  // If holder scan returned nothing, flag that wallet data is indeterminate
+  // rather than silently showing 0.00% which looks clean but is uninformative
+  const holderDataAvailable = holderBalances.size > 0;
+
+  if (!holderDataAvailable) {
+    flags.push({
+      id: "holder_data_indeterminate",
+      label: "Holder distribution could not be verified",
+      detail: `Transfer event scan returned no data — dev wallet % and top-5 concentration are unverified. Manual review recommended.`,
+      severity: "MEDIUM",
+      points: 10,
+    });
+  }
 
   if (deployerPct >= DEV_PCT_CRITICAL) {
     flags.push({
@@ -425,7 +493,13 @@ export function formatRugReport(r: RugCheckResult, meta: { name: string; symbol:
   lines.push(`║`);
   lines.push(`║  ── Ownership ──────────────────────────────────────────────`);
   lines.push(`║  Owner    : ${r.ownerAddress}`);
-  lines.push(`║  Renounced: ${r.ownershipRenounced ? "✅ Yes" : "❌ No"}`);
+  lines.push(`║  Renounced: ${
+    r.ownerAddress === "unknown"
+      ? "⚠️  Unknown (call failed — see flags)"
+      : r.ownershipRenounced
+        ? "✅ Yes (verified zero address)"
+        : "❌ No"
+  }`);
   lines.push(`║  Proxy    : ${r.isProxy ? "⚠️  Yes (upgradeable)" : "✅ No"}`);
   lines.push(`║`);
   lines.push(`║  ── Supply & Wallets ────────────────────────────────────────`);

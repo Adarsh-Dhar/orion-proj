@@ -1,0 +1,23 @@
+{
+  "name": "watchdog-tweet",
+  "version": "1.0.0",
+  "description": "",
+  "scripts": {
+    "watchdog": "tsx src/watchdog.ts",
+    "chat": "tsx src/chat.ts",
+    "sniper": "tsx src/sniper.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "viem": "^2.55.16"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2"
+  }
+}

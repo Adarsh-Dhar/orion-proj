@@ -100,7 +100,7 @@ export function recordLiquiditySnapshot(state: BotState, poolAddress: string, sn
   const arr = state.liquidityHistory[key] ?? (state.liquidityHistory[key] = []);
   arr.push(snap);
   if (arr.length > 5) arr.shift(); // keep it small — don't need unbounded history
-  saveState(state);
+  // Note: caller must call saveState() after batch operations
 }
 
 export function addToWatchlist(state: BotState, tokenAddress: string, poolAddress: string, pairedAsset: string): void {

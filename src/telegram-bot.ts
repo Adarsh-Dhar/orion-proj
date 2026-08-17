@@ -20,7 +20,7 @@ import { scanBlockRange, resolveTokenPool } from "./lib/scan-engine.js";
 import { sendReport } from "./lib/telegram.js";
 import { registerChatHandler } from "./lib/chat-handler.js";
 import { formatAlertCard } from "./lib/rugcheck.js";
-import { loadState, saveState, alreadyPosted, markPosted, addToWatchlist, getWatchlistTokens } from "./lib/state.js";
+import { loadState, saveState, alreadyPosted, markPosted, addToWatchlist, getWatchlistTokens, recordLiquiditySnapshot } from "./lib/state.js";
 import { checkLiquidityDelta } from "./lib/evidence.js";
 import { UNISWAP_V3_FACTORY } from "./lib/constants.js";
 
@@ -147,6 +147,10 @@ async function sniperTick(): Promise<void> {
     for (const entry of watchlistEntries) {
       try {
         const deltaResult = await checkLiquidityDelta(client as any, entry.poolAddress as any, state);
+        // Save the current snapshot for next comparison
+        if (deltaResult.currentSnapshot) {
+          recordLiquiditySnapshot(state, entry.poolAddress, deltaResult.currentSnapshot);
+        }
         if (deltaResult.liquidityDeltaPct !== null && deltaResult.liquidityDeltaPct < -30) {
           // Significant liquidity drop detected
           const emoji = deltaResult.liquidityDeltaPct < -70 ? "🔴" : "🟠";
@@ -164,6 +168,8 @@ async function sniperTick(): Promise<void> {
         console.error(`  [watchlist] Error checking ${entry.tokenAddress}: ${err}`);
       }
     }
+    // Batch save after the loop to avoid excessive file writes
+    saveState(state);
   } else {
     console.log(`  [watchlist] No tokens to monitor (watchlist empty or all entries expired)`);
   }

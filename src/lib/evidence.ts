@@ -19,7 +19,7 @@
 import { type Address, formatEther, encodeFunctionData, parseEventLogs } from "viem";
 import type { PublicClient } from "viem";
 import type { BotState, LiquiditySnapshot } from "./state.js";
-import { recordLiquiditySnapshot } from "./state.js";
+import { recordLiquiditySnapshot, saveState } from "./state.js";
 import {
   OWNER_ABI,
   NULL_ADDRESS,
@@ -641,6 +641,7 @@ export async function collectEvidence(
     // Save the current snapshot
     if (deltaResult.currentSnapshot) {
       recordLiquiditySnapshot(state, poolAddress, deltaResult.currentSnapshot);
+      saveState(state);
     }
   }
 

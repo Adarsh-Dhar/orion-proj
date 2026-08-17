@@ -16,11 +16,12 @@ import "dotenv/config";
 import { createPublicClient, http } from "viem";
 import { base } from "viem/chains";
 import { bot } from "./lib/telegram.js";
-import { scanBlockRange } from "./lib/scan-engine.js";
+import { scanBlockRange, resolveTokenPool } from "./lib/scan-engine.js";
 import { sendReport } from "./lib/telegram.js";
 import { registerChatHandler } from "./lib/chat-handler.js";
 import { formatAlertCard } from "./lib/rugcheck.js";
-import { loadState, saveState, alreadyPosted, markPosted } from "./lib/state.js";
+import { loadState, saveState, alreadyPosted, markPosted, addToWatchlist, getWatchlistTokens } from "./lib/state.js";
+import { checkLiquidityDelta } from "./lib/evidence.js";
 import { UNISWAP_V3_FACTORY } from "./lib/constants.js";
 
 // ─── Env validation ───────────────────────────────────────────────────────────
@@ -38,6 +39,7 @@ validateEnv(["RPC_URL", "GEMINI_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_NOTIFY
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const SNIPER_INTERVAL_MS = 5 * 60_000; // 5 min
+const WATCHLIST_MAX_AGE_MINUTES = 120; // 2 hours
 /**
  * Block lookback per tick — mirrors scan-historical.ts's default range.
  * 50,048,826 - 50,045,225 = 3,601 blocks ≈ 2 hours of Base history.
@@ -98,12 +100,15 @@ async function sniperTick(): Promise<void> {
     toBlock,
     {
       shouldSkip: (tokenAddress) => {
-        // Skip tokens we've already posted about (before expensive evidence collection)
-        if (alreadyPosted(state, tokenAddress)) {
-          console.log(`  [bot] Already posted ${tokenAddress} — skipping`);
-          return true;
+        // New tokens get full check
+        if (!alreadyPosted(state, tokenAddress)) {
+          return false;
         }
-        return false;
+        
+        // Already posted tokens get skipped from full check
+        // They'll be monitored via the watchlist recheck loop instead
+        console.log(`  [bot] Already posted ${tokenAddress} — skipping full check (will monitor via watchlist)`);
+        return true;
       },
       onResult: async (result, meta) => {
         // Only post noteworthy verdicts
@@ -117,6 +122,7 @@ async function sniperTick(): Promise<void> {
           formatAlertCard(result, meta)
         );
         markPosted(state, result.tokenAddress);
+        addToWatchlist(state, result.tokenAddress, result.poolAddress, result.pairedAsset);
       },
       state: state,
     }
@@ -127,6 +133,35 @@ async function sniperTick(): Promise<void> {
 
   if (totalPools > 0) {
     console.log(`  Pools: ${totalPools} found | ${processed} checked | ${skipped} skipped`);
+  }
+
+  // ── Liquidity recheck for watchlist tokens ────────────────────────────────
+  const watchlistEntries = getWatchlistTokens(state, WATCHLIST_MAX_AGE_MINUTES);
+  console.log(`  Watchlist check: ${watchlistEntries.length} tokens (max age: ${WATCHLIST_MAX_AGE_MINUTES} min)`);
+  if (watchlistEntries.length > 0) {
+    console.log(`  Checking liquidity for ${watchlistEntries.length} watchlist tokens...`);
+    for (const entry of watchlistEntries) {
+      try {
+        const deltaResult = await checkLiquidityDelta(client as any, entry.poolAddress as any, state);
+        if (deltaResult.liquidityDeltaPct !== null && deltaResult.liquidityDeltaPct < -30) {
+          // Significant liquidity drop detected
+          const emoji = deltaResult.liquidityDeltaPct < -70 ? "🔴" : "🟠";
+          const severity = deltaResult.liquidityDeltaPct < -70 ? "CRITICAL" : "HIGH";
+          const message = `${emoji} Liquidity Alert — ${entry.tokenAddress.slice(0,8)}…${entry.tokenAddress.slice(-4)}\n` +
+            `Liquidity dropped ${Math.abs(deltaResult.liquidityDeltaPct).toFixed(1)}% since last check (${deltaResult.snapshotAgeMinutes} min ago)\n` +
+            `https://basescan.org/address/${entry.tokenAddress}`;
+          
+          await sendReport(process.env.TELEGRAM_NOTIFY_CHAT_ID!, message);
+          console.log(`  [watchlist] 🚨 Liquidity drop detected for ${entry.tokenAddress}: ${deltaResult.liquidityDeltaPct.toFixed(1)}%`);
+        } else {
+          console.log(`  [watchlist] ${entry.tokenAddress}: ${deltaResult.liquidityDeltaPct !== null ? deltaResult.liquidityDeltaPct.toFixed(1) + '%' : 'no data'}`);
+        }
+      } catch (err) {
+        console.error(`  [watchlist] Error checking ${entry.tokenAddress}: ${err}`);
+      }
+    }
+  } else {
+    console.log(`  [watchlist] No tokens to monitor (watchlist empty or all entries expired)`);
   }
 
   console.log(`  Sniper ${runLabel} complete. Next in 5 min.\n`);

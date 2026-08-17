@@ -18,6 +18,8 @@
 
 import { type Address, formatEther, encodeFunctionData, parseEventLogs } from "viem";
 import type { PublicClient } from "viem";
+import type { BotState, LiquiditySnapshot } from "./state.js";
+import { recordLiquiditySnapshot } from "./state.js";
 import {
   OWNER_ABI,
   NULL_ADDRESS,
@@ -93,6 +95,11 @@ export interface TokenEvidence {
   poolLiquidity: string | null;      // bigint as string; null = read failed
   liquidityLocked: boolean | null;   // null = unknown
   initialLiquidityEth: number | null;
+
+  // ── Liquidity delta monitoring ─────────────────────────────────────────────
+  liquidityDeltaPct: number | null;       // % change since last snapshot
+  liquidityPreviousReading: string | null; // previous liquidity value
+  snapshotAgeMinutes: number | null;      // minutes since last snapshot
 
   // ── Sell-ability (honeypot) ─────────────────────────────────────────────
   sellTestPassed: boolean | null;      // null = couldn't run the test at all
@@ -295,6 +302,35 @@ async function scanHolderBalances(
 // through the persistent BotState in state.ts to survive bot restarts.
 // Kept here for backwards compatibility, but the real implementation is in rugcheck.ts
 
+// ── Liquidity delta check ─────────────────────────────────────────────────────
+export async function checkLiquidityDelta(
+  client: AnyClient,
+  poolAddress: Address,
+  state: BotState
+): Promise<{ liquidityDeltaPct: number | null; liquidityPreviousReading: string | null; snapshotAgeMinutes: number | null; currentSnapshot: LiquiditySnapshot }> {
+  const history = state.liquidityHistory[poolAddress.toLowerCase()] ?? [];
+  const prev = history[history.length - 1];
+  const current = await client.readContract({ address: poolAddress, abi: POOL_LIQUIDITY_ABI, functionName: "liquidity" }) as bigint;
+
+  const snap: LiquiditySnapshot = {
+    liquidity: current.toString(),
+    blockNumber: (await client.getBlockNumber()).toString(),
+    ts: Date.now(),
+  };
+
+  // Don't save state here - let the caller handle that to avoid excessive writes
+  if (!prev) return { liquidityDeltaPct: null, liquidityPreviousReading: null, snapshotAgeMinutes: null, currentSnapshot: snap };
+
+  const prevVal = BigInt(prev.liquidity);
+  const deltaPct = prevVal === 0n ? null : Number(((current - prevVal) * 10000n) / prevVal) / 100;
+  return {
+    liquidityDeltaPct: deltaPct,
+    liquidityPreviousReading: prev.liquidity,
+    snapshotAgeMinutes: Math.round((Date.now() - prev.ts) / 60000),
+    currentSnapshot: snap,
+  };
+}
+
 // ── 1. Sell-ability / honeypot test ──────────────────────────────────────
 async function testSellability(
   client: AnyClient,
@@ -453,7 +489,9 @@ export async function collectEvidence(
   /** pre-fetched ERC-20 metadata (avoids a second round of reads) */
   meta: { name: string; symbol: string; decimals: number; totalSupply: bigint; totalSupplyFormatted: string },
   /** optional deployer history from persistent state */
-  deployerHistory?: { deployerSeenBefore: boolean; deployerPriorTokens: string[] }
+  deployerHistory?: { deployerSeenBefore: boolean; deployerPriorTokens: string[] },
+  /** optional state for liquidity delta monitoring */
+  state?: BotState
 ): Promise<TokenEvidence> {
   const warnings: string[] = [];
 
@@ -591,6 +629,21 @@ export async function collectEvidence(
   const sourceCheck = await checkSourceVerification(tokenAddress, warnings);
   const deployerHistoryData = deployerHistory ?? { deployerSeenBefore: false, deployerPriorTokens: [] };
 
+  // ── 8. Liquidity delta check (if state provided) ──────────────────────────
+  let liquidityDeltaData: { liquidityDeltaPct: number | null; liquidityPreviousReading: string | null; snapshotAgeMinutes: number | null } = { liquidityDeltaPct: null, liquidityPreviousReading: null, snapshotAgeMinutes: null };
+  if (state) {
+    const deltaResult = await checkLiquidityDelta(client, poolAddress, state);
+    liquidityDeltaData = {
+      liquidityDeltaPct: deltaResult.liquidityDeltaPct,
+      liquidityPreviousReading: deltaResult.liquidityPreviousReading,
+      snapshotAgeMinutes: deltaResult.snapshotAgeMinutes,
+    };
+    // Save the current snapshot
+    if (deltaResult.currentSnapshot) {
+      recordLiquiditySnapshot(state, poolAddress, deltaResult.currentSnapshot);
+    }
+  }
+
   // ── 8. Assemble ────────────────────────────────────────────────────────────
   return {
     tokenAddress,
@@ -624,6 +677,10 @@ export async function collectEvidence(
     poolLiquidity:       poolLiquidityRaw?.toString() ?? null,
     liquidityLocked,
     initialLiquidityEth,
+
+    liquidityDeltaPct:      liquidityDeltaData.liquidityDeltaPct,
+    liquidityPreviousReading: liquidityDeltaData.liquidityPreviousReading,
+    snapshotAgeMinutes:     liquidityDeltaData.snapshotAgeMinutes,
 
     sellTestPassed:      sellTest.sellTestPassed,
     sellTestAmountSent:  sellTest.sellTestAmountSent,

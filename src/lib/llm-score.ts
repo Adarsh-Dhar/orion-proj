@@ -94,6 +94,8 @@ SCORING GUIDE:
 - LP position held by EOA (not locked):                      +25 pts, HIGH
 - LP status unverifiable:                                    +10 pts, MEDIUM
 - Liquidity ever pulled (burn events detected):              +30 pts, HIGH
+- Liquidity dropped >30% since last snapshot:               +30 pts, HIGH
+- Liquidity dropped >70% since last snapshot:               +50 pts, CRITICAL
 - Sell test failed (confirmed honeypot):                     +50 pts, CRITICAL
 - Sell test unverifiable (no suitable holder):               +5 pts, LOW (inconclusive)
 - Source not verified (no source code):                      +15 pts, MEDIUM

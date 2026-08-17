@@ -321,6 +321,9 @@ export async function runRugCheck(
     deployerAddress, deployerBalance, deployerBalanceIsEstimate,
     deployerPct, top5HoldersPct,
     poolLiquidity, initialLiquidityEth, liquidityLocked,
+    liquidityDeltaPct: null,
+    liquidityPreviousReading: null,
+    snapshotAgeMinutes: null,
     sellTestPassed: null,
     sellTestAmountSent: null,
     sellTestError: null,
@@ -368,7 +371,7 @@ export async function runRugCheckLLM(
 
   // ── 2. Collect evidence ───────────────────────────────────────────────────
   const evidence: TokenEvidence = await collectEvidence(
-    client, tokenAddress, poolAddress, pairedAsset, deployBlock, meta, deployerHistoryData
+    client, tokenAddress, poolAddress, pairedAsset, deployBlock, meta, deployerHistoryData, opts?.state
   );
 
   // ── 3. Update deployer history from persistent state ──────────────────────
@@ -425,6 +428,9 @@ export async function runRugCheckLLM(
       deployerAddress, deployerBalance, deployerBalanceIsEstimate,
       deployerPct, top5HoldersPct,
       poolLiquidity, initialLiquidityEth, liquidityLocked,
+      liquidityDeltaPct: evidence.liquidityDeltaPct,
+      liquidityPreviousReading: evidence.liquidityPreviousReading,
+      snapshotAgeMinutes: evidence.snapshotAgeMinutes,
       sellTestPassed: evidence.sellTestPassed,
       sellTestAmountSent: evidence.sellTestAmountSent,
       sellTestError: evidence.sellTestError,
@@ -455,6 +461,9 @@ export async function runRugCheckLLM(
     deployerAddress, deployerBalance, deployerBalanceIsEstimate,
     deployerPct, top5HoldersPct,
     poolLiquidity, initialLiquidityEth, liquidityLocked,
+    liquidityDeltaPct: evidence.liquidityDeltaPct,
+    liquidityPreviousReading: evidence.liquidityPreviousReading,
+    snapshotAgeMinutes: evidence.snapshotAgeMinutes,
     sellTestPassed: evidence.sellTestPassed,
     sellTestAmountSent: evidence.sellTestAmountSent,
     sellTestError: evidence.sellTestError,

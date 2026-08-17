@@ -152,6 +152,7 @@ const NULL_POOL = "0x0000000000000000000000000000000000000000";
 export interface ResolvedPool {
   poolAddress: Address;
   pairedLabel: string;
+  pairedAsset: Address; // Add the paired asset address for watchlist
 }
 
 /**
@@ -172,7 +173,7 @@ export async function resolveTokenPool(
           args: [tokenAddress, quote.address, fee],
         }) as Address;
         if (pool && pool.toLowerCase() !== NULL_POOL) {
-          return { poolAddress: pool, pairedLabel: quote.label };
+          return { poolAddress: pool, pairedLabel: quote.label, pairedAsset: quote.address };
         }
       } catch {
         // non-existent pair just returns zero address or reverts — keep trying

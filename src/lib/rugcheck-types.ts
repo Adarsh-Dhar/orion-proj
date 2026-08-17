@@ -36,6 +36,11 @@ export interface RugCheckResult {
   initialLiquidityEth: number;
   liquidityLocked: boolean | null;   // null = unknown
 
+  // ── Liquidity delta monitoring ──────────────────────────────────────────────
+  liquidityDeltaPct: number | null;       // % change since last snapshot
+  liquidityPreviousReading: string | null; // previous liquidity value
+  snapshotAgeMinutes: number | null;      // minutes since last snapshot
+
   // ── New evidence fields ────────────────────────────────────────────────────
   sellTestPassed: boolean | null;
   sellTestAmountSent: string | null;

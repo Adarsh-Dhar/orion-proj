@@ -66,7 +66,7 @@ registerChatHandler(bot, client as any);
 // ─── State ────────────────────────────────────────────────────────────────────
 
 const state = loadState();
-let lastScannedBlock: bigint | null = null;
+let lastScannedBlock: bigint | null = state.lastScannedBlock ? BigInt(state.lastScannedBlock) : null;
 let sniperRun = 0;
 
 // ─── Sniper tick ──────────────────────────────────────────────────────────────
@@ -99,15 +99,17 @@ async function sniperTick(): Promise<void> {
     fromBlock,
     toBlock,
     {
-      shouldSkip: (tokenAddress) => {
+      shouldSkip: (tokenAddress, poolAddress, pairedAsset) => {
         // New tokens get full check
         if (!alreadyPosted(state, tokenAddress)) {
           return false;
         }
         
-        // Already posted tokens get skipped from full check
-        // They'll be monitored via the watchlist recheck loop instead
-        console.log(`  [bot] Already posted ${tokenAddress} — skipping full check (will monitor via watchlist)`);
+        // Backfill: this token was posted before the watchlist existed, or before
+        // this restart re-discovered it — make sure it's still being monitored.
+        addToWatchlist(state, tokenAddress, poolAddress, pairedAsset);
+        
+        console.log(`  [bot] Already posted ${tokenAddress} — skipping full check (watchlist ensured)`);
         return true;
       },
       onResult: async (result, meta) => {
@@ -130,6 +132,8 @@ async function sniperTick(): Promise<void> {
 
   // Advance watermark only after a successful scan
   lastScannedBlock = toBlock;
+  state.lastScannedBlock = toBlock.toString();
+  saveState(state);
 
   if (totalPools > 0) {
     console.log(`  Pools: ${totalPools} found | ${processed} checked | ${skipped} skipped`);

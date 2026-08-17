@@ -212,7 +212,7 @@ export interface ScanOptions {
    * Called before evidence collection to check if a token should be skipped.
    * Return true to skip this token (e.g., already posted).
    */
-  shouldSkip?: (tokenAddress: string) => boolean;
+  shouldSkip?: (tokenAddress: string, poolAddress: string, pairedAsset: string) => boolean;
   /**
    * Called once per token immediately after the rug-check report is printed.
    * Errors thrown here are caught and logged — they never abort the scan loop.
@@ -339,7 +339,7 @@ export async function scanBlockRange(
     }
 
     // Early skip check (e.g., already posted) before expensive evidence collection
-    if (opts?.shouldSkip && opts.shouldSkip(newToken)) {
+    if (opts?.shouldSkip && opts.shouldSkip(newToken, pool, pairedLabel)) {
       console.log(`  [scan-engine] Skipping ${newToken} — shouldSkip returned true\n`);
       console.log(`${"─".repeat(66)}\n`);
       skipped++;

@@ -31,6 +31,8 @@ export interface BotState {
   liquidityHistory: Record<string, LiquiditySnapshot[]>;
   /** Watchlist: tokens to monitor for liquidity drops after initial posting. */
   watchlist: Record<string, WatchlistEntry>; // key: token address (lowercased)
+  /** Last scanned block watermark (persisted to avoid re-scanning on restart) */
+  lastScannedBlock: string | null;
 }
 
 // ─── Path ─────────────────────────────────────────────────────────────────────
@@ -40,18 +42,19 @@ const STATE_PATH = "./bot-state.json";
 // ─── Load / save ──────────────────────────────────────────────────────────────
 
 export function loadState(): BotState {
-  if (!existsSync(STATE_PATH)) return { postedTokens: [], deployerHistory: {}, liquidityHistory: {}, watchlist: {} };
+  if (!existsSync(STATE_PATH)) return { postedTokens: [], deployerHistory: {}, liquidityHistory: {}, watchlist: {}, lastScannedBlock: null };
   try {
     const parsed = JSON.parse(readFileSync(STATE_PATH, "utf-8")) as Partial<BotState>;
     return {
       postedTokens: parsed.postedTokens ?? [],
       deployerHistory: parsed.deployerHistory ?? {},
       liquidityHistory: parsed.liquidityHistory ?? {},
-      watchlist: parsed.watchlist ?? {}
+      watchlist: parsed.watchlist ?? {},
+      lastScannedBlock: parsed.lastScannedBlock ?? null
     };
   } catch (err) {
     console.warn(`[state] Could not parse ${STATE_PATH}, starting fresh: ${err}`);
-    return { postedTokens: [], deployerHistory: {}, liquidityHistory: {}, watchlist: {} };
+    return { postedTokens: [], deployerHistory: {}, liquidityHistory: {}, watchlist: {}, lastScannedBlock: null };
   }
 }
 

@@ -16,7 +16,7 @@
  *   broke every historical scan.
  */
 
-import { type Address, formatEther } from "viem";
+import { type Address, formatEther, encodeFunctionData, parseEventLogs } from "viem";
 import type { PublicClient } from "viem";
 import {
   OWNER_ABI,
@@ -26,6 +26,18 @@ import {
   POOL_LIQUIDITY_ABI,
   TRANSFER_EVENT_ABI,
   ERC20_ABI,
+  // new:
+  UNISWAP_V3_POSITION_MANAGER,
+  UNCX_V3_LOCKER,
+  BURN_ADDRESS,
+  ETHERSCAN_API_BASE,
+  BASE_CHAIN_ID,
+  POOL_MINT_EVENT_ABI,
+  POOL_BURN_EVENT_ABI,
+  NPM_INCREASE_LIQUIDITY_EVENT_ABI,
+  NPM_OWNER_OF_ABI,
+  ERC20_TRANSFER_ABI,
+  SUSPICIOUS_SOURCE_KEYWORDS,
 } from "./constants.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -81,6 +93,28 @@ export interface TokenEvidence {
   poolLiquidity: string | null;      // bigint as string; null = read failed
   liquidityLocked: boolean | null;   // null = unknown
   initialLiquidityEth: number | null;
+
+  // ── Sell-ability (honeypot) ─────────────────────────────────────────────
+  sellTestPassed: boolean | null;      // null = couldn't run the test at all
+  sellTestAmountSent: string | null;
+  sellTestError: string | null;
+
+  // ── LP position lock status ─────────────────────────────────────────────
+  lpTokenId: string | null;
+  lpPositionOwner: string | null;
+  lpPositionStatus: "burned" | "locked_uncx" | "held_by_eoa" | "non_nft_position" | "unverified";
+
+  // ── Liquidity pull history ──────────────────────────────────────────────
+  liquidityEverPulled: boolean;
+  burnEventCount: number;
+
+  // ── Source verification ─────────────────────────────────────────────────
+  sourceVerified: boolean | null;      // null = the Etherscan call itself failed
+  suspiciousFunctions: string[];
+
+  // ── Deployer history (in-process memory, resets on bot restart) ────────
+  deployerSeenBefore: boolean;
+  deployerPriorTokens: string[];
 
   // ── RPC warnings ──────────────────────────────────────────────────────────
   /** Every failed RPC call during collection. The LLM must treat any field
@@ -256,6 +290,158 @@ async function scanHolderBalances(
   };
 }
 
+// ── Deployer history check (now uses persistent state) ──────────────────────
+// This function is no longer used directly — deployer history is now managed
+// through the persistent BotState in state.ts to survive bot restarts.
+// Kept here for backwards compatibility, but the real implementation is in rugcheck.ts
+
+// ── 1. Sell-ability / honeypot test ──────────────────────────────────────
+async function testSellability(
+  client: AnyClient,
+  tokenAddress: Address,
+  poolAddress: Address,
+  top5: Array<{ address: string; balance: string }>,
+  ownerAddress: string | null,
+  deployerAddress: string | null,
+  warnings: string[]
+): Promise<{ sellTestPassed: boolean | null; sellTestAmountSent: string | null; sellTestError: string | null }> {
+  const candidate = top5.find(
+    (h) =>
+      h.address.toLowerCase() !== NULL_ADDRESS.toLowerCase() &&
+      h.address.toLowerCase() !== BURN_ADDRESS.toLowerCase() &&
+      (ownerAddress === null || h.address.toLowerCase() !== ownerAddress.toLowerCase()) &&
+      (deployerAddress === null || h.address.toLowerCase() !== deployerAddress.toLowerCase()) &&
+      BigInt(h.balance) > 0n
+  );
+  if (!candidate) {
+    return { sellTestPassed: null, sellTestAmountSent: null, sellTestError: "only privileged wallets hold balance — test would be meaningless" };
+  }
+  const balance = BigInt(candidate.balance);
+  const testAmount = balance / 1000n > 0n ? balance / 1000n : balance; // 0.1% or the whole balance if tiny
+
+  try {
+    await client.call({
+      account: candidate.address as Address,
+      to: tokenAddress,
+      data: encodeFunctionData({ abi: ERC20_TRANSFER_ABI, functionName: "transfer", args: [poolAddress, testAmount] }),
+    });
+    return { sellTestPassed: true, sellTestAmountSent: testAmount.toString(), sellTestError: null };
+  } catch (err) {
+    warn(warnings, "sellTest", "simulated transfer to pool reverted", err);
+    const message = err instanceof Error ? err.message.split("\n")[0] : String(err);
+    return { sellTestPassed: false, sellTestAmountSent: testAmount.toString(), sellTestError: message };
+  }
+}
+
+// ── 2. LP position lock/burn status ──────────────────────────────────────
+async function checkLpLockStatus(
+  client: AnyClient,
+  poolAddress: Address,
+  deployBlock: bigint,
+  warnings: string[]
+): Promise<{ lpTokenId: string | null; lpPositionOwner: string | null; lpPositionStatus: TokenEvidence["lpPositionStatus"] }> {
+  try {
+    const mintLogs = await client.getLogs({
+      address: poolAddress,
+      event: POOL_MINT_EVENT_ABI[0],
+      fromBlock: deployBlock,
+      toBlock: deployBlock + 200n,
+    });
+    if (mintLogs.length === 0) {
+      return { lpTokenId: null, lpPositionOwner: null, lpPositionStatus: "unverified" };
+    }
+
+    const mintLog = mintLogs[0];
+    const mintOwner = (mintLog.args as { owner: string }).owner;
+
+    if (mintOwner.toLowerCase() !== UNISWAP_V3_POSITION_MANAGER.toLowerCase()) {
+      // Liquidity added directly, bypassing the standard NFT flow — no
+      // position NFT to check; that same address controls the liquidity.
+      return { lpTokenId: null, lpPositionOwner: mintOwner, lpPositionStatus: "non_nft_position" };
+    }
+
+    const receipt = await client.getTransactionReceipt({ hash: mintLog.transactionHash! });
+    const increaseLogs = parseEventLogs({ abi: NPM_INCREASE_LIQUIDITY_EVENT_ABI, logs: receipt.logs });
+    const npmLog = increaseLogs.find((l) => l.address.toLowerCase() === UNISWAP_V3_POSITION_MANAGER.toLowerCase());
+
+    if (!npmLog) {
+      return { lpTokenId: null, lpPositionOwner: mintOwner, lpPositionStatus: "unverified" };
+    }
+
+    const tokenId = (npmLog.args as { tokenId: bigint }).tokenId;
+    const owner = (await client.readContract({
+      address: UNISWAP_V3_POSITION_MANAGER,
+      abi: NPM_OWNER_OF_ABI,
+      functionName: "ownerOf",
+      args: [tokenId],
+    })) as string;
+
+    let status: TokenEvidence["lpPositionStatus"];
+    if (owner.toLowerCase() === BURN_ADDRESS.toLowerCase()) status = "burned";
+    else if (owner.toLowerCase() === UNCX_V3_LOCKER.toLowerCase()) status = "locked_uncx";
+    else status = "held_by_eoa";
+
+    return { lpTokenId: tokenId.toString(), lpPositionOwner: owner, lpPositionStatus: status };
+  } catch (err) {
+    warn(warnings, "lpLock", "position lookup failed", err);
+    return { lpTokenId: null, lpPositionOwner: null, lpPositionStatus: "unverified" };
+  }
+}
+
+// ── 3. Liquidity pull history (Burn event scan) ──────────────────────────
+async function checkLiquidityPullHistory(
+  client: AnyClient,
+  poolAddress: Address,
+  deployBlock: bigint,
+  currentBlock: bigint,
+  warnings: string[]
+): Promise<{ liquidityEverPulled: boolean; burnEventCount: number }> {
+  let count = 0;
+  let chunkStart = deployBlock;
+  while (chunkStart <= currentBlock) {
+    const chunkEnd = chunkStart + SCAN_CHUNK - 1n < currentBlock ? chunkStart + SCAN_CHUNK - 1n : currentBlock;
+    try {
+      const logs = await client.getLogs({
+        address: poolAddress,
+        event: POOL_BURN_EVENT_ABI[0],
+        fromBlock: chunkStart,
+        toBlock: chunkEnd,
+      });
+      count += logs.length;
+    } catch (err) {
+      warn(warnings, "burnHistory", `chunk [${chunkStart}, ${chunkEnd}] failed`, err);
+    }
+    chunkStart = chunkEnd + 1n;
+  }
+  return { liquidityEverPulled: count > 0, burnEventCount: count };
+}
+
+// ── 4. Source verification + backdoor keyword scan ──────────────────────
+async function checkSourceVerification(
+  tokenAddress: Address,
+  warnings: string[]
+): Promise<{ sourceVerified: boolean | null; suspiciousFunctions: string[] }> {
+  const apiKey = process.env.ETHERSCAN_API_KEY;
+  if (!apiKey) {
+    warn(warnings, "sourceCheck", "ETHERSCAN_API_KEY not set — skipping", "missing env var");
+    return { sourceVerified: null, suspiciousFunctions: [] };
+  }
+  try {
+    const url = `${ETHERSCAN_API_BASE}?chainid=${BASE_CHAIN_ID}&module=contract&action=getsourcecode&address=${tokenAddress}&apikey=${apiKey}`;
+    const res = await fetch(url);
+    const json = await res.json();
+    const source: string = json?.result?.[0]?.SourceCode ?? "";
+    if (!source) {
+      return { sourceVerified: false, suspiciousFunctions: [] };
+    }
+    const found = SUSPICIOUS_SOURCE_KEYWORDS.filter((kw) => source.includes(kw));
+    return { sourceVerified: true, suspiciousFunctions: [...found] };
+  } catch (err) {
+    warn(warnings, "sourceCheck", "Etherscan API call failed", err);
+    return { sourceVerified: null, suspiciousFunctions: [] };
+  }
+}
+
 // ─── Main collection function ─────────────────────────────────────────────────
 
 export async function collectEvidence(
@@ -265,7 +451,9 @@ export async function collectEvidence(
   pairedAsset: string,
   deployBlock: bigint,
   /** pre-fetched ERC-20 metadata (avoids a second round of reads) */
-  meta: { name: string; symbol: string; decimals: number; totalSupply: bigint; totalSupplyFormatted: string }
+  meta: { name: string; symbol: string; decimals: number; totalSupply: bigint; totalSupplyFormatted: string },
+  /** optional deployer history from persistent state */
+  deployerHistory?: { deployerSeenBefore: boolean; deployerPriorTokens: string[] }
 ): Promise<TokenEvidence> {
   const warnings: string[] = [];
 
@@ -394,7 +582,16 @@ export async function collectEvidence(
     }
   }
 
-  // ── 7. Assemble ────────────────────────────────────────────────────────────
+  // ── 7. New checks: sell test, LP lock, burn history, source, deployer ────
+  const sellTest = await testSellability(client, tokenAddress, poolAddress, top5, ownerAddress, deployer.address, warnings);
+  const lpLock = await checkLpLockStatus(client, poolAddress, deployBlock, warnings);
+  const pullHistory = await checkLiquidityPullHistory(
+    client, poolAddress, deployBlock, holderScan.scanTo, warnings
+  );
+  const sourceCheck = await checkSourceVerification(tokenAddress, warnings);
+  const deployerHistoryData = deployerHistory ?? { deployerSeenBefore: false, deployerPriorTokens: [] };
+
+  // ── 8. Assemble ────────────────────────────────────────────────────────────
   return {
     tokenAddress,
     poolAddress,
@@ -427,6 +624,23 @@ export async function collectEvidence(
     poolLiquidity:       poolLiquidityRaw?.toString() ?? null,
     liquidityLocked,
     initialLiquidityEth,
+
+    sellTestPassed:      sellTest.sellTestPassed,
+    sellTestAmountSent:  sellTest.sellTestAmountSent,
+    sellTestError:       sellTest.sellTestError,
+
+    lpTokenId:           lpLock.lpTokenId,
+    lpPositionOwner:     lpLock.lpPositionOwner,
+    lpPositionStatus:    lpLock.lpPositionStatus,
+
+    liquidityEverPulled: pullHistory.liquidityEverPulled,
+    burnEventCount:      pullHistory.burnEventCount,
+
+    sourceVerified:       sourceCheck.sourceVerified,
+    suspiciousFunctions:  sourceCheck.suspiciousFunctions,
+
+    deployerSeenBefore:   deployerHistoryData.deployerSeenBefore,
+    deployerPriorTokens:  deployerHistoryData.deployerPriorTokens,
 
     rpcWarnings: warnings,
   };

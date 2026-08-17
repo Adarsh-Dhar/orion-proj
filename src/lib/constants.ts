@@ -165,3 +165,77 @@ export const ERC20_ABI = [
     stateMutability: "view",
   },
 ] as const;
+
+// ── New: LP / honeypot / source-check constants ────────────────────────────
+
+export const UNISWAP_V3_POSITION_MANAGER =
+  "0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1" as const;
+export const UNCX_V3_LOCKER =
+  "0x231278eDd38B00B07fBd52120CEf685B9BaEBCC1" as const;
+export const BURN_ADDRESS =
+  "0x000000000000000000000000000000000000dEaD" as const;
+
+export const ETHERSCAN_API_BASE = "https://api.etherscan.io/v2/api";
+
+export const POOL_MINT_EVENT_ABI = [{
+  type: "event",
+  name: "Mint",
+  inputs: [
+    { name: "sender", type: "address", indexed: false },
+    { name: "owner", type: "address", indexed: true },
+    { name: "tickLower", type: "int24", indexed: true },
+    { name: "tickUpper", type: "int24", indexed: true },
+    { name: "amount", type: "uint128", indexed: false },
+    { name: "amount0", type: "uint256", indexed: false },
+    { name: "amount1", type: "uint256", indexed: false },
+  ],
+}] as const;
+
+export const POOL_BURN_EVENT_ABI = [{
+  type: "event",
+  name: "Burn",
+  inputs: [
+    { name: "owner", type: "address", indexed: true },
+    { name: "tickLower", type: "int24", indexed: true },
+    { name: "tickUpper", type: "int24", indexed: true },
+    { name: "amount", type: "uint128", indexed: false },
+    { name: "amount0", type: "uint256", indexed: false },
+    { name: "amount1", type: "uint256", indexed: false },
+  ],
+}] as const;
+
+export const NPM_INCREASE_LIQUIDITY_EVENT_ABI = [{
+  type: "event",
+  name: "IncreaseLiquidity",
+  inputs: [
+    { name: "tokenId", type: "uint256", indexed: true },
+    { name: "liquidity", type: "uint128", indexed: false },
+    { name: "amount0", type: "uint256", indexed: false },
+    { name: "amount1", type: "uint256", indexed: false },
+  ],
+}] as const;
+
+export const NPM_OWNER_OF_ABI = [{
+  type: "function",
+  name: "ownerOf",
+  stateMutability: "view",
+  inputs: [{ name: "tokenId", type: "uint256" }],
+  outputs: [{ name: "", type: "address" }],
+}] as const;
+
+export const ERC20_TRANSFER_ABI = [{
+  type: "function",
+  name: "transfer",
+  stateMutability: "nonpayable",
+  inputs: [
+    { name: "to", type: "address" },
+    { name: "amount", type: "uint256" },
+  ],
+  outputs: [{ name: "", type: "bool" }],
+}] as const;
+
+export const SUSPICIOUS_SOURCE_KEYWORDS = [
+  "blacklist", "_isBlacklisted", "isBlacklisted",
+  "setFee", "setTax", "excludeFromFee",
+  "pause(", "disableTrading", "enableTrading",
+] as const;

@@ -36,6 +36,20 @@ export interface RugCheckResult {
   initialLiquidityEth: number;
   liquidityLocked: boolean | null;   // null = unknown
 
+  // ── New evidence fields ────────────────────────────────────────────────────
+  sellTestPassed: boolean | null;
+  sellTestAmountSent: string | null;
+  sellTestError: string | null;
+  lpTokenId: string | null;
+  lpPositionOwner: string | null;
+  lpPositionStatus: "burned" | "locked_uncx" | "held_by_eoa" | "non_nft_position" | "unverified";
+  liquidityEverPulled: boolean;
+  burnEventCount: number;
+  sourceVerified: boolean | null;
+  suspiciousFunctions: string[];
+  deployerSeenBefore: boolean;
+  deployerPriorTokens: string[];
+
   // ── Scoring ────────────────────────────────────────────────────────────────
   flags: RiskFlag[];
   score: number;                     // 0 (safe) → 100 (certain rug)

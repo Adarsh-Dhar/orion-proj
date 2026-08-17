@@ -85,9 +85,20 @@ SCORING GUIDE:
 - Dev wallet 20–50% supply:                                 +20 pts, HIGH
 - Top-5 holders >60% supply (excl. pool):                   +20 pts, HIGH
 - Holder data unverifiable:                                 +10 pts, MEDIUM
+- Deployer seen before (repeat deployer):                    +10 pts, MEDIUM (pattern risk)
+- Deployer has 3+ prior tokens:                             +20 pts, HIGH (serial deployer)
 - Zero in-range liquidity (confirmed):                      +40 pts, CRITICAL
 - Liquidity unverifiable:                                   +15 pts, MEDIUM
 - Very low liquidity (<0.5 ETH equivalent):                 +15 pts, MEDIUM
+- LP position burned (liquidity removed):                    +40 pts, CRITICAL
+- LP position held by EOA (not locked):                      +25 pts, HIGH
+- LP status unverifiable:                                    +10 pts, MEDIUM
+- Liquidity ever pulled (burn events detected):              +30 pts, HIGH
+- Sell test failed (confirmed honeypot):                     +50 pts, CRITICAL
+- Sell test unverifiable (no suitable holder):               +5 pts, LOW (inconclusive)
+- Source not verified (no source code):                      +15 pts, MEDIUM
+- Suspicious functions found (blacklist, fees, etc.):        +15 pts, MEDIUM per function type
+- Source verification failed (API error):                   +5 pts, LOW (inconclusive)
 - Total supply = 0 (broken contract):                       +20 pts, HIGH
 - Multiple unverified fields together (3+):                 +10 pts, MEDIUM (compound uncertainty)
 

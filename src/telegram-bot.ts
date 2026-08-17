@@ -97,12 +97,15 @@ async function sniperTick(): Promise<void> {
     fromBlock,
     toBlock,
     {
-      onResult: async (result, meta) => {
-        // Skip tokens we've already posted about
-        if (alreadyPosted(state, result.tokenAddress)) {
-          console.log(`  [bot] Already posted ${result.tokenAddress} — skipping`);
-          return;
+      shouldSkip: (tokenAddress) => {
+        // Skip tokens we've already posted about (before expensive evidence collection)
+        if (alreadyPosted(state, tokenAddress)) {
+          console.log(`  [bot] Already posted ${tokenAddress} — skipping`);
+          return true;
         }
+        return false;
+      },
+      onResult: async (result, meta) => {
         // Only post noteworthy verdicts
         if (!POST_VERDICTS.has(result.verdict)) {
           console.log(`  [bot] ${result.verdict} for ${result.tokenAddress} — below threshold, skipping`);
@@ -115,6 +118,7 @@ async function sniperTick(): Promise<void> {
         );
         markPosted(state, result.tokenAddress);
       },
+      state: state,
     }
   );
 

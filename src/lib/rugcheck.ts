@@ -32,6 +32,8 @@ import {
 import { collectEvidence }   from "./evidence.js";
 import { scoreWithLLM }      from "./llm-score.js";
 import type { TokenEvidence } from "./evidence.js";
+import type { BotState } from "./state.js";
+import { getDeployerHistory, recordDeployerToken } from "./state.js";
 
 // ─── Re-export shared types ───────────────────────────────────────────────────
 
@@ -319,6 +321,18 @@ export async function runRugCheck(
     deployerAddress, deployerBalance, deployerBalanceIsEstimate,
     deployerPct, top5HoldersPct,
     poolLiquidity, initialLiquidityEth, liquidityLocked,
+    sellTestPassed: null,
+    sellTestAmountSent: null,
+    sellTestError: null,
+    lpTokenId: null,
+    lpPositionOwner: null,
+    lpPositionStatus: "unverified",
+    liquidityEverPulled: false,
+    burnEventCount: 0,
+    sourceVerified: null,
+    suspiciousFunctions: [],
+    deployerSeenBefore: false,
+    deployerPriorTokens: [],
     flags, score, verdict, summary,
     scoringMethod: "rules",
   };
@@ -342,13 +356,29 @@ export async function runRugCheckLLM(
   pairedAsset: string,
   deployBlock: bigint,
   meta: { name: string; symbol: string; decimals: number; totalSupply: bigint; totalSupplyFormatted: string },
-  opts?: { userQuestion?: string; mode?: "alert" | "chat" }
+  opts?: { userQuestion?: string; mode?: "alert" | "chat"; state?: BotState }
 ): Promise<RugCheckResult> {
 
-  // ── 1. Collect evidence ───────────────────────────────────────────────────
+  // ── 1. Check deployer history from persistent state (before evidence collection) ─────────────────────
+  let deployerHistoryData = { deployerSeenBefore: false, deployerPriorTokens: [] };
+  if (opts?.state) {
+    // We'll get the deployer address after evidence collection, so we use a placeholder
+    // This will be updated after we know the deployer address
+  }
+
+  // ── 2. Collect evidence ───────────────────────────────────────────────────
   const evidence: TokenEvidence = await collectEvidence(
-    client, tokenAddress, poolAddress, pairedAsset, deployBlock, meta
+    client, tokenAddress, poolAddress, pairedAsset, deployBlock, meta, deployerHistoryData
   );
+
+  // ── 3. Update deployer history from persistent state ──────────────────────
+  if (opts?.state && evidence.deployerAddress) {
+    const priorTokens = getDeployerHistory(opts.state, evidence.deployerAddress);
+    evidence.deployerSeenBefore = priorTokens.length > 0;
+    evidence.deployerPriorTokens = priorTokens;
+    // Record this new token for the deployer
+    recordDeployerToken(opts.state, evidence.deployerAddress, tokenAddress);
+  }
 
   // Log full evidence block so every on-chain fact is visible in stdout
   console.log("\n  ── Raw Evidence ─────────────────────────────────────────────");
@@ -395,6 +425,18 @@ export async function runRugCheckLLM(
       deployerAddress, deployerBalance, deployerBalanceIsEstimate,
       deployerPct, top5HoldersPct,
       poolLiquidity, initialLiquidityEth, liquidityLocked,
+      sellTestPassed: evidence.sellTestPassed,
+      sellTestAmountSent: evidence.sellTestAmountSent,
+      sellTestError: evidence.sellTestError,
+      lpTokenId: evidence.lpTokenId,
+      lpPositionOwner: evidence.lpPositionOwner,
+      lpPositionStatus: evidence.lpPositionStatus,
+      liquidityEverPulled: evidence.liquidityEverPulled,
+      burnEventCount: evidence.burnEventCount,
+      sourceVerified: evidence.sourceVerified,
+      suspiciousFunctions: evidence.suspiciousFunctions,
+      deployerSeenBefore: evidence.deployerSeenBefore,
+      deployerPriorTokens: evidence.deployerPriorTokens,
       flags:   [errorFlag],
       score:   100,
       verdict: "CRITICAL",
@@ -413,6 +455,18 @@ export async function runRugCheckLLM(
     deployerAddress, deployerBalance, deployerBalanceIsEstimate,
     deployerPct, top5HoldersPct,
     poolLiquidity, initialLiquidityEth, liquidityLocked,
+    sellTestPassed: evidence.sellTestPassed,
+    sellTestAmountSent: evidence.sellTestAmountSent,
+    sellTestError: evidence.sellTestError,
+    lpTokenId: evidence.lpTokenId,
+    lpPositionOwner: evidence.lpPositionOwner,
+    lpPositionStatus: evidence.lpPositionStatus,
+    liquidityEverPulled: evidence.liquidityEverPulled,
+    burnEventCount: evidence.burnEventCount,
+    sourceVerified: evidence.sourceVerified,
+    suspiciousFunctions: evidence.suspiciousFunctions,
+    deployerSeenBefore: evidence.deployerSeenBefore,
+    deployerPriorTokens: evidence.deployerPriorTokens,
     flags:   llmResult.flags,
     score:   llmResult.score,
     verdict: llmResult.verdict,
@@ -477,6 +531,27 @@ export function formatRugReport(
         : "❌ Zero"
   }`);
   lines.push(`║  ~ETH     : ${r.initialLiquidityEth > 0 ? r.initialLiquidityEth.toFixed(4) + " ETH" : "n/a"}`);
+  lines.push(`║`);
+  lines.push(`║  ── Advanced Checks ─────────────────────────────────────────────`);
+  lines.push(`║  Sell test: ${
+    r.sellTestPassed === null ? "⚠️  Not run (" + (r.sellTestError || "no holder") + ")"
+      : r.sellTestPassed ? "✅ Passed" : "❌ Failed"
+  }`);
+  lines.push(`║  LP status: ${
+    r.lpPositionStatus === "unverified" ? "⚠️  Unknown"
+      : r.lpPositionStatus === "burned" ? "🔥 Burned"
+      : r.lpPositionStatus === "locked_uncx" ? "🔒 Locked (UNCX)"
+      : r.lpPositionStatus === "held_by_eoa" ? "👛 Held by EOA"
+      : "📋 Non-NFT position"
+  }`);
+  lines.push(`║  Liquidity pulled: ${r.liquidityEverPulled ? "⚠️  Yes (" + r.burnEventCount + " events)" : "✅ No"}`);
+  lines.push(`║  Source verified: ${
+    r.sourceVerified === null ? "⚠️  Unknown"
+      : r.sourceVerified ? "✅ Yes" : "❌ No"
+  }`);
+  if (r.deployerSeenBefore) {
+    lines.push(`║  Deployer history: ⚠️  Seen before (${r.deployerPriorTokens.length} prior tokens)`);
+  }
   lines.push(`║`);
   lines.push(`║  ── Risk Flags (${r.flags.length}) ────────────────────────────────────────`);
   if (r.flags.length === 0) {

@@ -208,6 +208,11 @@ export interface ScanResult {
 /** Optional hooks passed to scanBlockRange */
 export interface ScanOptions {
   /**
+   * Called before evidence collection to check if a token should be skipped.
+   * Return true to skip this token (e.g., already posted).
+   */
+  shouldSkip?: (tokenAddress: string) => boolean;
+  /**
    * Called once per token immediately after the rug-check report is printed.
    * Errors thrown here are caught and logged — they never abort the scan loop.
    */
@@ -215,6 +220,10 @@ export interface ScanOptions {
     name: string; symbol: string; decimals: number;
     totalSupply: bigint; totalSupplyFormatted: string;
   }) => Promise<void>;
+  /**
+   * Bot state for persistent storage (e.g., deployer history).
+   */
+  state?: import("./state.js").BotState;
 }
 
 /** Brief pause to be gentle on the RPC */
@@ -328,6 +337,14 @@ export async function scanBlockRange(
       continue;
     }
 
+    // Early skip check (e.g., already posted) before expensive evidence collection
+    if (opts?.shouldSkip && opts.shouldSkip(newToken)) {
+      console.log(`  [scan-engine] Skipping ${newToken} — shouldSkip returned true\n`);
+      console.log(`${"─".repeat(66)}\n`);
+      skipped++;
+      continue;
+    }
+
     // Fetch ERC-20 metadata
     let meta;
     try {
@@ -342,7 +359,7 @@ export async function scanBlockRange(
     // Run LLM rug check
     let rugResult;
     try {
-      rugResult = await runRugCheckLLM(client, newToken, pool, pairedLabel, blockNum, meta, { mode: "alert" });
+      rugResult = await runRugCheckLLM(client, newToken, pool, pairedLabel, blockNum, meta, { mode: "alert", state: opts?.state });
     } catch (err) {
       console.error(`  [scan-engine] rug check failed for ${newToken}: ${err}\n`);
       console.log(`${"─".repeat(66)}\n`);

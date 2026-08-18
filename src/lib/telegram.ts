@@ -14,7 +14,7 @@
  *   sendPlain(chatId, text) — send short-form text without monospace formatting
  */
 
-import { Bot } from "grammy";
+import { Bot, InlineKeyboard } from "grammy";
 
 export const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN!);
 
@@ -27,11 +27,18 @@ export async function sendReport(chatId: string | number, report: string): Promi
   }
 }
 
-/** Sends short-form text (alert cards, chat replies) without monospace formatting. */
-export async function sendPlain(chatId: string | number, text: string): Promise<void> {
+/** Sends short-form text (alert cards, chat replies) without monospace formatting.
+ *  Optionally attaches an inline keyboard to the last chunk. */
+export async function sendPlain(
+  chatId: string | number,
+  text: string,
+  keyboard?: InlineKeyboard
+): Promise<void> {
   const chunks = splitForTelegram(text);
-  for (const chunk of chunks) {
-    await bot.api.sendMessage(chatId, chunk);
+  for (let i = 0; i < chunks.length; i++) {
+    const isLast = i === chunks.length - 1;
+    const options = isLast && keyboard ? { reply_markup: keyboard } : undefined;
+    await bot.api.sendMessage(chatId, chunks[i], options);
   }
 }
 

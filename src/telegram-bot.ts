@@ -19,6 +19,7 @@ import { bot } from "./lib/telegram.js";
 import { scanBlockRange } from "./lib/scan-engine.js";
 import { sendReport } from "./lib/telegram.js";
 import { registerChatHandler } from "./lib/chat-handler.js";
+import { registerInlineHandler } from "./lib/inline-handler.js";
 import { formatAlertCard } from "./lib/rugcheck.js";
 import { loadState, saveState, alreadyPosted, markPosted, addToWatchlist, getWatchlistTokens, recordLiquiditySnapshot } from "./lib/state.js";
 import { checkLiquidityDelta } from "./lib/evidence.js";
@@ -62,6 +63,7 @@ const client = createPublicClient({
 // ─── Register chat handler ────────────────────────────────────────────────────
 
 registerChatHandler(bot, client as any);
+registerInlineHandler(bot, client as any);
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
@@ -200,6 +202,20 @@ async function main(): Promise<void> {
     console.error(`[sniper] Fatal on first run: ${err}`)
   );
   setTimeout(() => loop(sniperTick, SNIPER_INTERVAL_MS), SNIPER_INTERVAL_MS);
+
+  // Register command menu for Telegram's native "/" autocomplete
+  await bot.api.setMyCommands([
+    { command: "start", description: "Show welcome message" },
+    { command: "help", description: "Show usage instructions" },
+    { command: "full", description: "Get full detailed report" },
+  ]);
+
+  // Register command menu for Telegram's native "/" autocomplete
+  bot.api.setMyCommands([
+    { command: "start", description: "Show welcome message" },
+    { command: "help", description: "Show usage instructions" },
+    { command: "full", description: "Get full detailed report" },
+  ]).catch((err) => console.error("[bot] Failed to set commands:", err));
 
   // Start the bot for handling chat messages
   bot.start();

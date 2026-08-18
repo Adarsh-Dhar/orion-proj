@@ -14,18 +14,19 @@
  *   /setinlinefeedback → set to 100% (required for chosen_inline_result)
  *
  * Exports:
- *   registerInlineHandler(bot, client) — registers inline query handlers
+ *   registerInlineHandler(bot, client, state) — registers inline query handlers
  */
 
 import { Bot, Context, InlineQueryResultBuilder } from "grammy";
 import { extractAddress, answerTokenQuestion } from "./rugcheck-handler.js";
 import { formatRugReport, formatChatReply } from "./rugcheck.js";
 import type { PublicClient } from "viem";
+import type { BotState } from "./state.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = PublicClient<any>;
 
-export function registerInlineHandler(bot: Bot<any>, client: AnyClient): void {
+export function registerInlineHandler(bot: Bot<any>, client: AnyClient, state?: BotState): void {
   // Step 1: Handle inline queries - return placeholder immediately
   bot.on("inline_query", async (ctx: Context) => {
     if (!ctx.inlineQuery || !ctx.inlineQuery.query) return;
@@ -61,7 +62,7 @@ export function registerInlineHandler(bot: Bot<any>, client: AnyClient): void {
 
     try {
       // Run the full rug check
-      const outcome = await answerTokenQuestion(client, address as `0x${string}`, undefined, "chat");
+      const outcome = await answerTokenQuestion(client, address as `0x${string}`, undefined, "chat", state);
 
       if ("error" in outcome) {
         const inlineMessageId = ctx.chosenInlineResult.inline_message_id;

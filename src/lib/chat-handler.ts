@@ -5,7 +5,7 @@
  * and sends formatted reports back to the chat.
  *
  * Exports:
- *   registerChatHandler(bot, client) — registers the message:text handler
+ *   registerChatHandler(bot, client, state) — registers the message:text handler
  */
 
 import { Bot, Context, InlineKeyboard } from "grammy";
@@ -13,6 +13,7 @@ import { extractAddress, answerTokenQuestion, stripAddress } from "./rugcheck-ha
 import { formatChatReply, formatRugReport } from "./rugcheck.js";
 import { sendReport, sendPlain } from "./telegram.js";
 import type { PublicClient } from "viem";
+import type { BotState } from "./state.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = PublicClient<any>;
@@ -21,13 +22,14 @@ type AnyClient = PublicClient<any>;
 async function sendFullReport(
   ctx: Context,
   client: AnyClient,
-  address: string
+  address: string,
+  state?: BotState
 ): Promise<void> {
   const chatId = ctx.chat?.id;
   if (!chatId) return;
 
   await ctx.api.sendMessage(chatId, "Running full on-chain rug check…");
-  const outcome = await answerTokenQuestion(client, address as `0x${string}`, undefined, "chat");
+  const outcome = await answerTokenQuestion(client, address as `0x${string}`, undefined, "chat", state);
   if ("error" in outcome) {
     await ctx.api.sendMessage(chatId, `Couldn't check that token: ${outcome.error}`);
     return;
@@ -35,7 +37,7 @@ async function sendFullReport(
   await sendReport(chatId, formatRugReport(outcome.result, outcome.meta));
 }
 
-export function registerChatHandler(bot: Bot<any>, client: AnyClient): void {
+export function registerChatHandler(bot: Bot<any>, client: AnyClient, state?: BotState): void {
   // Register commands first (order matters - commands get priority)
   bot.command("start", async (ctx) => {
     const chatId = ctx.chat?.id;
@@ -84,7 +86,7 @@ export function registerChatHandler(bot: Bot<any>, client: AnyClient): void {
         }
         return;
       }
-      await sendFullReport(ctx, client, address);
+      await sendFullReport(ctx, client, address, state);
       return;
     }
 
@@ -111,7 +113,8 @@ export function registerChatHandler(bot: Bot<any>, client: AnyClient): void {
       client,
       address,
       question.length > 0 ? question : undefined,
-      "chat"
+      "chat",
+      state
     );
 
     if ("error" in outcome) {
@@ -143,7 +146,7 @@ export function registerChatHandler(bot: Bot<any>, client: AnyClient): void {
       await ctx.answerCallbackQuery();
 
       // Send the full report
-      await sendFullReport(ctx, client, address as `0x${string}`);
+      await sendFullReport(ctx, client, address as `0x${string}`, state);
     }
   });
 }

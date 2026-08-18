@@ -8,7 +8,7 @@
  * Exports:
  *   extractAddress(text)                         — pull first 0x address from string
  *   stripAddress(text, address)                  — remove address from text, return remainder
- *   answerTokenQuestion(client, address, question, mode) — run full pipeline, return result or error
+ *   answerTokenQuestion(client, address, question, mode, state) — run full pipeline, return result or error
  */
 
 import { type Address, type PublicClient } from "viem";
@@ -16,6 +16,7 @@ import { fetchTokenMetadata }                from "./erc20.js";
 import { resolveTokenPool, findContractDeployBlock } from "./scan-engine.js";
 import { runRugCheckLLM }                    from "./rugcheck.js";
 import type { RugCheckResult }               from "./rugcheck-types.js";
+import type { BotState }                     from "./state.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = PublicClient<any>;
@@ -63,7 +64,8 @@ export async function answerTokenQuestion(
   client: AnyClient,
   tokenAddress: Address,
   userQuestion?: string,
-  mode: "alert" | "chat" = "chat"
+  mode: "alert" | "chat" = "chat",
+  state?: BotState
 ): Promise<HandlerOutcome> {
 
   // ── 1. Resolve pool ─────────────────────────────────────────────────────
@@ -102,7 +104,7 @@ export async function answerTokenQuestion(
       resolved.pairedLabel,
       deployBlock,
       meta,
-      { userQuestion, mode }
+      { userQuestion, mode, state }
     );
     return { result, meta };
   } catch (err) {

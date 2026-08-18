@@ -60,14 +60,14 @@ const client = createPublicClient({
   transport: http(RPC_URL, { retryCount: 3, retryDelay: 1500 }),
 });
 
-// ─── Register chat handler ────────────────────────────────────────────────────
-
-registerChatHandler(bot, client as any);
-registerInlineHandler(bot, client as any);
-
 // ─── State ────────────────────────────────────────────────────────────────────
 
 const state = loadState();
+
+// ─── Register chat handler ────────────────────────────────────────────────────
+
+registerChatHandler(bot, client as any, state);
+registerInlineHandler(bot, client as any, state);
 let lastScannedBlock: bigint | null = state.lastScannedBlock ? BigInt(state.lastScannedBlock) : 0n; // Start from 0 for historical scan
 let sniperRun = 0;
 

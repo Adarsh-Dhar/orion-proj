@@ -108,6 +108,7 @@ SCORING GUIDE:
 - Single trader >50% of total swap volume:                  +30 pts, HIGH (fake volume / one wallet churning)
 - Fewer than 5 unique traders with >20 total swaps:        +20 pts, HIGH (thin organic interest, likely bot activity)
 - Buy/sell ratio wildly skewed toward sells early:          +15 pts, MEDIUM (possible dump in progress)
+- Trade scan data unverified (tradeScanPartial=true):       +10 pts, MEDIUM (incomplete wash-trading analysis)
 
 SANITY CHECKS — apply these before scoring:
 - If initialLiquidityEth is > 1,000,000 (one million ETH), it is a math artifact, NOT real liquidity. Treat it the same as null — do NOT use it as evidence of healthy liquidity. Add a flag for it.

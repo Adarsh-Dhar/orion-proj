@@ -3,15 +3,7 @@
   "version": "1.0.0",
   "description": "",
   "scripts": {
-    "rughound": "tsx src/rughound.ts",
-    "chat": "tsx src/chat.ts",
-    "sniper": "tsx src/sniper.ts",
-    "scan": "tsx src/scan-historical.ts",
-    "telegram-bot": "tsx src/telegram-bot.ts",
-    "test-telegram": "tsx src/test-telegram.ts",
-    "server": "tsx src/server.ts",
-    "tunnel": "lt --port 8080",
-    "dev-server": "tsx src/server.ts"
+    "telegram-bot": "tsx src/telegram-bot.ts"
   },
   "keywords": [],
   "author": "",
@@ -19,9 +11,7 @@
   "type": "module",
   "dependencies": {
     "dotenv": "^17.4.2",
-    "express": "^5.2.1",
     "grammy": "^1.45.1",
-    "localtunnel": "^2.0.2",
     "viem": "^2.55.16"
   },
   "devDependencies": {

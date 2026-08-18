@@ -16,7 +16,7 @@ import "dotenv/config";
 import { createPublicClient, http } from "viem";
 import { base } from "viem/chains";
 import { bot } from "./lib/telegram.js";
-import { scanBlockRange, resolveTokenPool } from "./lib/scan-engine.js";
+import { scanBlockRange } from "./lib/scan-engine.js";
 import { sendReport } from "./lib/telegram.js";
 import { registerChatHandler } from "./lib/chat-handler.js";
 import { formatAlertCard } from "./lib/rugcheck.js";
@@ -66,7 +66,7 @@ registerChatHandler(bot, client as any);
 // ─── State ────────────────────────────────────────────────────────────────────
 
 const state = loadState();
-let lastScannedBlock: bigint | null = state.lastScannedBlock ? BigInt(state.lastScannedBlock) : null;
+let lastScannedBlock: bigint | null = state.lastScannedBlock ? BigInt(state.lastScannedBlock) : 0n; // Start from 0 for historical scan
 let sniperRun = 0;
 
 // ─── Sniper tick ──────────────────────────────────────────────────────────────
@@ -76,25 +76,17 @@ async function sniperTick(): Promise<void> {
   const runLabel = `#${sniperRun}`;
   const now = new Date().toISOString();
 
-  let toBlock: bigint;
-  try {
-    toBlock = await client.getBlockNumber();
-  } catch (err) {
-    console.error(`[sniper ${runLabel}] getBlockNumber() failed — skipping: ${err}`);
-    return;
-  }
-
-  const fromBlock = lastScannedBlock !== null
-    ? lastScannedBlock + 1n
-    : toBlock - BLOCKS_PER_INTERVAL;
-  const windowLabel = lastScannedBlock !== null ? "watermark" : "bootstrap";
+  // Scan in 5-minute intervals (3600 blocks on Base), starting from lastScannedBlock
+  const fromBlock = lastScannedBlock ?? 0n;
+  const toBlock = fromBlock + BLOCKS_PER_INTERVAL;
+  const windowLabel = "interval";
 
   console.log(`\n${"═".repeat(66)}`);
   console.log(`  SNIPER ${runLabel}  |  ${now}`);
   console.log(`  Blocks : ${fromBlock.toLocaleString()} → ${toBlock.toLocaleString()}  (${windowLabel})`);
   console.log(`${"═".repeat(66)}\n`);
 
-  const { summary, totalPools, processed, skipped } = await scanBlockRange(
+  const { totalPools, processed, skipped } = await scanBlockRange(
     client as any,
     fromBlock,
     toBlock,

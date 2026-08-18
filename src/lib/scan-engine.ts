@@ -1,6 +1,5 @@
 /**
- * scan-engine.ts — shared block-range scanner used by both sniper.ts and
- * scan-historical.ts.
+ * scan-engine.ts — shared block-range scanner used by telegram-bot.ts
  *
  * Exports:
  *   shortAddr(addr)                        — "0x1234…abcd"
@@ -9,7 +8,6 @@
  *   findContractDeployBlock(client, addr)  — binary-search exact deploy block
  *   resolveTokenPool(client, tokenAddress) — find the Uniswap V3 pool for any token
  *   scanBlockRange(client, from, to)       — fetch PoolCreated → rug-check → print report
- *   printSummaryTable(summary)             — sorted verdict / score table
  */
 
 import { createPublicClient, http, type Address, type PublicClient } from "viem";
@@ -398,47 +396,4 @@ export async function scanBlockRange(
   }
 
   return { summary, totalPools: allLogs.length, processed, skipped };
-}
-
-// ─── Summary table printer ────────────────────────────────────────────────────
-
-const VERDICT_EMOJI: Record<string, string> = {
-  LOW: "🟢", MEDIUM: "🟡", HIGH: "🟠", CRITICAL: "🔴",
-};
-
-export function printSummaryTable(
-  summary: TokenSummary[],
-  extra?: { label?: string; modelName?: string }
-): void {
-  if (summary.length === 0) {
-    console.log("  No tokens were successfully checked.\n");
-    return;
-  }
-
-  const modelName = extra?.modelName ?? (process.env.GEMINI_MODEL ?? "gemini-2.0-flash-lite");
-
-  console.log(`\n${"═".repeat(66)}`);
-  console.log(`  SCAN COMPLETE — LLM Summary`);
-  console.log(`  Scoring   : Gemini LLM (${modelName})`);
-  if (extra?.label) console.log(`  Window    : ${extra.label}`);
-  console.log(`${"═".repeat(66)}\n`);
-
-  // Sort by risk score descending
-  const sorted = [...summary].sort((a, b) => b.score - a.score);
-
-  console.log(
-    `  ${"#".padEnd(3)} ${"Verdict".padEnd(10)} ${"Score".padEnd(7)} ${"Flags".padEnd(6)} ${"Symbol".padEnd(10)} Address`
-  );
-  console.log(`  ${"─".repeat(62)}`);
-
-  for (let i = 0; i < sorted.length; i++) {
-    const t = sorted[i];
-    const e = VERDICT_EMOJI[t.verdict] ?? "?";
-    console.log(
-      `  ${String(i + 1).padEnd(3)} ${(e + " " + t.verdict).padEnd(10)} ` +
-      `${String(t.score).padEnd(7)} ${String(t.flags).padEnd(6)} ` +
-      `${t.symbol.slice(0, 9).padEnd(10)} ${t.address}`
-    );
-  }
-  console.log();
 }

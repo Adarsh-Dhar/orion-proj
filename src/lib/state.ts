@@ -116,12 +116,6 @@ export function addToWatchlist(state: BotState, tokenAddress: string, poolAddres
   }
 }
 
-export function removeFromWatchlist(state: BotState, tokenAddress: string): void {
-  const key = tokenAddress.toLowerCase();
-  delete state.watchlist[key];
-  saveState(state);
-}
-
 export function getWatchlistTokens(state: BotState, maxAgeMinutes: number): WatchlistEntry[] {
   const cutoff = Date.now() - (maxAgeMinutes * 60 * 1000);
   return Object.values(state.watchlist).filter(entry => entry.firstPostedTimestamp > cutoff);

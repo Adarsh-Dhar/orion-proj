@@ -51,7 +51,9 @@ export interface RugCheckResult {
   liquidityEverPulled: boolean;
   burnEventCount: number;
   sourceVerified: boolean | null;
-  suspiciousFunctions: string[];
+  suspiciousFunctions: {name: string, snippet: string}[];
+  secondaryAdminDetected: boolean;
+  secondaryAdminSnippet: string | null;
   deployerSeenBefore: boolean;
   deployerPriorTokens: string[];
 

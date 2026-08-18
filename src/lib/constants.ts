@@ -238,4 +238,9 @@ export const SUSPICIOUS_SOURCE_KEYWORDS = [
   "blacklist", "_isBlacklisted", "isBlacklisted",
   "setFee", "setTax", "excludeFromFee",
   "pause(", "disableTrading", "enableTrading",
+  "mint(", "_maxTxAmount", "cooldown", "sniperProtection", "feeExempt", "_reflectionFee",
+] as const;
+
+export const PRIVILEGE_KEYWORDS = [
+  "onlyOwner", "onlyAdmin", "onlyManager", "hasRole", "AccessControl", "modifier only",
 ] as const;

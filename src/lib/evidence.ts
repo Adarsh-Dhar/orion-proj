@@ -40,6 +40,7 @@ import {
   NPM_OWNER_OF_ABI,
   ERC20_TRANSFER_ABI,
   SUSPICIOUS_SOURCE_KEYWORDS,
+  PRIVILEGE_KEYWORDS,
 } from "./constants.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -117,7 +118,9 @@ export interface TokenEvidence {
 
   // ── Source verification ─────────────────────────────────────────────────
   sourceVerified: boolean | null;      // null = the Etherscan call itself failed
-  suspiciousFunctions: string[];
+  suspiciousFunctions: {name: string, snippet: string}[];
+  secondaryAdminDetected: boolean;
+  secondaryAdminSnippet: string | null;
 
   // ── Deployer history (in-process memory, resets on bot restart) ────────
   deployerSeenBefore: boolean;
@@ -452,15 +455,102 @@ async function checkLiquidityPullHistory(
   return { liquidityEverPulled: count > 0, burnEventCount: count };
 }
 
+// ── Helper: extract function body from source code ───────────────────────
+function extractFunctionBody(source: string, keyword: string): string | null {
+  // Find the function that contains this keyword
+  const functionPattern = /function\s+(\w+)[^{]*\{/g;
+  let match: RegExpExecArray | null;
+  const maxLines = 40;
+  const lines = source.split('\n');
+  
+  while ((match = functionPattern.exec(source)) !== null) {
+    const funcStartIndex = match.index;
+    const funcStartLine = source.substring(0, funcStartIndex).split('\n').length - 1;
+    
+    // Check if this function contains the keyword
+    const funcEnd = findMatchingBrace(source, funcStartIndex + match[0].length - 1);
+    if (funcEnd === null) continue;
+    
+    const funcBody = source.substring(funcStartIndex, funcEnd + 1);
+    if (funcBody.includes(keyword)) {
+      // Extract up to maxLines
+      const funcLines = funcBody.split('\n');
+      if (funcLines.length <= maxLines) {
+        return funcBody;
+      }
+      return funcLines.slice(0, maxLines).join('\n') + '\n  // ... (truncated)';
+    }
+  }
+  
+  return null;
+}
+
+// ── Helper: find matching closing brace ─────────────────────────────────
+function findMatchingBrace(source: string, startIndex: number): number | null {
+  let braceCount = 0;
+  for (let i = startIndex; i < source.length; i++) {
+    if (source[i] === '{') braceCount++;
+    else if (source[i] === '}') {
+      braceCount--;
+      if (braceCount === 0) return i;
+    }
+  }
+  return null;
+}
+
+// ── Helper: detect secondary admin after renounce ───────────────────────
+function detectSecondaryAdmin(
+  source: string,
+  renouncedOwner: string | null
+): { detected: boolean; snippet: string | null } {
+  if (!renouncedOwner || renouncedOwner === "unknown") {
+    return { detected: false, snippet: null };
+  }
+  
+  // Look for privilege keywords that reference a different address variable
+  for (const keyword of PRIVILEGE_KEYWORDS) {
+    const keywordRegex = new RegExp(keyword, 'gi');
+    if (!keywordRegex.test(source)) continue;
+    
+    // Extract lines containing the keyword
+    const lines = source.split('\n');
+    const matchingLines = lines.filter(line => keywordRegex.test(line));
+    
+    // Check if any line references an address variable that's not the renounced owner
+    for (const line of matchingLines) {
+      // Look for address variables that might be secondary admins
+      const addressVarPattern = /(?:msg\.sender|_admin|_manager|_auth|_authorized|_newOwner|_pendingOwner|address\s*\(\s*\w+\s*\))/gi;
+      const matches = line.match(addressVarPattern);
+      
+      if (matches && matches.length > 0) {
+        // If we found references to potential admin variables, this is suspicious
+        return {
+          detected: true,
+          snippet: line.trim().substring(0, 200) + (line.length > 200 ? '...' : '')
+        };
+      }
+    }
+  }
+  
+  return { detected: false, snippet: null };
+}
+
 // ── 4. Source verification + backdoor keyword scan ──────────────────────
 async function checkSourceVerification(
   tokenAddress: Address,
-  warnings: string[]
-): Promise<{ sourceVerified: boolean | null; suspiciousFunctions: string[] }> {
+  warnings: string[],
+  ownershipRenounced: boolean | null,
+  ownerAddress: string | null
+): Promise<{ 
+  sourceVerified: boolean | null; 
+  suspiciousFunctions: {name: string, snippet: string}[];
+  secondaryAdminDetected: boolean;
+  secondaryAdminSnippet: string | null;
+}> {
   const apiKey = process.env.ETHERSCAN_API_KEY;
   if (!apiKey) {
     warn(warnings, "sourceCheck", "ETHERSCAN_API_KEY not set — skipping", "missing env var");
-    return { sourceVerified: null, suspiciousFunctions: [] };
+    return { sourceVerified: null, suspiciousFunctions: [], secondaryAdminDetected: false, secondaryAdminSnippet: null };
   }
   try {
     const url = `${ETHERSCAN_API_BASE}?chainid=${BASE_CHAIN_ID}&module=contract&action=getsourcecode&address=${tokenAddress}&apikey=${apiKey}`;
@@ -468,13 +558,44 @@ async function checkSourceVerification(
     const json = await res.json();
     const source: string = json?.result?.[0]?.SourceCode ?? "";
     if (!source) {
-      return { sourceVerified: false, suspiciousFunctions: [] };
+      return { sourceVerified: false, suspiciousFunctions: [], secondaryAdminDetected: false, secondaryAdminSnippet: null };
     }
-    const found = SUSPICIOUS_SOURCE_KEYWORDS.filter((kw) => source.includes(kw));
-    return { sourceVerified: true, suspiciousFunctions: [...found] };
+    
+    // Extract function bodies for each suspicious keyword found
+    const suspiciousFunctions: {name: string, snippet: string}[] = [];
+    for (const kw of SUSPICIOUS_SOURCE_KEYWORDS) {
+      if (source.includes(kw)) {
+        const snippet = extractFunctionBody(source, kw);
+        if (snippet) {
+          // Try to extract function name from the snippet
+          const nameMatch = snippet.match(/function\s+(\w+)/);
+          const funcName = nameMatch ? nameMatch[1] : "unknown";
+          suspiciousFunctions.push({ name: funcName, snippet });
+        } else {
+          // Fallback if we can't extract the function body
+          suspiciousFunctions.push({ name: kw, snippet: `// Keyword "${kw}" found but function body extraction failed` });
+        }
+      }
+    }
+    
+    // Check for secondary admin if ownership is renounced
+    let secondaryAdminDetected = false;
+    let secondaryAdminSnippet: string | null = null;
+    if (ownershipRenounced === true && ownerAddress) {
+      const adminCheck = detectSecondaryAdmin(source, ownerAddress);
+      secondaryAdminDetected = adminCheck.detected;
+      secondaryAdminSnippet = adminCheck.snippet;
+    }
+    
+    return { 
+      sourceVerified: true, 
+      suspiciousFunctions,
+      secondaryAdminDetected,
+      secondaryAdminSnippet
+    };
   } catch (err) {
     warn(warnings, "sourceCheck", "Etherscan API call failed", err);
-    return { sourceVerified: null, suspiciousFunctions: [] };
+    return { sourceVerified: null, suspiciousFunctions: [], secondaryAdminDetected: false, secondaryAdminSnippet: null };
   }
 }
 
@@ -626,7 +747,7 @@ export async function collectEvidence(
   const pullHistory = await checkLiquidityPullHistory(
     client, poolAddress, deployBlock, holderScan.scanTo, warnings
   );
-  const sourceCheck = await checkSourceVerification(tokenAddress, warnings);
+  const sourceCheck = await checkSourceVerification(tokenAddress, warnings, ownershipRenounced, ownerAddress);
   const deployerHistoryData = deployerHistory ?? { deployerSeenBefore: false, deployerPriorTokens: [] };
 
   // ── 8. Liquidity delta check (if state provided) ──────────────────────────
@@ -696,6 +817,8 @@ export async function collectEvidence(
 
     sourceVerified:       sourceCheck.sourceVerified,
     suspiciousFunctions:  sourceCheck.suspiciousFunctions,
+    secondaryAdminDetected: sourceCheck.secondaryAdminDetected,
+    secondaryAdminSnippet: sourceCheck.secondaryAdminSnippet,
 
     deployerSeenBefore:   deployerHistoryData.deployerSeenBefore,
     deployerPriorTokens:  deployerHistoryData.deployerPriorTokens,

@@ -129,6 +129,8 @@ export async function runRugCheckLLM(
       burnEventCount: evidence.burnEventCount,
       sourceVerified: evidence.sourceVerified,
       suspiciousFunctions: evidence.suspiciousFunctions,
+      secondaryAdminDetected: evidence.secondaryAdminDetected,
+      secondaryAdminSnippet: evidence.secondaryAdminSnippet,
       deployerSeenBefore: evidence.deployerSeenBefore,
       deployerPriorTokens: evidence.deployerPriorTokens,
       flags:   [errorFlag],
@@ -162,6 +164,8 @@ export async function runRugCheckLLM(
     burnEventCount: evidence.burnEventCount,
     sourceVerified: evidence.sourceVerified,
     suspiciousFunctions: evidence.suspiciousFunctions,
+    secondaryAdminDetected: evidence.secondaryAdminDetected,
+    secondaryAdminSnippet: evidence.secondaryAdminSnippet,
     deployerSeenBefore: evidence.deployerSeenBefore,
     deployerPriorTokens: evidence.deployerPriorTokens,
     flags:   llmResult.flags,
@@ -248,6 +252,9 @@ export function formatRugReport(
   }`);
   if (r.deployerSeenBefore) {
     lines.push(`║  Deployer history: ⚠️  Seen before (${r.deployerPriorTokens.length} prior tokens)`);
+  }
+  if (r.secondaryAdminDetected) {
+    lines.push(`║  Secondary admin: ⚠️  Detected (ownership shows renounced but privileged role found)`);
   }
   lines.push(`║`);
   lines.push(`║  ── Risk Flags (${r.flags.length}) ────────────────────────────────────────`);

@@ -79,7 +79,7 @@ IMPORTANT RULES:
 SCORING GUIDE:
 - Ownership not renounced (confirmed active owner address):  +25 pts, HIGH
 - Ownership unverifiable (owner() reverted):                +10 pts, MEDIUM
-- Upgradeable proxy detected:                               +35 pts, CRITICAL
+- Upgradeable proxy detected:                               +35 pts, CRITICAL — detail MUST explicitly state the implementation-swap risk
 - Proxy status unverifiable:                                +10 pts, MEDIUM
 - Dev wallet >50% supply:                                   +40 pts, CRITICAL
 - Dev wallet 20–50% supply:                                 +20 pts, HIGH
@@ -99,7 +99,8 @@ SCORING GUIDE:
 - Sell test failed (confirmed honeypot):                     +50 pts, CRITICAL
 - Sell test unverifiable (no suitable holder):               +5 pts, LOW (inconclusive)
 - Source not verified (no source code):                      +15 pts, MEDIUM
-- Suspicious functions found (blacklist, fees, etc.):        +15 pts, MEDIUM per function type
+- Suspicious functions found: For each entry in suspiciousFunctions, read the provided snippet and write a detail sentence explaining WHAT the function lets the caller do and HOW it could be abused. +15 pts, MEDIUM per function type
+- Secondary admin detected (ownership renounced but privileged role found): +30 pts, HIGH — "ownership shows renounced but a second privileged role was found in source, renounce may be a decoy"
 - Source verification failed (API error):                   +5 pts, LOW (inconclusive)
 - Total supply = 0 (broken contract):                       +20 pts, HIGH
 - Multiple unverified fields together (3+):                 +10 pts, MEDIUM (compound uncertainty)

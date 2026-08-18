@@ -104,6 +104,10 @@ SCORING GUIDE:
 - Source verification failed (API error):                   +5 pts, LOW (inconclusive)
 - Total supply = 0 (broken contract):                       +20 pts, HIGH
 - Multiple unverified fields together (3+):                 +10 pts, MEDIUM (compound uncertainty)
+- Round-trip traders >40% of unique traders:                +25 pts, HIGH (wash-trading pattern)
+- Single trader >50% of total swap volume:                  +30 pts, HIGH (fake volume / one wallet churning)
+- Fewer than 5 unique traders with >20 total swaps:        +20 pts, HIGH (thin organic interest, likely bot activity)
+- Buy/sell ratio wildly skewed toward sells early:          +15 pts, MEDIUM (possible dump in progress)
 
 SANITY CHECKS — apply these before scoring:
 - If initialLiquidityEth is > 1,000,000 (one million ETH), it is a math artifact, NOT real liquidity. Treat it the same as null — do NOT use it as evidence of healthy liquidity. Add a flag for it.

@@ -26,6 +26,7 @@ import {
   EIP1967_IMPL_SLOT,
   POOL_SLOT0_ABI,
   POOL_LIQUIDITY_ABI,
+  POOL_TOKENS_ABI,
   TRANSFER_EVENT_ABI,
   ERC20_ABI,
   // new:
@@ -36,6 +37,7 @@ import {
   BASE_CHAIN_ID,
   POOL_MINT_EVENT_ABI,
   POOL_BURN_EVENT_ABI,
+  POOL_SWAP_EVENT_ABI,
   NPM_INCREASE_LIQUIDITY_EVENT_ABI,
   NPM_OWNER_OF_ABI,
   ERC20_TRANSFER_ABI,
@@ -125,6 +127,17 @@ export interface TokenEvidence {
   // ── Deployer history (in-process memory, resets on bot restart) ────────
   deployerSeenBefore: boolean;
   deployerPriorTokens: string[];
+
+  // ── Trade activity (wash trading detection) ────────────────────────────
+  totalSwaps: number;
+  uniqueTraders: number;
+  buyCount: number;
+  sellCount: number;
+  buySellRatio: number | null; // buyCount / sellCount, null if sellCount = 0
+  roundTripTraderCount: number; // addresses that both bought AND sold
+  roundTripTraderPct: number | null; // % of unique traders that round-tripped
+  topTraderSwapSharePct: number; // e.g. 68% = one wallet did 68% of all swaps
+  tradeScanPartial: boolean;
 
   // ── RPC warnings ──────────────────────────────────────────────────────────
   /** Every failed RPC call during collection. The LLM must treat any field
@@ -453,6 +466,85 @@ async function checkLiquidityPullHistory(
     chunkStart = chunkEnd + 1n;
   }
   return { liquidityEverPulled: count > 0, burnEventCount: count };
+}
+
+// ── Trade activity scan (wash trading detection) ───────────────────────
+interface TradeActivity {
+  totalSwaps: number;
+  uniqueTraders: number;
+  buyCount: number;
+  sellCount: number;
+  buyerAddresses: Set<string>;
+  sellerAddresses: Set<string>;
+  // wash-trading signal: addresses that appear on BOTH sides
+  roundTripTraders: string[];
+  topTraderSwapShare: number; // % of total swaps done by the single busiest address
+  scanPartial: boolean;
+}
+
+async function scanTradeActivity(
+  client: AnyClient,
+  poolAddress: Address,
+  fromBlock: bigint,
+  token0IsTarget: boolean, // which side of the pool is the token being checked
+  warnings: string[]
+): Promise<TradeActivity> {
+  const latestBlock = await client.getBlockNumber();
+  const swapsByAddress = new Map<string, { buys: number; sells: number }>();
+  let chunksFailed = 0, chunksTotal = 0, totalSwaps = 0;
+
+  for (let chunkStart = fromBlock; chunkStart <= latestBlock; chunkStart += SCAN_CHUNK) {
+    const chunkEnd = chunkStart + SCAN_CHUNK - 1n < latestBlock ? chunkStart + SCAN_CHUNK - 1n : latestBlock;
+    chunksTotal++;
+    try {
+      const logs = await client.getLogs({
+        address: poolAddress,
+        event: POOL_SWAP_EVENT_ABI[0],
+        fromBlock: chunkStart,
+        toBlock: chunkEnd,
+      });
+      for (const log of logs) {
+        const { recipient, amount0, amount1 } = log.args as {
+          recipient: string; amount0: bigint; amount1: bigint;
+        };
+        totalSwaps++;
+        // Negative amount = pool sending that token out = the trader received it (a buy of that token)
+        const targetAmount = token0IsTarget ? amount0 : amount1;
+        const isBuy = targetAmount < 0n;
+        const entry = swapsByAddress.get(recipient) ?? { buys: 0, sells: 0 };
+        if (isBuy) entry.buys++; else entry.sells++;
+        swapsByAddress.set(recipient, entry);
+      }
+    } catch (err) {
+      chunksFailed++;
+      warn(warnings, "tradeScan", `chunk [${chunkStart}, ${chunkEnd}] failed`, err);
+    }
+  }
+
+  const buyerAddresses = new Set<string>();
+  const sellerAddresses = new Set<string>();
+  const roundTripTraders: string[] = [];
+  let buyCount = 0, sellCount = 0, maxSwapsForOne = 0;
+
+  for (const [addr, { buys, sells }] of swapsByAddress) {
+    buyCount += buys; sellCount += sells;
+    if (buys > 0) buyerAddresses.add(addr);
+    if (sells > 0) sellerAddresses.add(addr);
+    if (buys > 0 && sells > 0) roundTripTraders.push(addr);
+    maxSwapsForOne = Math.max(maxSwapsForOne, buys + sells);
+  }
+
+  return {
+    totalSwaps,
+    uniqueTraders: swapsByAddress.size,
+    buyCount,
+    sellCount,
+    buyerAddresses,
+    sellerAddresses,
+    roundTripTraders,
+    topTraderSwapShare: totalSwaps > 0 ? (maxSwapsForOne / totalSwaps) * 100 : 0,
+    scanPartial: chunksFailed > 0,
+  };
 }
 
 // ── Helper: extract function body from source code ───────────────────────
@@ -798,6 +890,36 @@ export async function collectEvidence(
     }
   }
 
+  // ── 9. Trade activity scan (wash trading detection) ───────────────────────
+  // Determine if the target token is token0 or token1 in the pool
+  let token0IsTarget = false;
+  try {
+    const token0 = await client.readContract({
+      address: poolAddress,
+      abi: POOL_TOKENS_ABI,
+      functionName: "token0",
+    }) as string;
+    token0IsTarget = token0.toLowerCase() === tokenAddress.toLowerCase();
+  } catch (err) {
+    warn(warnings, "tradeScan", "failed to read pool token0/token1", err);
+  }
+
+  const tradeActivity = await scanTradeActivity(
+    client, 
+    poolAddress, 
+    deployBlock, 
+    token0IsTarget, 
+    warnings
+  );
+
+  const buySellRatio: number | null = tradeActivity.sellCount > 0 
+    ? tradeActivity.buyCount / tradeActivity.sellCount 
+    : null;
+
+  const roundTripTraderPct: number | null = tradeActivity.uniqueTraders > 0
+    ? (tradeActivity.roundTripTraders.length / tradeActivity.uniqueTraders) * 100
+    : null;
+
   // ── 8. Assemble ────────────────────────────────────────────────────────────
   return {
     tokenAddress,
@@ -854,6 +976,16 @@ export async function collectEvidence(
 
     deployerSeenBefore:   deployerHistoryData.deployerSeenBefore,
     deployerPriorTokens:  deployerHistoryData.deployerPriorTokens,
+
+    totalSwaps:           tradeActivity.totalSwaps,
+    uniqueTraders:        tradeActivity.uniqueTraders,
+    buyCount:             tradeActivity.buyCount,
+    sellCount:            tradeActivity.sellCount,
+    buySellRatio:         buySellRatio,
+    roundTripTraderCount: tradeActivity.roundTripTraders.length,
+    roundTripTraderPct:   roundTripTraderPct,
+    topTraderSwapSharePct: tradeActivity.topTraderSwapShare,
+    tradeScanPartial:     tradeActivity.scanPartial,
 
     rpcWarnings: warnings,
   };

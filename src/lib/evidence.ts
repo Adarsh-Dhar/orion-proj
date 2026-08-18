@@ -507,26 +507,58 @@ function detectSecondaryAdmin(
     return { detected: false, snippet: null };
   }
   
-  // Look for privilege keywords that reference a different address variable
-  for (const keyword of PRIVILEGE_KEYWORDS) {
-    const keywordRegex = new RegExp(keyword, 'gi');
-    if (!keywordRegex.test(source)) continue;
+  // Extract all address-type state variables (potential admin roles)
+  const addressVarPattern = /address\s+(?:public|private|internal)?\s*(\w+)\s*(?:=|;)/gi;
+  const addressVars: string[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = addressVarPattern.exec(source)) !== null) {
+    const varName = match[1];
+    // Skip owner-related variables (these are expected)
+    if (!varName.toLowerCase().includes('owner') && 
+        !varName.toLowerCase().includes('pending')) {
+      addressVars.push(varName);
+    }
+  }
+  
+  if (addressVars.length === 0) {
+    return { detected: false, snippet: null };
+  }
+  
+  // Find all functions/modifiers that use privilege keywords
+  const functionPattern = /(?:function|modifier)\s+(\w+)[^{]*\{/g;
+  const privilegedFunctions: Array<{name: string, body: string}> = [];
+  
+  while ((match = functionPattern.exec(source)) !== null) {
+    const funcName = match[1];
+    const funcStart = match.index;
+    const funcBodyStart = funcStart + match[0].length - 1;
+    const funcEnd = findMatchingBrace(source, funcBodyStart);
     
-    // Extract lines containing the keyword
-    const lines = source.split('\n');
-    const matchingLines = lines.filter(line => keywordRegex.test(line));
-    
-    // Check if any line references an address variable that's not the renounced owner
-    for (const line of matchingLines) {
-      // Look for address variables that might be secondary admins
-      const addressVarPattern = /(?:msg\.sender|_admin|_manager|_auth|_authorized|_newOwner|_pendingOwner|address\s*\(\s*\w+\s*\))/gi;
-      const matches = line.match(addressVarPattern);
+    if (funcEnd !== null) {
+      const funcBody = source.substring(funcStart, funcEnd + 1);
       
-      if (matches && matches.length > 0) {
-        // If we found references to potential admin variables, this is suspicious
+      // Check if this function uses any privilege keyword
+      for (const keyword of PRIVILEGE_KEYWORDS) {
+        const keywordRegex = new RegExp(keyword, 'gi');
+        if (keywordRegex.test(funcBody)) {
+          privilegedFunctions.push({ name: funcName, body: funcBody });
+          break;
+        }
+      }
+    }
+  }
+  
+  // Check if any privileged function is gated by a non-owner address variable
+  for (const func of privilegedFunctions) {
+    for (const addrVar of addressVars) {
+      // Look for this address variable being used in a require/check
+      const varUsagePattern = new RegExp(`require\\s*\\([^)]*${addrVar}[^)]*\\)|if\\s*\\([^)]*${addrVar}[^)]*\\)`, 'gi');
+      if (varUsagePattern.test(func.body)) {
+        // Found a privileged function gated by a secondary address variable
+        const snippet = func.body.split('\n').slice(0, 8).join('\n').trim();
         return {
           detected: true,
-          snippet: line.trim().substring(0, 200) + (line.length > 200 ? '...' : '')
+          snippet: snippet.length > 300 ? snippet.substring(0, 300) + '...' : snippet
         };
       }
     }

@@ -19,7 +19,7 @@
 
 import { Bot, Context, InlineQueryResultBuilder } from "grammy";
 import { extractAddress, answerTokenQuestion } from "./rugcheck-handler.js";
-import { formatRugReport } from "./rugcheck.js";
+import { formatRugReport, formatChatReply } from "./rugcheck.js";
 import type { PublicClient } from "viem";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -64,19 +64,27 @@ export function registerInlineHandler(bot: Bot<any>, client: AnyClient): void {
       const outcome = await answerTokenQuestion(client, address as `0x${string}`, undefined, "chat");
 
       if ("error" in outcome) {
-        console.error("[inline] Error checking token:", outcome.error);
+        const inlineMessageId = ctx.chosenInlineResult.inline_message_id;
+        if (inlineMessageId) {
+          await bot.api.editMessageTextInline(inlineMessageId, `❌ Couldn't check that token: ${outcome.error}`);
+        }
         return;
       }
 
-      // Format the full report
-      const report = formatRugReport(outcome.result, outcome.meta);
+      // Format the result (use chat reply format for inline messages to keep it concise)
+      const reply = formatChatReply(outcome.result, outcome.meta);
 
-      // Log the result for now - inline message editing requires raw API access
-      console.log("[inline] Rug check completed for", address);
-      console.log("[inline] Result:", outcome.result.verdict, outcome.result.score);
-      console.log("[inline] Report:", report.substring(0, 200) + "...");
+      // Edit the inline message with the actual result
+      const inlineMessageId = ctx.chosenInlineResult.inline_message_id;
+      if (!inlineMessageId) return;
+
+      await bot.api.editMessageTextInline(inlineMessageId, reply);
     } catch (err) {
       console.error("[inline] Error processing chosen result:", err);
+      const inlineMessageId = ctx.chosenInlineResult.inline_message_id;
+      if (inlineMessageId) {
+        await bot.api.editMessageTextInline(inlineMessageId, "❌ Error running rug check. Please try again.");
+      }
     }
   });
 }

@@ -208,13 +208,6 @@ async function main(): Promise<void> {
     { command: "start", description: "Show welcome message" },
     { command: "help", description: "Show usage instructions" },
     { command: "full", description: "Get full detailed report" },
-  ]);
-
-  // Register command menu for Telegram's native "/" autocomplete
-  bot.api.setMyCommands([
-    { command: "start", description: "Show welcome message" },
-    { command: "help", description: "Show usage instructions" },
-    { command: "full", description: "Get full detailed report" },
   ]).catch((err) => console.error("[bot] Failed to set commands:", err));
 
   // Start the bot for handling chat messages

@@ -68,7 +68,7 @@ const state = loadState();
 
 registerChatHandler(bot, client as any, state);
 registerInlineHandler(bot, client as any, state);
-let lastScannedBlock: bigint | null = state.lastScannedBlock ? BigInt(state.lastScannedBlock) : 0n; // Start from 0 for historical scan
+let lastScannedBlock: bigint | null = state.lastScannedBlock ? BigInt(state.lastScannedBlock) : 0n;
 let sniperRun = 0;
 
 // ─── Sniper tick ──────────────────────────────────────────────────────────────
@@ -78,14 +78,41 @@ async function sniperTick(): Promise<void> {
   const runLabel = `#${sniperRun}`;
   const now = new Date().toISOString();
 
-  // Scan in 5-minute intervals (3600 blocks on Base), starting from lastScannedBlock
-  const fromBlock = lastScannedBlock ?? 0n;
-  const toBlock = fromBlock + BLOCKS_PER_INTERVAL;
+  // Get current block to ensure we don't scan ahead of the chain
+  const currentBlock = await client.getBlockNumber();
+  
+  // Ensure we don't scan ahead of the current block
+  let fromBlock = lastScannedBlock ?? 0n;
+  if (fromBlock > currentBlock) {
+    console.log(`[bot] Warning: fromBlock ${fromBlock} is ahead of current block ${currentBlock}, resetting`);
+    fromBlock = currentBlock - BLOCKS_PER_INTERVAL;
+    if (fromBlock < 0n) fromBlock = 0n;
+    lastScannedBlock = fromBlock;
+    state.lastScannedBlock = fromBlock.toString();
+    saveState(state);
+  }
+
+  // Scan in 5-minute intervals (3600 blocks on Base), but don't exceed current block
+  let toBlock = fromBlock + BLOCKS_PER_INTERVAL;
+  if (toBlock > currentBlock) {
+    toBlock = currentBlock;
+  }
+  
+  // If fromBlock == toBlock, no new blocks to scan
+  if (fromBlock >= currentBlock) {
+    console.log(`\n${"═".repeat(66)}`);
+    console.log(`  SNIPER ${runLabel}  |  ${now}`);
+    console.log(`  No new blocks to scan (current: ${currentBlock.toLocaleString()}, last scanned: ${fromBlock.toLocaleString()})`);
+    console.log(`${"═".repeat(66)}\n`);
+    return;
+  }
+
   const windowLabel = "interval";
 
   console.log(`\n${"═".repeat(66)}`);
   console.log(`  SNIPER ${runLabel}  |  ${now}`);
   console.log(`  Blocks : ${fromBlock.toLocaleString()} → ${toBlock.toLocaleString()}  (${windowLabel})`);
+  console.log(`  Current block: ${currentBlock.toLocaleString()}`);
   console.log(`${"═".repeat(66)}\n`);
 
   const { totalPools, processed, skipped } = await scanBlockRange(
@@ -124,9 +151,12 @@ async function sniperTick(): Promise<void> {
     }
   );
 
-  // Advance watermark only after a successful scan
+  // Advance watermark only after a successful scan, but never ahead of current block
   lastScannedBlock = toBlock;
-  state.lastScannedBlock = toBlock.toString();
+  if (lastScannedBlock > currentBlock) {
+    lastScannedBlock = currentBlock;
+  }
+  state.lastScannedBlock = lastScannedBlock.toString();
   saveState(state);
 
   if (totalPools > 0) {
@@ -185,6 +215,35 @@ async function loop(fn: () => Promise<void>, intervalMs: number): Promise<void> 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
+  // Check if stored block is too old or ahead of current block
+  const currentBlock = await client.getBlockNumber();
+  if (currentBlock > 0n && lastScannedBlock !== null) {
+    // Reset if too old (before Base mainnet was active)
+    if (lastScannedBlock < 50000000n) {
+      console.log(`[bot] Stored block ${lastScannedBlock} is too old, resetting to current block ${currentBlock}`);
+      lastScannedBlock = currentBlock; // Start from current block, not current - 3600
+      state.lastScannedBlock = lastScannedBlock.toString();
+      state.postedTokens = []; // Clear posted tokens when resetting block
+      saveState(state);
+    }
+    // Reset if ahead of current block (scanning future blocks)
+    else if (lastScannedBlock > currentBlock) {
+      console.log(`[bot] Stored block ${lastScannedBlock} is ahead of current block ${currentBlock}, resetting`);
+      lastScannedBlock = currentBlock; // Start from current block
+      state.lastScannedBlock = lastScannedBlock.toString();
+      state.postedTokens = []; // Clear posted tokens when resetting block
+      saveState(state);
+    }
+    // Reset if more than 10,000 blocks behind current (too much historical data)
+    else if (currentBlock - lastScannedBlock > 10000n) {
+      console.log(`[bot] Stored block ${lastScannedBlock} is too far behind current block ${currentBlock}, resetting`);
+      lastScannedBlock = currentBlock;
+      state.lastScannedBlock = lastScannedBlock.toString();
+      state.postedTokens = []; // Clear posted tokens when resetting block
+      saveState(state);
+    }
+  }
+
   console.log(`${"═".repeat(66)}`);
   console.log(`  RugHound Telegram Bot`);
   console.log(`  Network  : Base Mainnet (chain ID 8453)`);

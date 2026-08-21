@@ -155,7 +155,9 @@ export async function runRugCheckLLM(
   let llmResult;
   let toolCallTranscript: import("./rugcheck-types.js").ToolCallRecord[] | undefined;
   
-  if (isAmbiguous(evidence)) {
+  // Temporarily disable agentic mode due to Gemini API compatibility issues
+  // TODO: Fix Gemini function calling format to use correct API structure
+  if (false && isAmbiguous(evidence)) {
     console.log("  Evidence is ambiguous — entering agentic investigation mode...");
     
     const toolContext: ToolContext = {
@@ -179,10 +181,11 @@ export async function runRugCheckLLM(
         console.log(`    - ${call.name} at ${new Date(call.ts).toISOString()}`);
       }
     }
-  } else {
-    console.log("  Evidence is clear — using single-shot LLM scoring...");
-    llmResult = await scoreWithLLM(evidence, opts);
-  }
+  } 
+  
+  // Always use single-shot mode for now (agentic mode disabled due to Gemini API compatibility)
+  console.log("  Evidence is clear — using single-shot LLM scoring...");
+  llmResult = await scoreWithLLM(evidence, opts);
 
   if (!llmResult.ok) {
     console.error(`  [LLM] Scoring failed: ${llmResult.reason}`);

@@ -421,6 +421,7 @@ IMPORTANT: Every numeric fact in your final flags must be traceable to a tool re
 
 /**
  * Append a function result to the message history.
+ * Gemini uses a different format: function responses are added as user messages with functionResponse parts.
  */
 function appendFunctionResult(
   messages: Message[],
@@ -435,10 +436,15 @@ function appendFunctionResult(
     parts: [{ functionCall: { name: call.name, args: call.args } }],
   });
   
-  // Add the function response
+  // Add the function response (Gemini uses user role with functionResponse)
   newMessages.push({
-    role: "function",
-    parts: [{ functionResponse: { name: call.name, response: result } }],
+    role: "user",
+    parts: [{
+      functionResponse: {
+        name: call.name,
+        response: result
+      }
+    }],
   });
   
   return newMessages;

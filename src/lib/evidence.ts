@@ -182,7 +182,7 @@ interface DeployerResult {
   source: "tight" | "wide" | "unknown";
 }
 
-async function findDeployer(
+export async function findDeployer(
   client: AnyClient,
   tokenAddress: Address,
   deployBlock: bigint,
@@ -260,7 +260,7 @@ interface HolderScanResult {
  * always failed with "range exceeds limit" on any scan more than 10k blocks
  * from the current head — which is true of all historical tokens.
  */
-async function scanHolderBalances(
+export async function scanHolderBalances(
   client: AnyClient,
   tokenAddress: Address,
   fromBlock: bigint,
@@ -348,7 +348,7 @@ export async function checkLiquidityDelta(
 }
 
 // ── 1. Sell-ability / honeypot test ──────────────────────────────────────
-async function testSellability(
+export async function testSellability(
   client: AnyClient,
   tokenAddress: Address,
   poolAddress: Address,
@@ -385,8 +385,59 @@ async function testSellability(
   }
 }
 
+/**
+ * Standalone sell test for a specific holder at a specific percentage.
+ * This is the agent-friendly wrapper that allows the LLM to specify which holder
+ * to test and what percentage of their balance to sell.
+ */
+export async function runSellTest(
+  client: AnyClient,
+  tokenAddress: Address,
+  poolAddress: Address,
+  holderAddress: Address,
+  amountPct: number,
+  warnings: string[]
+): Promise<{ sellTestPassed: boolean | null; sellTestAmountSent: string | null; sellTestError: string | null }> {
+  // Get the holder's current balance
+  let balance: bigint;
+  try {
+    balance = await client.readContract({
+      address: tokenAddress,
+      abi: ERC20_ABI,
+      functionName: "balanceOf",
+      args: [holderAddress],
+    }) as bigint;
+  } catch (err) {
+    warn(warnings, "sellTest", `failed to read balance for ${holderAddress}`, err);
+    return { sellTestPassed: null, sellTestAmountSent: null, sellTestError: "failed to read holder balance" };
+  }
+
+  if (balance === 0n) {
+    return { sellTestPassed: null, sellTestAmountSent: null, sellTestError: "holder has zero balance" };
+  }
+
+  // Calculate test amount based on percentage
+  const testAmount = (balance * BigInt(Math.floor(amountPct * 100))) / 10000n;
+  if (testAmount === 0n) {
+    return { sellTestPassed: null, sellTestAmountSent: null, sellTestError: "calculated test amount is zero" };
+  }
+
+  try {
+    await client.call({
+      account: holderAddress,
+      to: tokenAddress,
+      data: encodeFunctionData({ abi: ERC20_TRANSFER_ABI, functionName: "transfer", args: [poolAddress, testAmount] }),
+    });
+    return { sellTestPassed: true, sellTestAmountSent: testAmount.toString(), sellTestError: null };
+  } catch (err) {
+    warn(warnings, "sellTest", "simulated transfer to pool reverted", err);
+    const message = err instanceof Error ? err.message.split("\n")[0] : String(err);
+    return { sellTestPassed: false, sellTestAmountSent: testAmount.toString(), sellTestError: message };
+  }
+}
+
 // ── 2. LP position lock/burn status ──────────────────────────────────────
-async function checkLpLockStatus(
+export async function checkLpLockStatus(
   client: AnyClient,
   poolAddress: Address,
   deployBlock: bigint,
@@ -441,7 +492,7 @@ async function checkLpLockStatus(
 }
 
 // ── 3. Liquidity pull history (Burn event scan) ──────────────────────────
-async function checkLiquidityPullHistory(
+export async function checkLiquidityPullHistory(
   client: AnyClient,
   poolAddress: Address,
   deployBlock: bigint,
@@ -482,7 +533,7 @@ interface TradeActivity {
   scanPartial: boolean;
 }
 
-async function scanTradeActivity(
+export async function scanTradeActivity(
   client: AnyClient,
   poolAddress: Address,
   fromBlock: bigint,
@@ -660,7 +711,7 @@ function detectSecondaryAdmin(
 }
 
 // ── 4. Source verification + backdoor keyword scan ──────────────────────
-async function checkSourceVerification(
+export async function checkSourceVerification(
   tokenAddress: Address,
   warnings: string[],
   ownershipRenounced: boolean | null,

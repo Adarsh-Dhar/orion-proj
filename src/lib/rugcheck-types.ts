@@ -12,6 +12,13 @@ export interface RiskFlag {
   points: number;      // used by rule engine; LLM sets 0 but field is required
 }
 
+export interface ToolCallRecord {
+  name: string;
+  args: Record<string, unknown>;
+  output: unknown;
+  ts: number;
+}
+
 export interface RugCheckResult {
   tokenAddress: Address;
   poolAddress: Address;
@@ -64,8 +71,10 @@ export interface RugCheckResult {
   summary: string;
 
   // ── Metadata ───────────────────────────────────────────────────────────────
-  scoringMethod?: "rules" | "llm";
+  scoringMethod?: "rules" | "llm" | "llm-agentic";
   scoringError?: string;             // set when LLM scoring fails
   /** Direct answer to the user's question, only present when asked via chat */
   answer?: string;
+  /** Transcript of tool calls made during agentic scoring */
+  toolCallTranscript?: ToolCallRecord[];
 }

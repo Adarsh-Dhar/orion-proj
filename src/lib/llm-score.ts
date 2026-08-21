@@ -17,8 +17,9 @@
 
 import type { TokenEvidence } from "./evidence.js";
 import type { RiskFlag, RiskLevel } from "./rugcheck-types.js";
+import type { ToolCallRecord } from "./rugcheck-types.js";
 
-export type ScoreMode = "alert" | "chat";
+export type ScoreMode = "alert" | "chat" | "agentic";
 
 // ─── Env ─────────────────────────────────────────────────────────────────────
 
@@ -37,6 +38,8 @@ export interface LLMScoreSuccess {
   rawModelText: string;
   /** Only present when opts.userQuestion was supplied */
   answer?: string;
+  /** Only present in agentic mode: transcript of tool calls made */
+  toolCallTranscript?: ToolCallRecord[];
 }
 
 export interface LLMScoreFailure {
@@ -75,6 +78,7 @@ IMPORTANT RULES:
    - "chat" with no question (bare address): add an "answer" field with a natural,
      conversational risk read of the token (2–4 sentences) — as if explaining it to someone,
      not a formal restatement of 'summary'.
+   - "agentic": You have access to tools to gather additional evidence. Use them when the initial evidence is ambiguous or incomplete. Before finalizing, consider what a scammer would have done to pass the checks you've run, and issue one more tool call if it surfaces a gap.
 
 SCORING GUIDE:
 - Ownership not renounced (confirmed active owner address):  +25 pts, HIGH
@@ -290,4 +294,224 @@ export async function scoreWithLLM(
   }
 
   return { ...validated, rawModelText };
+}
+
+// ─── Agentic function-calling variant ───────────────────────────────────────────
+
+interface ToolCall {
+  name: string;
+  args: Record<string, unknown>;
+}
+
+interface ToolCallResponse {
+  type: "tool_calls";
+  toolCalls: ToolCall[];
+  raw: string;
+}
+
+interface FinalResponse {
+  type: "final";
+  json: unknown;
+  raw: string;
+}
+
+type AgenticResponse = ToolCallResponse | FinalResponse;
+
+interface MessagePart {
+  text?: string;
+  functionCall?: { name: string; args: Record<string, unknown> };
+  functionResponse?: { name: string; response: unknown };
+  [key: string]: unknown; // Make it indexable
+}
+
+interface Message {
+  role: string;
+  parts: MessagePart[];
+}
+
+/**
+ * Call Gemini with function calling support.
+ * Returns either tool calls to execute or a final JSON response.
+ */
+async function callGeminiWithTools(
+  messages: Array<{ role: string; parts: Array<Record<string, unknown>> }>,
+  tools: readonly unknown[]
+): Promise<AgenticResponse> {
+  const response = await fetch(GEMINI_ENDPOINT, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: messages,
+      tools: [{ functionDeclarations: tools }],
+    }),
+  });
+
+  const data = await response.json() as {
+    candidates?: Array<{ content?: { parts?: Array<{ text?: string; functionCall?: { name: string; args: Record<string, unknown> } }> } }>;
+    error?: { code: number; message: string };
+  };
+
+  if (data.error) {
+    throw new Error(`Gemini API error ${data.error.code}: ${data.error.message}`);
+  }
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+  }
+
+  const candidate = data.candidates?.[0];
+  if (!candidate?.content?.parts) {
+    throw new Error("Gemini returned empty response");
+  }
+
+  const parts = candidate.content.parts as MessagePart[];
+  const rawText = parts.map(p => p.text ?? "").join("");
+  
+  // Check for function calls
+  const functionCalls = parts
+    .filter(p => p.functionCall)
+    .map(p => ({ name: p.functionCall!.name, args: p.functionCall!.args }));
+
+  if (functionCalls.length > 0) {
+    return { type: "tool_calls", toolCalls: functionCalls, raw: rawText };
+  }
+
+  // Parse as final JSON response
+  const cleaned = rawText
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```\s*$/, "")
+    .trim();
+
+  try {
+    const json = JSON.parse(cleaned);
+    return { type: "final", json, raw: rawText };
+  } catch {
+    throw new Error(`Failed to parse final JSON: ${cleaned.slice(0, 200)}`);
+  }
+}
+
+/**
+ * Build initial messages for the agentic loop.
+ */
+function buildInitialMessages(evidence: TokenEvidence): Message[] {
+  const evidenceJson = JSON.stringify(evidence, null, 2);
+  
+  return [
+    {
+      role: "user",
+      parts: [{
+        text: `${SYSTEM_PROMPT}
+
+You are now operating in AGENTIC mode. You have access to tools to gather additional evidence beyond the initial scan.
+
+INITIAL EVIDENCE:
+${evidenceJson}
+
+Your task:
+1. Review the initial evidence
+2. If the evidence is ambiguous or incomplete, use tools to gather more information
+3. Before finalizing, ask yourself what a scammer would have done to pass the checks you've run, and issue one more tool call if it surfaces a gap
+4. When you have sufficient evidence, return your final risk assessment as JSON
+
+IMPORTANT: Every numeric fact in your final flags must be traceable to a tool result. Do not hallucinate numbers.
+`,
+      }],
+    },
+  ];
+}
+
+/**
+ * Append a function result to the message history.
+ */
+function appendFunctionResult(
+  messages: Message[],
+  call: ToolCall,
+  result: unknown
+): Message[] {
+  const newMessages = [...messages];
+  
+  // Add the function call
+  newMessages.push({
+    role: "user",
+    parts: [{ functionCall: { name: call.name, args: call.args } }],
+  });
+  
+  // Add the function response
+  newMessages.push({
+    role: "function",
+    parts: [{ functionResponse: { name: call.name, response: result } }],
+  });
+  
+  return newMessages;
+}
+
+/**
+ * Score with LLM in agentic mode with function calling.
+ */
+export async function scoreWithLLMAgentic(
+  evidence: TokenEvidence,
+  dispatchTool: (name: string, args: Record<string, unknown>) => Promise<unknown>,
+  tools: readonly unknown[],
+  opts?: { maxIterations?: number }
+): Promise<LLMScoreResult> {
+  if (!GEMINI_API_KEY) {
+    return { ok: false, reason: "GEMINI_API_KEY is not set" };
+  }
+
+  const maxIterations = opts?.maxIterations ?? 12;
+  let messages = buildInitialMessages(evidence);
+  const transcript: ToolCallRecord[] = [];
+
+  for (let i = 0; i < maxIterations; i++) {
+    try {
+      const response = await callGeminiWithTools(messages, tools);
+
+      if (response.type === "final") {
+        const validated = validateParsed(response.json);
+        if (!validated) {
+          return {
+            ok: false,
+            reason: `Model returned JSON with missing/invalid fields: ${response.raw.slice(0, 300)}`,
+            rawModelText: response.raw,
+          };
+        }
+
+        return {
+          ...validated,
+          rawModelText: response.raw,
+          toolCallTranscript: transcript,
+        };
+      }
+
+      // Execute tool calls
+      for (const call of response.toolCalls) {
+        try {
+          const output = await dispatchTool(call.name, call.args);
+          transcript.push({
+            name: call.name,
+            args: call.args,
+            output,
+            ts: Date.now(),
+          });
+          messages = appendFunctionResult(messages, call, output);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          transcript.push({
+            name: call.name,
+            args: call.args,
+            output: { error: msg },
+            ts: Date.now(),
+          });
+          messages = appendFunctionResult(messages, call, { error: msg });
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { ok: false, reason: `Agentic loop failed: ${msg}` };
+    }
+  }
+
+  return {
+    ok: false,
+    reason: `Agent exceeded ${maxIterations} tool calls without a verdict`,
+  };
 }

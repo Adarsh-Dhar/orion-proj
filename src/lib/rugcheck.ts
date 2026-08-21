@@ -23,11 +23,63 @@ import { scoreWithLLM }      from "./llm-score.js";
 import type { TokenEvidence } from "./evidence.js";
 import type { BotState } from "./state.js";
 import { getDeployerHistory, recordDeployerToken } from "./state.js";
+import { runAgentLoop } from "./agent-loop.js";
+import type { ToolContext } from "./agent-tools.js";
 
 // ─── Re-export shared types ───────────────────────────────────────────────────
 
 export type { RiskLevel, RiskFlag, RugCheckResult } from "./rugcheck-types.js";
 import type { RiskLevel, RiskFlag, RugCheckResult } from "./rugcheck-types.js";
+
+// ─── Ambiguity detector ──────────────────────────────────────────────────────────
+
+/**
+ * Determine if the evidence is ambiguous and requires agentic investigation.
+ * Returns true if the evidence shows conflicting signals or insufficient data.
+ */
+function isAmbiguous(evidence: TokenEvidence): boolean {
+  // Conflicting signals: sell test passed but high concentration
+  if (evidence.sellTestPassed === true && evidence.top5HoldersPct !== null && evidence.top5HoldersPct > 60) {
+    return true;
+  }
+
+  // Source verification missing/null
+  if (evidence.sourceVerified === null) {
+    return true;
+  }
+
+  // Deployer seen before but otherwise clean signals
+  if (evidence.deployerSeenBefore && evidence.sellTestPassed === true && evidence.liquidityLocked === true) {
+    return true;
+  }
+
+  // Ownership renounced but LP not locked
+  if (evidence.ownershipRenounced === true && evidence.lpPositionStatus === "held_by_eoa") {
+    return true;
+  }
+
+  // Low liquidity but not zero
+  if (evidence.initialLiquidityEth !== null && evidence.initialLiquidityEth > 0 && evidence.initialLiquidityEth < 0.5) {
+    return true;
+  }
+
+  // Trade scan failed or partial
+  if (evidence.tradeScanPartial) {
+    return true;
+  }
+
+  // Holder scan partial
+  if (evidence.holderScanPartial) {
+    return true;
+  }
+
+  // Multiple RPC warnings
+  if (evidence.rpcWarnings.length >= 3) {
+    return true;
+  }
+
+  return false;
+}
 
 // ─── LLM scorer ───────────────────────────────────────────────────────────────
 
@@ -96,9 +148,40 @@ export async function runRugCheckLLM(
   const liquidityLocked = evidence.liquidityLocked;
   const initialLiquidityEth = evidence.initialLiquidityEth ?? 0;
 
-  // ── 3. Score with LLM ─────────────────────────────────────────────────────
+  // ── 3. Score with LLM (hybrid: single-shot for clean/obvious, agentic for ambiguous) ─────────────────────
   console.log("  Sending evidence to Gemini for scoring...");
-  const llmResult = await scoreWithLLM(evidence, opts);
+  
+  let llmResult;
+  let toolCallTranscript: import("./rugcheck-types.js").ToolCallRecord[] | undefined;
+  
+  if (isAmbiguous(evidence)) {
+    console.log("  Evidence is ambiguous — entering agentic investigation mode...");
+    
+    const toolContext: ToolContext = {
+      client,
+      tokenAddress,
+      poolAddress,
+      deployBlock,
+      state: opts?.state,
+      ownershipRenounced: evidence.ownershipRenounced,
+      ownerAddress: evidence.ownerAddress,
+    };
+    
+    const { result, transcript } = await runAgentLoop(evidence, toolContext, { maxIterations: 12 });
+    llmResult = result;
+    toolCallTranscript = transcript;
+    
+    console.log(`  Agentic investigation complete: ${llmResult.ok ? "SUCCESS" : "FAILED"}`);
+    if (transcript.length > 0) {
+      console.log(`  Tool calls made: ${transcript.length}`);
+      for (const call of transcript) {
+        console.log(`    - ${call.name} at ${new Date(call.ts).toISOString()}`);
+      }
+    }
+  } else {
+    console.log("  Evidence is clear — using single-shot LLM scoring...");
+    llmResult = await scoreWithLLM(evidence, opts);
+  }
 
   if (!llmResult.ok) {
     console.error(`  [LLM] Scoring failed: ${llmResult.reason}`);
@@ -137,12 +220,24 @@ export async function runRugCheckLLM(
       score:   100,
       verdict: "CRITICAL",
       summary: `LLM scoring failed: ${llmResult.reason}`,
-      scoringMethod: "llm",
+      scoringMethod: toolCallTranscript ? "llm-agentic" : "llm",
       scoringError:  llmResult.reason,
+      toolCallTranscript,
     };
   }
 
   console.log(`  Gemini verdict: ${llmResult.verdict} (${llmResult.score}/100)`);
+  
+  // Log tool call transcript if it exists
+  if (toolCallTranscript && toolCallTranscript.length > 0) {
+    console.log("\n  ── Tool Call Transcript ─────────────────────────────────────");
+    for (const call of toolCallTranscript) {
+      console.log(`  [${new Date(call.ts).toISOString()}] ${call.name}`);
+      console.log(`    Args: ${JSON.stringify(call.args)}`);
+      console.log(`    Output: ${JSON.stringify(call.output).slice(0, 200)}${JSON.stringify(call.output).length > 200 ? "..." : ""}`);
+    }
+    console.log("  ─────────────────────────────────────────────────────────────\n");
+  }
 
   return {
     tokenAddress, poolAddress, pairedAsset,
@@ -172,8 +267,9 @@ export async function runRugCheckLLM(
     score:   llmResult.score,
     verdict: llmResult.verdict,
     summary: llmResult.summary,
-    scoringMethod: "llm",
+    scoringMethod: toolCallTranscript ? "llm-agentic" : "llm",
     answer:  llmResult.answer,
+    toolCallTranscript,
   };
 }
 

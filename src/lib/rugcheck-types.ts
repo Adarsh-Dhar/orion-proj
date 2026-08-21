@@ -77,4 +77,6 @@ export interface RugCheckResult {
   answer?: string;
   /** Transcript of tool calls made during agentic scoring */
   toolCallTranscript?: ToolCallRecord[];
+  /** Analysis ID for retrieving full trace from Upstash */
+  analysisId?: string;
 }

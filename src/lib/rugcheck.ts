@@ -25,6 +25,7 @@ import type { BotState } from "./state.js";
 import { getDeployerHistory, recordDeployerToken } from "./state.js";
 import { runAgentLoop } from "./agent-loop.js";
 import type { ToolContext } from "./agent-tools.js";
+import { storeAnalysis } from "./analysis-store.js";
 
 // ─── Re-export shared types ───────────────────────────────────────────────────
 
@@ -223,6 +224,7 @@ export async function runRugCheckLLM(
       scoringMethod: toolCallTranscript ? "llm-agentic" : "llm",
       scoringError:  llmResult.reason,
       toolCallTranscript,
+      analysisId: undefined,
     };
   }
 
@@ -237,6 +239,34 @@ export async function runRugCheckLLM(
       console.log(`    Output: ${JSON.stringify(call.output).slice(0, 200)}${JSON.stringify(call.output).length > 200 ? "..." : ""}`);
     }
     console.log("  ─────────────────────────────────────────────────────────────\n");
+  }
+
+  // Store analysis in Upstash if we have agentic data
+  let analysisId: string | undefined;
+  if (toolCallTranscript && toolCallTranscript.length > 0 && llmResult.ok) {
+    try {
+      const storedId = await storeAnalysis({
+        tokenAddress,
+        tokenName: meta.name,
+        tokenSymbol: meta.symbol,
+        poolAddress,
+        pairedAsset,
+        score: llmResult.score,
+        verdict: llmResult.verdict,
+        summary: llmResult.summary,
+        evidence,
+        toolCallTranscript,
+        flags: llmResult.flags,
+        scoringMethod: toolCallTranscript ? "llm-agentic" : "llm",
+      });
+      if (storedId) {
+        analysisId = storedId;
+        console.log(`  [analysis] Stored analysis with ID: ${analysisId}`);
+      }
+    } catch (err) {
+      console.error(`  [analysis] Failed to store analysis:`, err);
+      // Continue without analysis storage - non-critical
+    }
   }
 
   return {
@@ -270,6 +300,7 @@ export async function runRugCheckLLM(
     scoringMethod: toolCallTranscript ? "llm-agentic" : "llm",
     answer:  llmResult.answer,
     toolCallTranscript,
+    analysisId,
   };
 }
 
@@ -397,6 +428,14 @@ export function formatAlertCard(
 
   lines.push(r.tokenAddress);
   lines.push(`https://basescan.org/address/${r.tokenAddress}`);
+
+  // Add analysis link if available (only for agentic scoring)
+  if (r.analysisId && r.scoringMethod === "llm-agentic") {
+    const frontendBaseUrl = process.env.FRONTEND_BASE_URL;
+    if (frontendBaseUrl) {
+      lines.push(`🔍 View full agent trace: ${frontendBaseUrl}/analysis/${r.analysisId}`);
+    }
+  }
 
   return lines.join("\n");
 }

@@ -10,6 +10,7 @@
   "license": "ISC",
   "type": "module",
   "dependencies": {
+    "@upstash/redis": "^1.38.2",
     "dotenv": "^17.4.2",
     "grammy": "^1.45.1",
     "viem": "^2.55.16"

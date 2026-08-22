@@ -11,7 +11,7 @@
  *
  * Key fix vs old rugcheck.ts:
  *   getHolderBalances now resolves "latest" explicitly via getBlockNumber(),
- *   then walks FORWARD in SCAN_CHUNK (10k-block) windows rather than making
+ *   then walks FORWARD in SCAN_CHUNK windows rather than making
  *   one unbounded call. This eliminates the "range exceeds limit" error that
  *   broke every historical scan.
  *
@@ -64,7 +64,9 @@ import {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = PublicClient<any>;
 
-const SCAN_CHUNK   = 10_000n;
+/** Max blocks per eth_getLogs call.
+ *  Alchemy free tier: 10 blocks. PAYG / Growth: raise to 500 or 2000. */
+const SCAN_CHUNK   = 10n;
 const MAX_LOOKBACK = 200_000n;
 const ZERO_SLOT    =
   "0x0000000000000000000000000000000000000000000000000000000000000000";
@@ -210,41 +212,22 @@ export async function findDeployer(
   deployBlock: bigint,
   warnings: string[]
 ): Promise<DeployerResult> {
-  const MINT_LOOKBACK = 500n;
-  const tightFrom = deployBlock > MINT_LOOKBACK ? deployBlock - MINT_LOOKBACK : 0n;
-
-  // Pass 1 — tight window around pool creation
-  try {
-    const logs = await client.getLogs({
-      address: tokenAddress,
-      event: TRANSFER_EVENT_ABI[0],
-      args: { from: NULL_ADDRESS as Address },
-      fromBlock: tightFrom,
-      toBlock: deployBlock,
-    });
-    if (logs.length > 0) {
-      const sorted = [...logs].sort((a, b) => (a.blockNumber! < b.blockNumber! ? -1 : 1));
-      const first  = sorted[0];
-      const to     = (first.args as { to: string }).to ?? null;
-      const value  = (first.args as { value?: bigint }).value ?? null;
-      return { address: to, mintBlock: first.blockNumber ?? null, mintAmount: value, source: "tight" };
-    }
-  } catch (err) {
-    warn(warnings, "findDeployer", `tight-window [${tightFrom}, ${deployBlock}] failed`, err);
-  }
-
-  // Pass 2 — walk backwards in 10k-block chunks up to 200k blocks
+  // Mint happens at or before the pool creation block.
+  // Walk backwards in SCAN_CHUNK windows up to MAX_LOOKBACK blocks.
+  // "Tight" pass = the first few chunks immediately around deployBlock;
+  // "Wide" pass = the remaining history — same loop, different label.
   const hardFloor = deployBlock > MAX_LOOKBACK ? deployBlock - MAX_LOOKBACK : 0n;
-  let chunkEnd = tightFrom > 1n ? tightFrom - 1n : 0n;
+  let chunkEnd = deployBlock;
 
-  while (chunkEnd > hardFloor) {
-    const chunkStart = chunkEnd > SCAN_CHUNK ? chunkEnd - SCAN_CHUNK : 0n;
+  while (chunkEnd >= hardFloor) {
+    const chunkStart = chunkEnd >= SCAN_CHUNK ? chunkEnd - (SCAN_CHUNK - 1n) : 0n;
+    const clampedStart = chunkStart > hardFloor ? chunkStart : hardFloor;
     try {
       const logs = await client.getLogs({
         address: tokenAddress,
         event: TRANSFER_EVENT_ABI[0],
         args: { from: NULL_ADDRESS as Address },
-        fromBlock: chunkStart,
+        fromBlock: clampedStart,
         toBlock: chunkEnd,
       });
       if (logs.length > 0) {
@@ -252,13 +235,20 @@ export async function findDeployer(
         const first  = sorted[0];
         const to     = (first.args as { to: string }).to ?? null;
         const value  = (first.args as { value?: bigint }).value ?? null;
-        return { address: to, mintBlock: first.blockNumber ?? null, mintAmount: value, source: "wide" };
+        return {
+          address: to,
+          mintBlock: first.blockNumber ?? null,
+          mintAmount: value,
+          source: chunkEnd === deployBlock ? "tight" : "wide",
+        };
       }
     } catch (err) {
-      warn(warnings, "findDeployer", `wide chunk [${chunkStart}, ${chunkEnd}] failed`, err);
+      warn(warnings, "findDeployer", `chunk [${clampedStart}, ${chunkEnd}] failed`, err);
+      // Stop — don't burn requests on a connection that's already failing
+      return { address: null, mintBlock: null, mintAmount: null, source: "unknown" };
     }
-    if (chunkStart === 0n) break;
-    chunkEnd = chunkStart - 1n;
+    if (clampedStart <= hardFloor) break;
+    chunkEnd = clampedStart - 1n;
   }
 
   return { address: null, mintBlock: null, mintAmount: null, source: "unknown" };
@@ -314,6 +304,8 @@ export async function scanHolderBalances(
     } catch (err) {
       chunksFailed++;
       warn(warnings, "holderScan", `chunk [${chunkStart}, ${chunkEnd}] failed`, err);
+      // Stop — don't burn requests on a connection that's already failing
+      break;
     }
   }
 
@@ -423,8 +415,22 @@ export async function testSellability(
     fee: number;
     tickSpacing: number;
     hooks: Address;
-  }
+  },
+  /** Pass the already-computed liquidity value so we can skip the test when
+   *  the pool is empty.  A revert against a zero-liquidity pool is not a
+   *  honeypot signal — it's just "nothing to trade against". */
+  poolLiquidityRaw: bigint | null = null
 ): Promise<{ sellTestPassed: boolean | null; sellTestAmountSent: string | null; sellTestError: string | null }> {
+  // Guard: empty pool ⇒ any revert is ambiguous, not a honeypot signal.
+  // Both V3 and V4 branches benefit from this check.
+  if (poolLiquidityRaw !== null && poolLiquidityRaw === 0n) {
+    return {
+      sellTestPassed: null,
+      sellTestAmountSent: null,
+      sellTestError: "pool has zero liquidity — sell simulation skipped (not meaningful against an empty pool)",
+    };
+  }
+
   const candidate = top5.find(
     (h) =>
       h.address.toLowerCase() !== NULL_ADDRESS.toLowerCase() &&
@@ -468,7 +474,7 @@ export async function testSellability(
     try {
       // quoteExactInputSingle is nonpayable (uses transient storage) — must
       // use simulateContract, not readContract, otherwise viem refuses to call it.
-      await client.simulateContract({
+      const result = await client.simulateContract({
         address: UNISWAP_V4_QUOTER as Address,
         abi: V4_QUOTER_EXACT_INPUT_SINGLE_ABI,
         functionName: "quoteExactInputSingle",
@@ -485,10 +491,44 @@ export async function testSellability(
           hookData: "0x" as `0x${string}`,
         }],
       });
+      
+      // If we get here, the simulation succeeded
       return { sellTestPassed: true, sellTestAmountSent: quoteAmount.toString(), sellTestError: null };
     } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      
+      // Check if the error is due to "No pool" or "Pool not initialized"
+      if (errorMessage.includes("No pool") || errorMessage.includes("not initialized") || errorMessage.includes("Pool does not exist") || errorMessage.includes("uninitialized")) {
+        // Pool doesn't exist or isn't properly initialized - this is not a honeypot signal
+        return {
+          sellTestPassed: null,
+          sellTestAmountSent: null,
+          sellTestError: "V4 pool not initialized or does not exist - sell test skipped",
+        };
+      }
+      
+      // Check if error is due to insufficient liquidity
+      if (errorMessage.includes("insufficient liquidity") || errorMessage.includes("Insufficient liquidity") || errorMessage.includes("SLIPPAGE") || errorMessage.includes("low liquidity")) {
+        return {
+          sellTestPassed: null,
+          sellTestAmountSent: null,
+          sellTestError: "Insufficient pool liquidity - sell test inconclusive",
+        };
+      }
+      
+      // Check if error is just a generic revert without specific hook data
+      // This often happens with pools that have no liquidity or are malformed
+      if (errorMessage.includes("reverted with the following signature") && !errorMessage.includes("hook") && !errorMessage.includes("blacklist") && !errorMessage.includes("block")) {
+        return {
+          sellTestPassed: null,
+          sellTestAmountSent: null,
+          sellTestError: "V4 Quoter reverted (malformed pool or no liquidity) - sell test inconclusive",
+        };
+      }
+      
+      // If it's a revert from a hook blocking the swap, that's a honeypot signal
       warn(warnings, "sellTest", "V4 Quoter simulation reverted", err);
-      const message = err instanceof Error ? err.message.split("\n")[0] : String(err);
+      const message = errorMessage.split("\n")[0];
       return { sellTestPassed: false, sellTestAmountSent: quoteAmount.toString(), sellTestError: message };
     }
   }
@@ -599,7 +639,7 @@ async function checkLpLockStatusV3(
       address: poolAddress,
       event: POOL_MINT_EVENT_ABI[0],
       fromBlock: deployBlock,
-      toBlock: deployBlock + 200n,
+      toBlock: deployBlock + SCAN_CHUNK - 1n,
     });
     if (mintLogs.length === 0) {
       return { lpTokenId: null, lpPositionOwner: null, lpPositionStatus: "unverified" };
@@ -653,18 +693,23 @@ async function checkLpLockStatusV4(
   // We look within a generous window (deploy block + 500) to catch the initial
   // liquidity add, then check whether the same sender later pulled it.
   try {
-    const scanTo = deployBlock + 500n;
+    const scanTo = deployBlock + SCAN_CHUNK - 1n;
 
     const addLogs = await client.getLogs({
       address: UNISWAP_V4_POOL_MANAGER as Address,
       event:   V4_MODIFY_LIQUIDITY_EVENT_ABI[0],
-      args:    { id: poolId },
+      // No args filter — bytes32 topic filter rejected by Alchemy free tier.
+      // Filter by poolId client-side after fetching.
       fromBlock: deployBlock,
       toBlock:   scanTo,
     });
+    const poolIdLower = poolId.toLowerCase();
+    const poolAddLogs = addLogs.filter(
+      (l) => (l.args as { id: string }).id?.toLowerCase() === poolIdLower
+    );
 
     // Find the first event with a positive liquidityDelta (initial LP add)
-    const firstAdd = addLogs.find(
+    const firstAdd = poolAddLogs.find(
       (l) => (l.args as { liquidityDelta: bigint }).liquidityDelta > 0n
     );
     if (!firstAdd) {
@@ -690,12 +735,16 @@ async function checkLpLockStatusV4(
         const removeLogs = await client.getLogs({
           address: UNISWAP_V4_POOL_MANAGER as Address,
           event:   V4_MODIFY_LIQUIDITY_EVENT_ABI[0],
-          args:    { id: poolId, sender: lpSender as Address },
+          // Filter only by sender (address topic — works on free tier).
+          // poolId (bytes32 topic) filtered client-side.
+          args:    { sender: lpSender as Address },
           fromBlock: chunkStart,
           toBlock:   chunkEnd,
         });
         for (const l of removeLogs) {
-          if ((l.args as { liquidityDelta: bigint }).liquidityDelta < 0n) {
+          const args = l.args as { id: string; liquidityDelta: bigint };
+          if (args.id?.toLowerCase() !== poolIdLower) continue;
+          if (args.liquidityDelta < 0n) {
             removedByLpOwner = true;
             break;
           }
@@ -766,6 +815,7 @@ async function checkLiquidityPullHistoryV3(
       count += logs.length;
     } catch (err) {
       warn(warnings, "burnHistory", `V3 chunk [${chunkStart}, ${chunkEnd}] failed`, err);
+      break; // Stop — don't burn requests on a failing connection
     }
   }
   return { liquidityEverPulled: count > 0, burnEventCount: count };
@@ -793,17 +843,22 @@ async function checkLiquidityPullHistoryV4(
       const logs = await client.getLogs({
         address: UNISWAP_V4_POOL_MANAGER as Address,
         event:   V4_MODIFY_LIQUIDITY_EVENT_ABI[0],
-        args:    { id: poolId },
+        // No bytes32 args filter — rejected by Alchemy free tier.
+        // Filter by poolId client-side.
         fromBlock: chunkStart,
         toBlock:   chunkEnd,
       });
+      const poolIdLower = poolId.toLowerCase();
       for (const l of logs) {
-        if ((l.args as { liquidityDelta: bigint }).liquidityDelta < 0n) {
+        const args = l.args as { id: string; liquidityDelta: bigint };
+        if (args.id?.toLowerCase() !== poolIdLower) continue;
+        if (args.liquidityDelta < 0n) {
           count++;
         }
       }
     } catch (err) {
       warn(warnings, "burnHistory", `V4 chunk [${chunkStart}, ${chunkEnd}] failed`, err);
+      break; // Stop — don't burn requests on a failing connection
     }
   }
   return { liquidityEverPulled: count > 0, burnEventCount: count };
@@ -877,6 +932,7 @@ async function scanTradeActivityV3(
     } catch (err) {
       chunksFailed++;
       warn(warnings, "tradeScan", `V3 chunk [${chunkStart}, ${chunkEnd}] failed`, err);
+      break; // Stop — don't burn requests on a failing connection
     }
   }
 
@@ -905,14 +961,16 @@ async function scanTradeActivityV4(
       const logs = await client.getLogs({
         address: UNISWAP_V4_POOL_MANAGER as Address,
         event:   V4_SWAP_EVENT_ABI[0],
-        args:    { id: poolId },
+        // No bytes32 args filter — rejected by Alchemy free tier.
+        // Filter by poolId client-side.
         fromBlock: chunkStart,
         toBlock:   chunkEnd,
       });
+      const poolIdLower = poolId.toLowerCase();
       for (const log of logs) {
-        const { recipient, amount0, amount1 } = log.args as {
-          recipient: string; amount0: bigint; amount1: bigint;
-        };
+        const args = log.args as { id: string; recipient: string; amount0: bigint; amount1: bigint };
+        if (args.id?.toLowerCase() !== poolIdLower) continue;
+        const { recipient, amount0, amount1 } = args;
         totalSwaps++;
         // Negative amount on the target side = pool sent that token to trader = buy
         const targetAmount = token0IsTarget ? amount0 : amount1;
@@ -924,6 +982,7 @@ async function scanTradeActivityV4(
     } catch (err) {
       chunksFailed++;
       warn(warnings, "tradeScan", `V4 chunk [${chunkStart}, ${chunkEnd}] failed`, err);
+      break; // Stop — don't burn requests on a failing connection
     }
   }
 
@@ -1141,14 +1200,42 @@ export async function collectEvidence(
   let ownerAddress: string | null = null;
   let ownershipRenounced: boolean | null = null;
   try {
-    ownerAddress = await client.readContract({
-      address: tokenAddress,
-      abi:     OWNER_ABI,
-      functionName: "owner",
-    }) as string;
-    ownershipRenounced = ownerAddress === NULL_ADDRESS;
+    // First check if the contract has bytecode (not an EOA)
+    const code = await client.getBytecode({ address: tokenAddress });
+    if (!code || code === "0x") {
+      // This is an EOA, not a contract - no owner() function
+      ownerAddress = tokenAddress; // EOAs "own" themselves
+      ownershipRenounced = false;
+    } else {
+      // Try to call owner() - not all contracts have this function
+      // Use a silent approach first to avoid noisy warnings
+      try {
+        ownerAddress = await client.readContract({
+          address: tokenAddress,
+          abi:     OWNER_ABI,
+          functionName: "owner",
+        }) as string;
+        ownershipRenounced = ownerAddress === NULL_ADDRESS;
+      } catch (ownerErr) {
+        // Check if this is a revert vs other error
+        const errorMsg = ownerErr instanceof Error ? ownerErr.message : String(ownerErr);
+        if (errorMsg.includes("revert") || errorMsg.includes("owner") || errorMsg.includes("function")) {
+          // Token likely doesn't use Ownable pattern - this is normal for many tokens
+          // Don't log as warning, just set to null and continue
+          ownerAddress = null;
+          ownershipRenounced = null;
+        } else {
+          // Other unexpected error - log as warning
+          warn(warnings, "owner", "owner() call failed with unexpected error", ownerErr);
+          ownerAddress = null;
+          ownershipRenounced = null;
+        }
+      }
+    }
   } catch (err) {
-    warn(warnings, "owner", "owner() call failed", err);
+    // Bytecode check failed - treat as non-ownable
+    ownerAddress = null;
+    ownershipRenounced = null;
   }
 
   // ── 3. Proxy check ─────────────────────────────────────────────────────────
@@ -1166,7 +1253,7 @@ export async function collectEvidence(
   // ── 5. Holder balances ─────────────────────────────────────────────────────
   const holderScanFrom = deployer.mintBlock !== null
     ? deployer.mintBlock
-    : deployBlock > 10_000n ? deployBlock - 10_000n : 0n;
+    : deployBlock > SCAN_CHUNK ? deployBlock - SCAN_CHUNK : 0n;
 
   const holderScan = await scanHolderBalances(client, tokenAddress, holderScanFrom, warnings);
 
@@ -1186,26 +1273,51 @@ export async function collectEvidence(
     warnings.push("[holderScan] deployer balance is a floor estimate — mint predates scan window");
   }
 
-  const deployerPct: number | null =
-    deployer.address && totalSupply > 0n && deployerCurrentBalance !== null
-      ? Number((deployerCurrentBalance * 10_000n) / totalSupply) / 100
-      : null;
+  // (deployerPct computed below with the top-5 rebase guard)
 
   // Top-5 holders (excluding the pool address itself)
   const sortedHolders = [...holderScan.balances.entries()]
     .filter(([addr]) => addr.toLowerCase() !== poolAddress.toLowerCase())
     .sort((a, b) => (b[1] > a[1] ? 1 : -1));
 
-  const top5 = sortedHolders.slice(0, 5).map(([address, balance]) => ({
-    address,
-    balance: balance.toString(),
-    pct: totalSupply > 0n ? Number((balance * 10_000n) / totalSupply) / 100 : 0,
-  }));
+  // Rebase / elastic-supply detection: if any reconstructed balance implies
+  // a share > 100% of the current totalSupply(), our Transfer-delta accounting
+  // is stale (supply shrank without emitting Transfer events).  Cap at 100 and
+  // flag it so the LLM treats the distribution as unreliable.
+  let rebaseSuspected = false;
+
+  const top5 = sortedHolders.slice(0, 5).map(([address, balance]) => {
+    const rawPct = totalSupply > 0n ? Number((balance * 10_000n) / totalSupply) / 100 : 0;
+    if (rawPct > 100) rebaseSuspected = true;
+    return { address, balance: balance.toString(), pct: Math.min(rawPct, 100) };
+  });
 
   const top5Balance = sortedHolders.slice(0, 5).reduce((acc, [, bal]) => acc + bal, 0n);
+  const rawTop5Pct = totalSupply > 0n
+    ? Number((top5Balance * 10_000n) / totalSupply) / 100
+    : 0;
+  if (rawTop5Pct > 100) rebaseSuspected = true;
+
   const top5HoldersPct: number | null = holderScan.failed
     ? null
-    : totalSupply > 0n ? Number((top5Balance * 10_000n) / totalSupply) / 100 : 0;
+    : Math.min(rawTop5Pct, 100);
+
+  // Clamp deployer pct too — same stale-balance issue applies
+  const deployerPctRaw: number | null =
+    deployer.address && totalSupply > 0n && deployerCurrentBalance !== null
+      ? Number((deployerCurrentBalance * 10_000n) / totalSupply) / 100
+      : null;
+  const deployerPct: number | null =
+    deployerPctRaw !== null ? Math.min(deployerPctRaw, 100) : null;
+  if (deployerPctRaw !== null && deployerPctRaw > 100) rebaseSuspected = true;
+
+  if (rebaseSuspected) {
+    warnings.push(
+      "[holderScan] reconstructed holder balances exceed totalSupply() — likely a rebase/" +
+      "elastic-supply token whose supply contractions do not emit Transfer events. " +
+      "Holder percentages are unreliable and have been capped at 100%."
+    );
+  }
 
   // ── 6. Pool liquidity + initial ETH value ─────────────────────────────────
   let poolLiquidityRaw: bigint | null = null;
@@ -1238,10 +1350,12 @@ export async function collectEvidence(
         if (sqrtPriceX96 > 0n) {
           const Q96 = 2n ** 96n;
           const raw = Number(formatEther((poolLiquidityRaw * Q96) / sqrtPriceX96));
-          const ETH_SUPPLY_MAX = 200_000_000;
+          // No real Base pool holds more than ~100k ETH; anything above that
+          // is a sqrtPriceX96 overflow artifact — null it out server-side.
+          const ETH_SUPPLY_MAX = 100_000;
           if (raw > ETH_SUPPLY_MAX) {
             warnings.push(
-              `[pool.slot0.v4] initialLiquidityEth=${raw.toFixed(0)} ETH is physically impossible — nulled`
+              `[pool.slot0.v4] initialLiquidityEth=${raw.toFixed(0)} ETH exceeds 100k ETH ceiling — overflow artifact, nulled`
             );
             initialLiquidityEth = null;
           } else {
@@ -1276,10 +1390,12 @@ export async function collectEvidence(
         if (sqrtPriceX96 > 0n) {
           const Q96 = 2n ** 96n;
           const raw = Number(formatEther((poolLiquidityRaw * Q96) / sqrtPriceX96));
-          const ETH_SUPPLY_MAX = 200_000_000;
+          // No real Base pool holds more than ~100k ETH; anything above that
+          // is a sqrtPriceX96 overflow artifact — null it out server-side.
+          const ETH_SUPPLY_MAX = 100_000;
           if (raw > ETH_SUPPLY_MAX) {
             warnings.push(
-              `[pool.slot0] initialLiquidityEth=${raw.toFixed(0)} ETH is physically impossible — nulled`
+              `[pool.slot0] initialLiquidityEth=${raw.toFixed(0)} ETH exceeds 100k ETH ceiling — overflow artifact, nulled`
             );
             initialLiquidityEth = null;
           } else {
@@ -1295,7 +1411,7 @@ export async function collectEvidence(
   // ── 7. Sell test, LP lock, burn history ───────────────────────────────────
   const sellTest   = await testSellability(
     client, tokenAddress, poolAddress, top5, ownerAddress, deployer.address,
-    warnings, resolvedVenue, v4PoolParams
+    warnings, resolvedVenue, v4PoolParams, poolLiquidityRaw   // poolLiquidityRaw gates empty-pool guard
   );
   const lpLock     = await checkLpLockStatus(
     client, poolAddress, deployBlock, warnings, resolvedVenue

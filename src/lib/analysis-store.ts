@@ -50,6 +50,10 @@ export interface StoredAnalysis {
   tokenSymbol: string;
   poolAddress: string;
   pairedAsset: string;
+  /** Which Uniswap architecture the pool is on */
+  venue?: "v3" | "v4";
+  /** V4 only: hook contract address from the Initialize event */
+  hookAddress?: string | null;
   score: number;
   verdict: string;
   summary: string;
@@ -88,12 +92,14 @@ export async function storeAnalysis(data: Omit<StoredAnalysis, "id" | "timestamp
   };
   
   try {
-    // Store with TTL of 30 days (2592000 seconds)
-    await client.set(`analysis:${analysisId}`, JSON.stringify(storedAnalysis), {
-      ex: 2592000,
+    // Store as a plain object — Upstash serialises to JSON automatically.
+    // Previously we called JSON.stringify() here, which caused a double-parse
+    // issue: the API route received a JSON-encoded string instead of an object.
+    await client.set(`analysis:${analysisId}`, storedAnalysis, {
+      ex: 2592000, // 30 days
     });
     
-    // Also store a reverse index by token address (most recent analysis)
+    // Reverse index: most recent analysis for this token address
     await client.set(`latest:${data.tokenAddress}`, analysisId, {
       ex: 2592000,
     });
@@ -118,12 +124,12 @@ export async function getAnalysis(analysisId: string): Promise<StoredAnalysis | 
     const data = await client.get(`analysis:${analysisId}`);
     if (!data) return null;
     
-    // Upstash may return an object if it deserialized automatically
-    if (typeof data === 'object') {
-      return data as StoredAnalysis;
+    // New records: Upstash returns a plain object (auto-deserialized).
+    // Old records: stored via JSON.stringify(), so Upstash returns a string.
+    if (typeof data === 'string') {
+      return JSON.parse(data) as StoredAnalysis;
     }
-    
-    return JSON.parse(data as string) as StoredAnalysis;
+    return data as StoredAnalysis;
   } catch (err) {
     console.error(`[analysis-store] Failed to retrieve analysis ${analysisId}:`, err);
     return null;

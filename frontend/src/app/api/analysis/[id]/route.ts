@@ -12,10 +12,17 @@ export async function GET(
 ) {
   try {
     const { id } = await params;
-    const data = await redis.get(`analysis:${id}`);
-    if (!data) {
+    const raw = await redis.get(`analysis:${id}`);
+
+    if (!raw) {
       return NextResponse.json({ error: 'Analysis not found' }, { status: 404 });
     }
+
+    // Old records were stored via JSON.stringify() so Upstash returns a plain
+    // string.  New records are stored as objects so Upstash auto-deserializes
+    // them.  Handle both.
+    const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+
     return NextResponse.json(data);
   } catch (error) {
     console.error('Failed to fetch analysis:', error);

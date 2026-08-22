@@ -37,6 +37,14 @@ function validateEnv(required: string[]): void {
 
 validateEnv(["RPC_URL", "GEMINI_API_KEY", "TELEGRAM_BOT_TOKEN", "TELEGRAM_NOTIFY_CHAT_ID"]);
 
+// Warn early about optional-but-visible config gaps so they don't fail silently
+if (!process.env.FRONTEND_BASE_URL) {
+  console.warn("[config] FRONTEND_BASE_URL not set — analysis links will be omitted from alerts");
+}
+if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
+  console.warn("[config] Upstash Redis credentials not set — analysis storage disabled (links will be omitted)");
+}
+
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const SNIPER_INTERVAL_MS = 5 * 60_000; // 5 min
@@ -57,8 +65,30 @@ const POST_VERDICTS = new Set(["LOW", "MEDIUM", "HIGH", "CRITICAL"]);
 const RPC_URL = process.env.RPC_URL!;
 const client = createPublicClient({
   chain: base,
-  transport: http(RPC_URL, { retryCount: 3, retryDelay: 1500 }),
+  transport: http(RPC_URL, { retryCount: 5, retryDelay: 2000 }),
 });
+
+/**
+ * Wrapper around client.getBlockNumber() with manual exponential backoff.
+ * The viem built-in retryCount handles server errors (5xx), but transient
+ * network errors like ECONNRESET / fetch failed can still slip through.
+ * This adds an outer retry layer so a brief connectivity blip doesn't crash
+ * the whole sniper loop.
+ */
+async function getBlockNumberWithRetry(maxAttempts = 5): Promise<bigint> {
+  let delay = 2000;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await client.getBlockNumber();
+    } catch (err) {
+      if (attempt === maxAttempts) throw err;
+      console.warn(`[bot] getBlockNumber failed (attempt ${attempt}/${maxAttempts}), retrying in ${delay}ms… ${err instanceof Error ? err.message : err}`);
+      await new Promise((r) => setTimeout(r, delay));
+      delay = Math.min(delay * 2, 30_000); // cap at 30s
+    }
+  }
+  throw new Error("getBlockNumber: unreachable");
+}
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
@@ -79,7 +109,7 @@ async function sniperTick(): Promise<void> {
   const now = new Date().toISOString();
 
   // Get current block to ensure we don't scan ahead of the chain
-  const currentBlock = await client.getBlockNumber();
+  const currentBlock = await getBlockNumberWithRetry();
   
   // Ensure we don't scan ahead of the current block
   let fromBlock = lastScannedBlock ?? 0n;
@@ -222,7 +252,7 @@ async function loop(fn: () => Promise<void>, intervalMs: number): Promise<void> 
 
 async function main(): Promise<void> {
   // Check if stored block is too old or ahead of current block
-  const currentBlock = await client.getBlockNumber();
+  const currentBlock = await getBlockNumberWithRetry();
   if (currentBlock > 0n && lastScannedBlock !== null) {
     // Reset if too old (before Base mainnet was active)
     if (lastScannedBlock < 50000000n) {

@@ -262,9 +262,10 @@ export async function runRugCheckLLM(
     console.log("  ─────────────────────────────────────────────────────────────\n");
   }
 
-  // Store analysis in Upstash if we have agentic data
+  // Store analysis in Upstash for every successful scoring run — not just
+  // agentic ones — so the frontend link works with single-shot results too.
   let analysisId: string | undefined;
-  if (toolCallTranscript && toolCallTranscript.length > 0 && llmResult.ok) {
+  if (llmResult.ok) {
     try {
       const storedId = await storeAnalysis({
         tokenAddress,
@@ -272,11 +273,13 @@ export async function runRugCheckLLM(
         tokenSymbol: meta.symbol,
         poolAddress,
         pairedAsset,
+        venue:       opts?.venue ?? "v3",
+        hookAddress: evidence.hookAddress ?? null,
         score: llmResult.score,
         verdict: llmResult.verdict,
         summary: llmResult.summary,
         evidence,
-        toolCallTranscript,
+        toolCallTranscript, // undefined for single-shot runs — storage handles that gracefully
         flags: llmResult.flags,
         scoringMethod: toolCallTranscript ? "llm-agentic" : "llm",
       });
@@ -286,7 +289,7 @@ export async function runRugCheckLLM(
       }
     } catch (err) {
       console.error(`  [analysis] Failed to store analysis:`, err);
-      // Continue without analysis storage - non-critical
+      // Non-critical — scoring result is still returned
     }
   }
 
@@ -462,11 +465,11 @@ export function formatAlertCard(
   lines.push(r.tokenAddress);
   lines.push(`https://basescan.org/address/${r.tokenAddress}`);
 
-  // Add analysis link if available (only for agentic scoring)
-  if (r.analysisId && r.scoringMethod === "llm-agentic") {
+  // Add analysis link if available — shown for all scoring methods, not just agentic
+  if (r.analysisId) {
     const frontendBaseUrl = process.env.FRONTEND_BASE_URL;
     if (frontendBaseUrl) {
-      lines.push(`🔍 View full agent trace: ${frontendBaseUrl}/analysis/${r.analysisId}`);
+      lines.push(`🔍 View full report: ${frontendBaseUrl}/analysis/${r.analysisId}`);
     }
   }
 

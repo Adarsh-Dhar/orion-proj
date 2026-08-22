@@ -26,9 +26,10 @@ import { runRugCheckLLM, formatRugReport } from "./rugcheck.js";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = PublicClient<any>;
 
-/** Max block range per getLogs call — Infura enforces a 10k limit;
- *  500 keeps well inside it and avoids rate-limit bursts. */
-const CHUNK_SIZE = 500n;
+/** Max block range per getLogs call.
+ *  Alchemy free tier enforces a hard 10-block limit on eth_getLogs.
+ *  PAYG / Growth plans allow up to 10k blocks — raise this if you upgrade. */
+const CHUNK_SIZE = 10n;
 
 // ─── Shared formatting helpers ────────────────────────────────────────────────
 
@@ -121,6 +122,11 @@ export async function findContractDeployBlock(
   return lo;
 }
 
+/** Brief pause to be gentle on the RPC */
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 // ─── Pool resolver (used by chat.ts) ─────────────────────────────────────────
 
 /** Minimal Uniswap V3 Factory getPool ABI */
@@ -191,7 +197,7 @@ export async function resolveTokenPool(
     const currentBlock = await client.getBlockNumber();
     const lookback     = 100_000n;
     const fromBlock    = currentBlock > lookback ? currentBlock - lookback : 0n;
-    const CHUNK        = 10_000n;
+    const CHUNK        = 10n; // Alchemy free tier: max 10 blocks per eth_getLogs
 
     for (let chunkStart = fromBlock; chunkStart <= currentBlock; chunkStart += CHUNK) {
       const chunkEnd = chunkStart + CHUNK - 1n < currentBlock ? chunkStart + CHUNK - 1n : currentBlock;
@@ -234,6 +240,7 @@ export async function resolveTokenPool(
       } catch {
         // chunk failed — keep scanning
       }
+      await sleep(150); // respect Alchemy free tier rate limit
     }
   } catch {
     // V4 scan failed entirely — fall through to null
@@ -285,11 +292,6 @@ export interface ScanOptions {
    * Bot state for persistent storage (e.g., deployer history).
    */
   state?: import("./state.js").BotState;
-}
-
-/** Brief pause to be gentle on the RPC */
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
 }
 
 /**
@@ -369,7 +371,7 @@ export async function scanBlockRange(
       );
     }
 
-    if (chunkStart + CHUNK_SIZE <= toBlock) await sleep(200);
+    if (chunkStart + CHUNK_SIZE <= toBlock) await sleep(150); // ~6.5 req/s — well within Alchemy free tier (330 req/s)
   }
 
   console.log(

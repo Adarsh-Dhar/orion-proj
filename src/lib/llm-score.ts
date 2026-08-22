@@ -18,6 +18,7 @@
 import type { TokenEvidence } from "./evidence.js";
 import type { RiskFlag, RiskLevel } from "./rugcheck-types.js";
 import type { ToolCallRecord } from "./rugcheck-types.js";
+import type { Venue } from "./constants.js";
 
 export type ScoreMode = "alert" | "chat" | "agentic";
 
@@ -55,6 +56,14 @@ export type LLMScoreResult = LLMScoreSuccess | LLMScoreFailure;
 const SYSTEM_PROMPT = `You are an expert DeFi security analyst specialising in rug-pull detection on Base (an OP-Stack EVM chain).
 
 You will be given a JSON object containing raw on-chain evidence about a newly launched ERC-20 token. Your job is to score the rug-pull risk.
+
+The evidence may include a "venue" field indicating whether the token is on Uniswap V3 or V4:
+- V3: Traditional per-pool contracts
+- V4: Singleton PoolManager architecture with custom hooks support
+
+For V4 pools, pay special attention to:
+- Custom hooks: A malicious hook can act like a hidden tax or blacklist mechanism at the pool level
+- Hook address: If non-zero, evaluate it as an additional risk surface
 
 IMPORTANT RULES:
 1. Return ONLY valid JSON — no markdown, no prose, no code fences.
@@ -113,6 +122,8 @@ SCORING GUIDE:
 - Fewer than 5 unique traders with >20 total swaps:        +20 pts, HIGH (thin organic interest, likely bot activity)
 - Buy/sell ratio wildly skewed toward sells early:          +15 pts, MEDIUM (possible dump in progress)
 - Trade scan data unverified (tradeScanPartial=true):       +10 pts, MEDIUM (incomplete wash-trading analysis)
+- V4 custom hook detected (non-zero hook address):          +20 pts, HIGH — custom hooks can implement hidden taxes or blacklists at the pool level
+- V4 hook source not verified:                              +15 pts, MEDIUM (cannot verify hook safety)
 
 SANITY CHECKS — apply these before scoring:
 - If initialLiquidityEth is > 1,000,000 (one million ETH), it is a math artifact, NOT real liquidity. Treat it the same as null — do NOT use it as evidence of healthy liquidity. Add a flag for it.
@@ -191,7 +202,7 @@ function validateParsed(parsed: unknown): LLMScoreSuccess | null {
 
 export async function scoreWithLLM(
   evidence: TokenEvidence,
-  opts?: { userQuestion?: string; mode?: ScoreMode }
+  opts?: { userQuestion?: string; mode?: ScoreMode; venue?: Venue }
 ): Promise<LLMScoreResult> {
   // ── Guard: no API key ──────────────────────────────────────────────────────
   if (!GEMINI_API_KEY) {

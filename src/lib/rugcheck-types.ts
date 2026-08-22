@@ -1,4 +1,5 @@
 import type { Address } from "viem";
+import type { Venue } from "./constants.js";
 
 // ─── Core types ───────────────────────────────────────────────────────────────
 
@@ -23,6 +24,9 @@ export interface RugCheckResult {
   tokenAddress: Address;
   poolAddress: Address;
   pairedAsset: string;
+  venue: Venue;
+  /** V4 only: hook contract address from the Initialize event. null for V3 pools. */
+  hookAddress: string | null;
 
   // ── Ownership ──────────────────────────────────────────────────────────────
   ownerAddress: string;

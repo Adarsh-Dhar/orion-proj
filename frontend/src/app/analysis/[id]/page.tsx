@@ -12,6 +12,8 @@ import {
   TradeFlowBar,
   MeterBar,
   AgentPipeline,
+  VenueBadge,
+  HookBadge,
   VERDICT_TONE,
   shortenAddress,
   fmtPct,
@@ -116,10 +118,14 @@ export default function AnalysisPage() {
           <div className="flex flex-col md:flex-row items-center gap-8">
             <ScoreGauge score={analysis.score} verdict={verdict} />
             <div className="flex-1 text-center md:text-left">
-              <span className={`inline-block rounded-full border ${tone.border} px-3 py-1 text-xs font-bold uppercase tracking-widest ${tone.text}`}>
-                {verdict} risk
-              </span>
-              <p className="mt-3 text-lg leading-relaxed text-zinc-200">{analysis.summary}</p>
+              <div className="flex flex-wrap items-center justify-center md:justify-start gap-2 mb-2">
+                <span className={`inline-block rounded-full border ${tone.border} px-3 py-1 text-xs font-bold uppercase tracking-widest ${tone.text}`}>
+                  {verdict} risk
+                </span>
+                <VenueBadge venue={analysis.venue ?? ev?.venue} />
+                <HookBadge hookAddress={analysis.hookAddress ?? ev?.hookAddress} />
+              </div>
+              <p className="mt-1 text-lg leading-relaxed text-zinc-200">{analysis.summary}</p>
               <div className="mt-4 flex flex-wrap justify-center md:justify-start gap-x-6 gap-y-1 text-xs font-mono text-zinc-400">
                 <span>Token: {shortenAddress(analysis.tokenAddress, 6)}</span>
                 <span>Pool: {shortenAddress(analysis.poolAddress, 6)}</span>
@@ -199,6 +205,28 @@ export default function AnalysisPage() {
             {/* Liquidity & LP Lock */}
             <Panel title="Liquidity & LP Lock" icon="💧">
               <dl className="space-y-3 text-sm">
+                {ev.venue === 'v4' && (
+                  <>
+                    <Row label="Architecture">
+                      <VenueBadge venue="v4" />
+                    </Row>
+                    <Row label="Hook contract">
+                      {ev.hookAddress && ev.hookAddress !== '0x0000000000000000000000000000000000000000' ? (
+                        <a
+                          href={`https://basescan.org/address/${ev.hookAddress}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="font-mono text-xs text-amber-400 hover:text-amber-300 underline underline-offset-2"
+                          title={ev.hookAddress}
+                        >
+                          🪝 {shortenAddress(ev.hookAddress, 6)}
+                        </a>
+                      ) : (
+                        <span className="text-xs text-zinc-500">None (0x0)</span>
+                      )}
+                    </Row>
+                  </>
+                )}
                 <Row label="Pool liquidity">
                   <VerifiedPill state={ev.liquidityLocked === null ? 'unverified' : ev.liquidityLocked ? 'verified' : 'flagged'} />
                 </Row>

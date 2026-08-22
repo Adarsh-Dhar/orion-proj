@@ -28,6 +28,36 @@ export function fmtPct(n: number | null | undefined): string {
   return `${n.toFixed(2)}%`;
 }
 
+// ─── V4 venue badge ───────────────────────────────────────────────────────────
+
+/** Small pill showing which Uniswap architecture the pool is on. */
+export function VenueBadge({ venue }: { venue?: 'v3' | 'v4' | null }) {
+  if (!venue) return null;
+  return venue === 'v4' ? (
+    <span className="inline-flex items-center gap-1 rounded-full border border-violet-500/40 bg-violet-500/10 px-2.5 py-0.5 text-[11px] font-bold uppercase tracking-widest text-violet-400">
+      Uniswap V4
+    </span>
+  ) : (
+    <span className="inline-flex items-center gap-1 rounded-full border border-sky-500/30 bg-sky-500/10 px-2.5 py-0.5 text-[11px] font-bold uppercase tracking-widest text-sky-400">
+      Uniswap V3
+    </span>
+  );
+}
+
+/** Hook address pill — only shown for V4 pools with a non-zero hook. */
+export function HookBadge({ hookAddress }: { hookAddress?: string | null }) {
+  const NULL_HOOK = '0x0000000000000000000000000000000000000000';
+  if (!hookAddress || hookAddress.toLowerCase() === NULL_HOOK) return null;
+  return (
+    <span
+      className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/40 bg-amber-500/10 px-2.5 py-0.5 text-[11px] font-mono text-amber-400"
+      title={hookAddress}
+    >
+      🪝 Hook: {hookAddress.slice(0, 6)}…{hookAddress.slice(-4)}
+    </span>
+  );
+}
+
 // ─── Score gauge ──────────────────────────────────────────────────────────────
 
 export function ScoreGauge({ score, verdict }: { score: number; verdict: RiskLevel }) {

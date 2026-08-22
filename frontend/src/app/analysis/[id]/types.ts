@@ -29,6 +29,9 @@ export interface TokenEvidence {
   tokenAddress: string;
   poolAddress: string;
   pairedAsset: string;
+  venue: 'v3' | 'v4';
+  /** V4 only: hook contract address from the Initialize event. null for V3 pools. */
+  hookAddress: string | null;
   deployBlock: string;
 
   name: string;
@@ -102,6 +105,10 @@ export interface StoredAnalysis {
   tokenSymbol: string;
   poolAddress: string;
   pairedAsset: string;
+  /** 'v3' or 'v4' — which Uniswap architecture this pool is on */
+  venue?: 'v3' | 'v4';
+  /** V4 only: hook contract address. null / absent for V3. */
+  hookAddress?: string | null;
   score: number;
   verdict: RiskLevel;
   summary: string;

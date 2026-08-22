@@ -14,6 +14,13 @@
  *   then walks FORWARD in SCAN_CHUNK (10k-block) windows rather than making
  *   one unbounded call. This eliminates the "range exceeds limit" error that
  *   broke every historical scan.
+ *
+ * V4 support:
+ *   All pool-specific reads have a V4 branch that uses the singleton
+ *   PoolManager / StateView contract rather than per-pool contract calls.
+ *   poolAddress for V4 tokens is the bytes32 PoolId cast to Address — it is
+ *   NOT a callable contract.  Every function that reads pool state must
+ *   branch on `venue` before issuing any RPC call against poolAddress.
  */
 
 import { type Address, formatEther, encodeFunctionData, parseEventLogs } from "viem";
@@ -29,7 +36,6 @@ import {
   POOL_TOKENS_ABI,
   TRANSFER_EVENT_ABI,
   ERC20_ABI,
-  // new:
   UNISWAP_V3_POSITION_MANAGER,
   UNCX_V3_LOCKER,
   BURN_ADDRESS,
@@ -43,6 +49,16 @@ import {
   ERC20_TRANSFER_ABI,
   SUSPICIOUS_SOURCE_KEYWORDS,
   PRIVILEGE_KEYWORDS,
+  // V4-specific
+  UNISWAP_V4_POOL_MANAGER,
+  UNISWAP_V4_STATE_VIEW,
+  UNISWAP_V4_QUOTER,
+  V4_STATE_VIEW_SLOT0_ABI,
+  V4_STATE_VIEW_LIQUIDITY_ABI,
+  V4_SWAP_EVENT_ABI,
+  V4_MODIFY_LIQUIDITY_EVENT_ABI,
+  V4_QUOTER_EXACT_INPUT_SINGLE_ABI,
+  type Venue,
 } from "./constants.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -63,9 +79,15 @@ const ZERO_SLOT    =
 export interface TokenEvidence {
   // ── Identity ──────────────────────────────────────────────────────────────
   tokenAddress: string;
-  poolAddress: string;
+  poolAddress: string;   // V3: pool contract address; V4: bytes32 PoolId as hex
   pairedAsset: string;
+  venue: Venue;
   deployBlock: string;   // bigint as string
+
+  // ── V4-specific ───────────────────────────────────────────────────────────
+  /** V4 only: the hook contract address attached to this pool. address(0) means
+   *  no hook.  Populated from the Initialize event; null for V3 pools. */
+  hookAddress: string | null;
 
   // ── ERC-20 metadata ───────────────────────────────────────────────────────
   name: string;
@@ -255,10 +277,6 @@ interface HolderScanResult {
 /**
  * Fetch holder balances by scanning Transfer events from `fromBlock` to the
  * current chain head, walking forward in SCAN_CHUNK (10k) windows.
- *
- * This replaces the old single getLogs({ toBlock: "latest" }) call which
- * always failed with "range exceeds limit" on any scan more than 10k blocks
- * from the current head — which is true of all historical tokens.
  */
 export async function scanHolderBalances(
   client: AnyClient,
@@ -313,20 +331,48 @@ export async function scanHolderBalances(
   };
 }
 
-// ── Deployer history check (now uses persistent state) ──────────────────────
-// This function is no longer used directly — deployer history is now managed
-// through the persistent BotState in state.ts to survive bot restarts.
-// Kept here for backwards compatibility, but the real implementation is in rugcheck.ts
+// ─── Liquidity delta check ────────────────────────────────────────────────────
 
-// ── Liquidity delta check ─────────────────────────────────────────────────────
+/**
+ * Read current liquidity and compare to the last stored snapshot.
+ * Branches on venue: V4 reads from StateView using the poolId (bytes32),
+ * V3 reads directly from the pool contract.
+ *
+ * The `poolIdOrAddress` param carries:
+ *   - V3: the pool contract address
+ *   - V4: the bytes32 PoolId, hex-encoded (looks like an address in storage)
+ */
 export async function checkLiquidityDelta(
   client: AnyClient,
-  poolAddress: Address,
-  state: BotState
-): Promise<{ liquidityDeltaPct: number | null; liquidityPreviousReading: string | null; snapshotAgeMinutes: number | null; currentSnapshot: LiquiditySnapshot }> {
-  const history = state.liquidityHistory[poolAddress.toLowerCase()] ?? [];
+  poolIdOrAddress: Address,
+  state: BotState,
+  venue: Venue = "v3"
+): Promise<{
+  liquidityDeltaPct: number | null;
+  liquidityPreviousReading: string | null;
+  snapshotAgeMinutes: number | null;
+  currentSnapshot: LiquiditySnapshot;
+}> {
+  const history = state.liquidityHistory[poolIdOrAddress.toLowerCase()] ?? [];
   const prev = history[history.length - 1];
-  const current = await client.readContract({ address: poolAddress, abi: POOL_LIQUIDITY_ABI, functionName: "liquidity" }) as bigint;
+
+  let current: bigint;
+  if (venue === "v4") {
+    // V4: read from StateView using the poolId as bytes32
+    current = await client.readContract({
+      address: UNISWAP_V4_STATE_VIEW as Address,
+      abi: V4_STATE_VIEW_LIQUIDITY_ABI,
+      functionName: "getLiquidity",
+      args: [poolIdOrAddress],
+    }) as bigint;
+  } else {
+    // V3: read directly from the pool contract
+    current = await client.readContract({
+      address: poolIdOrAddress,
+      abi: POOL_LIQUIDITY_ABI,
+      functionName: "liquidity",
+    }) as bigint;
+  }
 
   const snap: LiquiditySnapshot = {
     liquidity: current.toString(),
@@ -334,11 +380,16 @@ export async function checkLiquidityDelta(
     ts: Date.now(),
   };
 
-  // Don't save state here - let the caller handle that to avoid excessive writes
-  if (!prev) return { liquidityDeltaPct: null, liquidityPreviousReading: null, snapshotAgeMinutes: null, currentSnapshot: snap };
+  // Don't save state here — let the caller batch-save to avoid excessive writes
+  if (!prev) {
+    return { liquidityDeltaPct: null, liquidityPreviousReading: null, snapshotAgeMinutes: null, currentSnapshot: snap };
+  }
 
-  const prevVal = BigInt(prev.liquidity);
-  const deltaPct = prevVal === 0n ? null : Number(((current - prevVal) * 10000n) / prevVal) / 100;
+  const prevVal  = BigInt(prev.liquidity);
+  const deltaPct = prevVal === 0n
+    ? null
+    : Number(((current - prevVal) * 10000n) / prevVal) / 100;
+
   return {
     liquidityDeltaPct: deltaPct,
     liquidityPreviousReading: prev.liquidity,
@@ -347,15 +398,32 @@ export async function checkLiquidityDelta(
   };
 }
 
-// ── 1. Sell-ability / honeypot test ──────────────────────────────────────
+// ── 1. Sell-ability / honeypot test (V3) ─────────────────────────────────────
+//
+// V3: simulate transfer(poolAddress, amount) via eth_call.  If the token
+// contract reverts, it has a transfer blacklist/hook.
+//
+// V4: simulate via the Quoter contract.  The Quoter calls the PoolManager and
+// runs any attached hook — if the hook blocks the swap the call reverts.
+// We construct a minimal PoolKey from the stored params and call
+// quoteExactInputSingle.  A revert means the hook is blocking sells.
+
 export async function testSellability(
   client: AnyClient,
   tokenAddress: Address,
-  poolAddress: Address,
+  poolIdOrAddress: Address,
   top5: Array<{ address: string; balance: string }>,
   ownerAddress: string | null,
   deployerAddress: string | null,
-  warnings: string[]
+  warnings: string[],
+  venue: Venue = "v3",
+  v4PoolParams?: {
+    currency0: Address;
+    currency1: Address;
+    fee: number;
+    tickSpacing: number;
+    hooks: Address;
+  }
 ): Promise<{ sellTestPassed: boolean | null; sellTestAmountSent: string | null; sellTestError: string | null }> {
   const candidate = top5.find(
     (h) =>
@@ -366,16 +434,75 @@ export async function testSellability(
       BigInt(h.balance) > 0n
   );
   if (!candidate) {
-    return { sellTestPassed: null, sellTestAmountSent: null, sellTestError: "only privileged wallets hold balance — test would be meaningless" };
+    return {
+      sellTestPassed: null,
+      sellTestAmountSent: null,
+      sellTestError: "only privileged wallets hold balance — test would be meaningless",
+    };
   }
-  const balance = BigInt(candidate.balance);
-  const testAmount = balance / 1000n > 0n ? balance / 1000n : balance; // 0.1% or the whole balance if tiny
 
+  const balance    = BigInt(candidate.balance);
+  const testAmount = balance / 1000n > 0n ? balance / 1000n : balance; // 0.1% or full if tiny
+
+  if (venue === "v4") {
+    // V4 sell test: use the Quoter to simulate a swap through the PoolManager.
+    // If v4PoolParams is missing we can't build the PoolKey — report gracefully.
+    if (!v4PoolParams) {
+      return {
+        sellTestPassed: null,
+        sellTestAmountSent: null,
+        sellTestError: "V4 sell test skipped — PoolKey params not available",
+      };
+    }
+
+    // Determine swap direction: selling the new token means
+    //   zeroForOne = true  when the new token is currency0
+    //   zeroForOne = false when the new token is currency1
+    const zeroForOne =
+      tokenAddress.toLowerCase() === v4PoolParams.currency0.toLowerCase();
+
+    // testAmount is in token units (uint128); clamp to uint128 max
+    const uint128Max = (2n ** 128n) - 1n;
+    const quoteAmount = testAmount > uint128Max ? uint128Max : testAmount;
+
+    try {
+      // quoteExactInputSingle is nonpayable (uses transient storage) — must
+      // use simulateContract, not readContract, otherwise viem refuses to call it.
+      await client.simulateContract({
+        address: UNISWAP_V4_QUOTER as Address,
+        abi: V4_QUOTER_EXACT_INPUT_SINGLE_ABI,
+        functionName: "quoteExactInputSingle",
+        args: [{
+          poolKey: {
+            currency0: v4PoolParams.currency0,
+            currency1: v4PoolParams.currency1,
+            fee:        v4PoolParams.fee,
+            tickSpacing: v4PoolParams.tickSpacing,
+            hooks:      v4PoolParams.hooks,
+          },
+          zeroForOne,
+          exactAmount: quoteAmount,
+          hookData: "0x" as `0x${string}`,
+        }],
+      });
+      return { sellTestPassed: true, sellTestAmountSent: quoteAmount.toString(), sellTestError: null };
+    } catch (err) {
+      warn(warnings, "sellTest", "V4 Quoter simulation reverted", err);
+      const message = err instanceof Error ? err.message.split("\n")[0] : String(err);
+      return { sellTestPassed: false, sellTestAmountSent: quoteAmount.toString(), sellTestError: message };
+    }
+  }
+
+  // V3 path: simulate transfer(poolAddress, amount)
   try {
     await client.call({
       account: candidate.address as Address,
       to: tokenAddress,
-      data: encodeFunctionData({ abi: ERC20_TRANSFER_ABI, functionName: "transfer", args: [poolAddress, testAmount] }),
+      data: encodeFunctionData({
+        abi: ERC20_TRANSFER_ABI,
+        functionName: "transfer",
+        args: [poolIdOrAddress, testAmount],
+      }),
     });
     return { sellTestPassed: true, sellTestAmountSent: testAmount.toString(), sellTestError: null };
   } catch (err) {
@@ -387,8 +514,7 @@ export async function testSellability(
 
 /**
  * Standalone sell test for a specific holder at a specific percentage.
- * This is the agent-friendly wrapper that allows the LLM to specify which holder
- * to test and what percentage of their balance to sell.
+ * Agent-friendly wrapper; V3-only (uses the transfer-to-pool simulation).
  */
 export async function runSellTest(
   client: AnyClient,
@@ -398,7 +524,6 @@ export async function runSellTest(
   amountPct: number,
   warnings: string[]
 ): Promise<{ sellTestPassed: boolean | null; sellTestAmountSent: string | null; sellTestError: string | null }> {
-  // Get the holder's current balance
   let balance: bigint;
   try {
     balance = await client.readContract({
@@ -416,7 +541,6 @@ export async function runSellTest(
     return { sellTestPassed: null, sellTestAmountSent: null, sellTestError: "holder has zero balance" };
   }
 
-  // Calculate test amount based on percentage
   const testAmount = (balance * BigInt(Math.floor(amountPct * 100))) / 10000n;
   if (testAmount === 0n) {
     return { sellTestPassed: null, sellTestAmountSent: null, sellTestError: "calculated test amount is zero" };
@@ -426,7 +550,11 @@ export async function runSellTest(
     await client.call({
       account: holderAddress,
       to: tokenAddress,
-      data: encodeFunctionData({ abi: ERC20_TRANSFER_ABI, functionName: "transfer", args: [poolAddress, testAmount] }),
+      data: encodeFunctionData({
+        abi: ERC20_TRANSFER_ABI,
+        functionName: "transfer",
+        args: [poolAddress, testAmount],
+      }),
     });
     return { sellTestPassed: true, sellTestAmountSent: testAmount.toString(), sellTestError: null };
   } catch (err) {
@@ -436,8 +564,31 @@ export async function runSellTest(
   }
 }
 
-// ── 2. LP position lock/burn status ──────────────────────────────────────
+// ── 2. LP position lock/burn status ──────────────────────────────────────────
+//
+// V3: watch for Mint events on the pool contract, check whether the NFT
+// position manager minted an NFT, then check who owns that NFT.
+//
+// V4: there is no per-pool contract and no separate NFT position manager.
+// Liquidity is managed directly through PoolManager via ModifyLiquidity
+// events. We scan for the first positive-liquidityDelta ModifyLiquidity event
+// on PoolManager filtered by poolId to identify who added the initial LP, and
+// whether they later removed it (negative delta after the initial add).
+
 export async function checkLpLockStatus(
+  client: AnyClient,
+  poolIdOrAddress: Address,
+  deployBlock: bigint,
+  warnings: string[],
+  venue: Venue = "v3"
+): Promise<{ lpTokenId: string | null; lpPositionOwner: string | null; lpPositionStatus: TokenEvidence["lpPositionStatus"] }> {
+  if (venue === "v4") {
+    return checkLpLockStatusV4(client, poolIdOrAddress, deployBlock, warnings);
+  }
+  return checkLpLockStatusV3(client, poolIdOrAddress, deployBlock, warnings);
+}
+
+async function checkLpLockStatusV3(
   client: AnyClient,
   poolAddress: Address,
   deployBlock: bigint,
@@ -454,45 +605,142 @@ export async function checkLpLockStatus(
       return { lpTokenId: null, lpPositionOwner: null, lpPositionStatus: "unverified" };
     }
 
-    const mintLog = mintLogs[0];
+    const mintLog  = mintLogs[0];
     const mintOwner = (mintLog.args as { owner: string }).owner;
 
     if (mintOwner.toLowerCase() !== UNISWAP_V3_POSITION_MANAGER.toLowerCase()) {
-      // Liquidity added directly, bypassing the standard NFT flow — no
-      // position NFT to check; that same address controls the liquidity.
+      // Liquidity added directly — no position NFT; that address controls it.
       return { lpTokenId: null, lpPositionOwner: mintOwner, lpPositionStatus: "non_nft_position" };
     }
 
-    const receipt = await client.getTransactionReceipt({ hash: mintLog.transactionHash! });
+    const receipt     = await client.getTransactionReceipt({ hash: mintLog.transactionHash! });
     const increaseLogs = parseEventLogs({ abi: NPM_INCREASE_LIQUIDITY_EVENT_ABI, logs: receipt.logs });
-    const npmLog = increaseLogs.find((l) => l.address.toLowerCase() === UNISWAP_V3_POSITION_MANAGER.toLowerCase());
+    const npmLog       = increaseLogs.find(
+      (l) => l.address.toLowerCase() === UNISWAP_V3_POSITION_MANAGER.toLowerCase()
+    );
 
     if (!npmLog) {
       return { lpTokenId: null, lpPositionOwner: mintOwner, lpPositionStatus: "unverified" };
     }
 
     const tokenId = (npmLog.args as { tokenId: bigint }).tokenId;
-    const owner = (await client.readContract({
+    const owner   = (await client.readContract({
       address: UNISWAP_V3_POSITION_MANAGER,
-      abi: NPM_OWNER_OF_ABI,
+      abi:     NPM_OWNER_OF_ABI,
       functionName: "ownerOf",
       args: [tokenId],
     })) as string;
 
     let status: TokenEvidence["lpPositionStatus"];
-    if (owner.toLowerCase() === BURN_ADDRESS.toLowerCase()) status = "burned";
+    if (owner.toLowerCase() === BURN_ADDRESS.toLowerCase())    status = "burned";
     else if (owner.toLowerCase() === UNCX_V3_LOCKER.toLowerCase()) status = "locked_uncx";
-    else status = "held_by_eoa";
+    else                                                           status = "held_by_eoa";
 
     return { lpTokenId: tokenId.toString(), lpPositionOwner: owner, lpPositionStatus: status };
   } catch (err) {
-    warn(warnings, "lpLock", "position lookup failed", err);
+    warn(warnings, "lpLock", "V3 position lookup failed", err);
     return { lpTokenId: null, lpPositionOwner: null, lpPositionStatus: "unverified" };
   }
 }
 
-// ── 3. Liquidity pull history (Burn event scan) ──────────────────────────
+async function checkLpLockStatusV4(
+  client: AnyClient,
+  poolId: Address,
+  deployBlock: bigint,
+  warnings: string[]
+): Promise<{ lpTokenId: string | null; lpPositionOwner: string | null; lpPositionStatus: TokenEvidence["lpPositionStatus"] }> {
+  // Scan ModifyLiquidity events on the PoolManager filtered by this pool's id.
+  // We look within a generous window (deploy block + 500) to catch the initial
+  // liquidity add, then check whether the same sender later pulled it.
+  try {
+    const scanTo = deployBlock + 500n;
+
+    const addLogs = await client.getLogs({
+      address: UNISWAP_V4_POOL_MANAGER as Address,
+      event:   V4_MODIFY_LIQUIDITY_EVENT_ABI[0],
+      args:    { id: poolId },
+      fromBlock: deployBlock,
+      toBlock:   scanTo,
+    });
+
+    // Find the first event with a positive liquidityDelta (initial LP add)
+    const firstAdd = addLogs.find(
+      (l) => (l.args as { liquidityDelta: bigint }).liquidityDelta > 0n
+    );
+    if (!firstAdd) {
+      return { lpTokenId: null, lpPositionOwner: null, lpPositionStatus: "unverified" };
+    }
+
+    const lpSender = (firstAdd.args as { sender: string }).sender;
+
+    // Now check from firstAdd block to latest for any negative-delta event
+    // from the same sender — that would mean they later pulled liquidity.
+    const latestBlock = await client.getBlockNumber();
+    let removedByLpOwner = false;
+
+    for (
+      let chunkStart = (firstAdd.blockNumber ?? deployBlock) + 1n;
+      chunkStart <= latestBlock;
+      chunkStart += SCAN_CHUNK
+    ) {
+      const chunkEnd = chunkStart + SCAN_CHUNK - 1n < latestBlock
+        ? chunkStart + SCAN_CHUNK - 1n
+        : latestBlock;
+      try {
+        const removeLogs = await client.getLogs({
+          address: UNISWAP_V4_POOL_MANAGER as Address,
+          event:   V4_MODIFY_LIQUIDITY_EVENT_ABI[0],
+          args:    { id: poolId, sender: lpSender as Address },
+          fromBlock: chunkStart,
+          toBlock:   chunkEnd,
+        });
+        for (const l of removeLogs) {
+          if ((l.args as { liquidityDelta: bigint }).liquidityDelta < 0n) {
+            removedByLpOwner = true;
+            break;
+          }
+        }
+      } catch (err) {
+        warn(warnings, "lpLock", `V4 remove-scan chunk [${chunkStart}, ${chunkEnd}] failed`, err);
+      }
+      if (removedByLpOwner) break;
+    }
+
+    // V4 has no NFT-based locker; we report the sender as owner.
+    // If they haven't pulled, classify as "non_nft_position" (direct control).
+    // If they have already pulled, classify as "held_by_eoa" (unprotected and drained).
+    const status: TokenEvidence["lpPositionStatus"] = removedByLpOwner
+      ? "held_by_eoa"
+      : "non_nft_position";
+
+    return { lpTokenId: null, lpPositionOwner: lpSender, lpPositionStatus: status };
+  } catch (err) {
+    warn(warnings, "lpLock", "V4 position lookup failed", err);
+    return { lpTokenId: null, lpPositionOwner: null, lpPositionStatus: "unverified" };
+  }
+}
+
+// ── 3. Liquidity pull history ─────────────────────────────────────────────────
+//
+// V3: scan Burn events on the pool contract.
+// V4: scan ModifyLiquidity events with negative liquidityDelta on PoolManager,
+//     filtered by poolId.
+
 export async function checkLiquidityPullHistory(
+  client: AnyClient,
+  poolIdOrAddress: Address,
+  deployBlock: bigint,
+  currentBlock: bigint,
+  warnings: string[],
+  venue: Venue = "v3"
+): Promise<{ liquidityEverPulled: boolean; burnEventCount: number }> {
+  if (venue === "v4") {
+    return checkLiquidityPullHistoryV4(client, poolIdOrAddress, deployBlock, currentBlock, warnings);
+  }
+  return checkLiquidityPullHistoryV3(client, poolIdOrAddress, deployBlock, currentBlock, warnings);
+}
+
+async function checkLiquidityPullHistoryV3(
   client: AnyClient,
   poolAddress: Address,
   deployBlock: bigint,
@@ -500,26 +748,72 @@ export async function checkLiquidityPullHistory(
   warnings: string[]
 ): Promise<{ liquidityEverPulled: boolean; burnEventCount: number }> {
   let count = 0;
-  let chunkStart = deployBlock;
-  while (chunkStart <= currentBlock) {
-    const chunkEnd = chunkStart + SCAN_CHUNK - 1n < currentBlock ? chunkStart + SCAN_CHUNK - 1n : currentBlock;
+  for (
+    let chunkStart = deployBlock;
+    chunkStart <= currentBlock;
+    chunkStart += SCAN_CHUNK
+  ) {
+    const chunkEnd = chunkStart + SCAN_CHUNK - 1n < currentBlock
+      ? chunkStart + SCAN_CHUNK - 1n
+      : currentBlock;
     try {
       const logs = await client.getLogs({
         address: poolAddress,
-        event: POOL_BURN_EVENT_ABI[0],
+        event:   POOL_BURN_EVENT_ABI[0],
         fromBlock: chunkStart,
-        toBlock: chunkEnd,
+        toBlock:   chunkEnd,
       });
       count += logs.length;
     } catch (err) {
-      warn(warnings, "burnHistory", `chunk [${chunkStart}, ${chunkEnd}] failed`, err);
+      warn(warnings, "burnHistory", `V3 chunk [${chunkStart}, ${chunkEnd}] failed`, err);
     }
-    chunkStart = chunkEnd + 1n;
   }
   return { liquidityEverPulled: count > 0, burnEventCount: count };
 }
 
-// ── Trade activity scan (wash trading detection) ───────────────────────
+async function checkLiquidityPullHistoryV4(
+  client: AnyClient,
+  poolId: Address,
+  deployBlock: bigint,
+  currentBlock: bigint,
+  warnings: string[]
+): Promise<{ liquidityEverPulled: boolean; burnEventCount: number }> {
+  // Count ModifyLiquidity events with negative liquidityDelta — these are
+  // partial or full liquidity removals on a V4 pool.
+  let count = 0;
+  for (
+    let chunkStart = deployBlock;
+    chunkStart <= currentBlock;
+    chunkStart += SCAN_CHUNK
+  ) {
+    const chunkEnd = chunkStart + SCAN_CHUNK - 1n < currentBlock
+      ? chunkStart + SCAN_CHUNK - 1n
+      : currentBlock;
+    try {
+      const logs = await client.getLogs({
+        address: UNISWAP_V4_POOL_MANAGER as Address,
+        event:   V4_MODIFY_LIQUIDITY_EVENT_ABI[0],
+        args:    { id: poolId },
+        fromBlock: chunkStart,
+        toBlock:   chunkEnd,
+      });
+      for (const l of logs) {
+        if ((l.args as { liquidityDelta: bigint }).liquidityDelta < 0n) {
+          count++;
+        }
+      }
+    } catch (err) {
+      warn(warnings, "burnHistory", `V4 chunk [${chunkStart}, ${chunkEnd}] failed`, err);
+    }
+  }
+  return { liquidityEverPulled: count > 0, burnEventCount: count };
+}
+
+// ── Trade activity scan (wash trading detection) ──────────────────────────────
+//
+// V3: scan Swap events on the pool contract.
+// V4: scan Swap events on the PoolManager filtered by the poolId (id field).
+
 interface TradeActivity {
   totalSwaps: number;
   uniqueTraders: number;
@@ -527,7 +821,6 @@ interface TradeActivity {
   sellCount: number;
   buyerAddresses: Set<string>;
   sellerAddresses: Set<string>;
-  // wash-trading signal: addresses that appear on BOTH sides
   roundTripTraders: string[];
   topTraderSwapShare: number; // % of total swaps done by the single busiest address
   scanPartial: boolean;
@@ -535,31 +828,46 @@ interface TradeActivity {
 
 export async function scanTradeActivity(
   client: AnyClient,
+  poolIdOrAddress: Address,
+  fromBlock: bigint,
+  token0IsTarget: boolean,
+  warnings: string[],
+  venue: Venue = "v3"
+): Promise<TradeActivity> {
+  if (venue === "v4") {
+    return scanTradeActivityV4(client, poolIdOrAddress, fromBlock, token0IsTarget, warnings);
+  }
+  return scanTradeActivityV3(client, poolIdOrAddress, fromBlock, token0IsTarget, warnings);
+}
+
+async function scanTradeActivityV3(
+  client: AnyClient,
   poolAddress: Address,
   fromBlock: bigint,
-  token0IsTarget: boolean, // which side of the pool is the token being checked
+  token0IsTarget: boolean,
   warnings: string[]
 ): Promise<TradeActivity> {
-  const latestBlock = await client.getBlockNumber();
+  const latestBlock    = await client.getBlockNumber();
   const swapsByAddress = new Map<string, { buys: number; sells: number }>();
   let chunksFailed = 0, chunksTotal = 0, totalSwaps = 0;
 
   for (let chunkStart = fromBlock; chunkStart <= latestBlock; chunkStart += SCAN_CHUNK) {
-    const chunkEnd = chunkStart + SCAN_CHUNK - 1n < latestBlock ? chunkStart + SCAN_CHUNK - 1n : latestBlock;
+    const chunkEnd = chunkStart + SCAN_CHUNK - 1n < latestBlock
+      ? chunkStart + SCAN_CHUNK - 1n
+      : latestBlock;
     chunksTotal++;
     try {
       const logs = await client.getLogs({
         address: poolAddress,
-        event: POOL_SWAP_EVENT_ABI[0],
+        event:   POOL_SWAP_EVENT_ABI[0],
         fromBlock: chunkStart,
-        toBlock: chunkEnd,
+        toBlock:   chunkEnd,
       });
       for (const log of logs) {
         const { recipient, amount0, amount1 } = log.args as {
           recipient: string; amount0: bigint; amount1: bigint;
         };
         totalSwaps++;
-        // Negative amount = pool sending that token out = the trader received it (a buy of that token)
         const targetAmount = token0IsTarget ? amount0 : amount1;
         const isBuy = targetAmount < 0n;
         const entry = swapsByAddress.get(recipient) ?? { buys: 0, sells: 0 };
@@ -568,20 +876,76 @@ export async function scanTradeActivity(
       }
     } catch (err) {
       chunksFailed++;
-      warn(warnings, "tradeScan", `chunk [${chunkStart}, ${chunkEnd}] failed`, err);
+      warn(warnings, "tradeScan", `V3 chunk [${chunkStart}, ${chunkEnd}] failed`, err);
     }
   }
 
-  const buyerAddresses = new Set<string>();
+  return buildTradeActivity(swapsByAddress, totalSwaps, chunksFailed > 0);
+}
+
+async function scanTradeActivityV4(
+  client: AnyClient,
+  poolId: Address,
+  fromBlock: bigint,
+  token0IsTarget: boolean,
+  warnings: string[]
+): Promise<TradeActivity> {
+  // V4 Swap events are emitted on the PoolManager contract.  The `id` field
+  // (indexed) carries the PoolId, so we can filter precisely.
+  const latestBlock    = await client.getBlockNumber();
+  const swapsByAddress = new Map<string, { buys: number; sells: number }>();
+  let chunksFailed = 0, chunksTotal = 0, totalSwaps = 0;
+
+  for (let chunkStart = fromBlock; chunkStart <= latestBlock; chunkStart += SCAN_CHUNK) {
+    const chunkEnd = chunkStart + SCAN_CHUNK - 1n < latestBlock
+      ? chunkStart + SCAN_CHUNK - 1n
+      : latestBlock;
+    chunksTotal++;
+    try {
+      const logs = await client.getLogs({
+        address: UNISWAP_V4_POOL_MANAGER as Address,
+        event:   V4_SWAP_EVENT_ABI[0],
+        args:    { id: poolId },
+        fromBlock: chunkStart,
+        toBlock:   chunkEnd,
+      });
+      for (const log of logs) {
+        const { recipient, amount0, amount1 } = log.args as {
+          recipient: string; amount0: bigint; amount1: bigint;
+        };
+        totalSwaps++;
+        // Negative amount on the target side = pool sent that token to trader = buy
+        const targetAmount = token0IsTarget ? amount0 : amount1;
+        const isBuy = targetAmount < 0n;
+        const entry = swapsByAddress.get(recipient) ?? { buys: 0, sells: 0 };
+        if (isBuy) entry.buys++; else entry.sells++;
+        swapsByAddress.set(recipient, entry);
+      }
+    } catch (err) {
+      chunksFailed++;
+      warn(warnings, "tradeScan", `V4 chunk [${chunkStart}, ${chunkEnd}] failed`, err);
+    }
+  }
+
+  return buildTradeActivity(swapsByAddress, totalSwaps, chunksFailed > 0);
+}
+
+function buildTradeActivity(
+  swapsByAddress: Map<string, { buys: number; sells: number }>,
+  totalSwaps: number,
+  anyChunkFailed: boolean
+): TradeActivity {
+  const buyerAddresses  = new Set<string>();
   const sellerAddresses = new Set<string>();
   const roundTripTraders: string[] = [];
   let buyCount = 0, sellCount = 0, maxSwapsForOne = 0;
 
   for (const [addr, { buys, sells }] of swapsByAddress) {
-    buyCount += buys; sellCount += sells;
-    if (buys > 0) buyerAddresses.add(addr);
+    buyCount  += buys;
+    sellCount += sells;
+    if (buys  > 0) buyerAddresses.add(addr);
     if (sells > 0) sellerAddresses.add(addr);
-    if (buys > 0 && sells > 0) roundTripTraders.push(addr);
+    if (buys  > 0 && sells > 0) roundTripTraders.push(addr);
     maxSwapsForOne = Math.max(maxSwapsForOne, buys + sells);
   }
 
@@ -594,46 +958,37 @@ export async function scanTradeActivity(
     sellerAddresses,
     roundTripTraders,
     topTraderSwapShare: totalSwaps > 0 ? (maxSwapsForOne / totalSwaps) * 100 : 0,
-    scanPartial: chunksFailed > 0,
+    scanPartial: anyChunkFailed,
   };
 }
 
-// ── Helper: extract function body from source code ───────────────────────
+// ── Helper: extract function body from source code ───────────────────────────
 function extractFunctionBody(source: string, keyword: string): string | null {
-  // Find the function that contains this keyword
   const functionPattern = /function\s+(\w+)[^{]*\{/g;
   let match: RegExpExecArray | null;
   const maxLines = 40;
-  const lines = source.split('\n');
-  
+
   while ((match = functionPattern.exec(source)) !== null) {
     const funcStartIndex = match.index;
-    const funcStartLine = source.substring(0, funcStartIndex).split('\n').length - 1;
-    
-    // Check if this function contains the keyword
     const funcEnd = findMatchingBrace(source, funcStartIndex + match[0].length - 1);
     if (funcEnd === null) continue;
-    
+
     const funcBody = source.substring(funcStartIndex, funcEnd + 1);
     if (funcBody.includes(keyword)) {
-      // Extract up to maxLines
-      const funcLines = funcBody.split('\n');
-      if (funcLines.length <= maxLines) {
-        return funcBody;
-      }
-      return funcLines.slice(0, maxLines).join('\n') + '\n  // ... (truncated)';
+      const funcLines = funcBody.split("\n");
+      if (funcLines.length <= maxLines) return funcBody;
+      return funcLines.slice(0, maxLines).join("\n") + "\n  // ... (truncated)";
     }
   }
-  
   return null;
 }
 
-// ── Helper: find matching closing brace ─────────────────────────────────
+// ── Helper: find matching closing brace ──────────────────────────────────────
 function findMatchingBrace(source: string, startIndex: number): number | null {
   let braceCount = 0;
   for (let i = startIndex; i < source.length; i++) {
-    if (source[i] === '{') braceCount++;
-    else if (source[i] === '}') {
+    if (source[i] === "{") braceCount++;
+    else if (source[i] === "}") {
       braceCount--;
       if (braceCount === 0) return i;
     }
@@ -641,7 +996,7 @@ function findMatchingBrace(source: string, startIndex: number): number | null {
   return null;
 }
 
-// ── Helper: detect secondary admin after renounce ───────────────────────
+// ── Helper: detect secondary admin after renounce ────────────────────────────
 function detectSecondaryAdmin(
   source: string,
   renouncedOwner: string | null
@@ -649,76 +1004,65 @@ function detectSecondaryAdmin(
   if (!renouncedOwner || renouncedOwner === "unknown") {
     return { detected: false, snippet: null };
   }
-  
-  // Extract all address-type state variables (potential admin roles)
+
   const addressVarPattern = /address\s+(?:public|private|internal)?\s*(\w+)\s*(?:=|;)/gi;
   const addressVars: string[] = [];
   let match: RegExpExecArray | null;
   while ((match = addressVarPattern.exec(source)) !== null) {
     const varName = match[1];
-    // Skip owner-related variables (these are expected)
-    if (!varName.toLowerCase().includes('owner') && 
-        !varName.toLowerCase().includes('pending')) {
+    if (
+      !varName.toLowerCase().includes("owner") &&
+      !varName.toLowerCase().includes("pending")
+    ) {
       addressVars.push(varName);
     }
   }
-  
-  if (addressVars.length === 0) {
-    return { detected: false, snippet: null };
-  }
-  
-  // Find all functions/modifiers that use privilege keywords
+  if (addressVars.length === 0) return { detected: false, snippet: null };
+
   const functionPattern = /(?:function|modifier)\s+(\w+)[^{]*\{/g;
-  const privilegedFunctions: Array<{name: string, body: string}> = [];
-  
+  const privilegedFunctions: Array<{ name: string; body: string }> = [];
   while ((match = functionPattern.exec(source)) !== null) {
-    const funcName = match[1];
-    const funcStart = match.index;
+    const funcStart     = match.index;
     const funcBodyStart = funcStart + match[0].length - 1;
-    const funcEnd = findMatchingBrace(source, funcBodyStart);
-    
+    const funcEnd       = findMatchingBrace(source, funcBodyStart);
     if (funcEnd !== null) {
       const funcBody = source.substring(funcStart, funcEnd + 1);
-      
-      // Check if this function uses any privilege keyword
       for (const keyword of PRIVILEGE_KEYWORDS) {
-        const keywordRegex = new RegExp(keyword, 'gi');
-        if (keywordRegex.test(funcBody)) {
-          privilegedFunctions.push({ name: funcName, body: funcBody });
+        if (new RegExp(keyword, "gi").test(funcBody)) {
+          privilegedFunctions.push({ name: match[1], body: funcBody });
           break;
         }
       }
     }
   }
-  
-  // Check if any privileged function is gated by a non-owner address variable
+
   for (const func of privilegedFunctions) {
     for (const addrVar of addressVars) {
-      // Look for this address variable being used in a require/check
-      const varUsagePattern = new RegExp(`require\\s*\\([^)]*${addrVar}[^)]*\\)|if\\s*\\([^)]*${addrVar}[^)]*\\)`, 'gi');
-      if (varUsagePattern.test(func.body)) {
-        // Found a privileged function gated by a secondary address variable
-        const snippet = func.body.split('\n').slice(0, 8).join('\n').trim();
+      const pat = new RegExp(
+        `require\\s*\\([^)]*${addrVar}[^)]*\\)|if\\s*\\([^)]*${addrVar}[^)]*\\)`,
+        "gi"
+      );
+      if (pat.test(func.body)) {
+        const snippet = func.body.split("\n").slice(0, 8).join("\n").trim();
         return {
           detected: true,
-          snippet: snippet.length > 300 ? snippet.substring(0, 300) + '...' : snippet
+          snippet: snippet.length > 300 ? snippet.substring(0, 300) + "..." : snippet,
         };
       }
     }
   }
-  
   return { detected: false, snippet: null };
 }
 
-// ── 4. Source verification + backdoor keyword scan ──────────────────────
+// ── 4. Source verification + backdoor keyword scan ───────────────────────────
 export async function checkSourceVerification(
   tokenAddress: Address,
   warnings: string[],
   ownershipRenounced: boolean | null,
   ownerAddress: string | null
-): Promise<{ 
-  sourceVerified: boolean | null; 
-  suspiciousFunctions: {name: string, snippet: string}[];
+): Promise<{
+  sourceVerified: boolean | null;
+  suspiciousFunctions: { name: string; snippet: string }[];
   secondaryAdminDetected: boolean;
   secondaryAdminSnippet: string | null;
 }> {
@@ -728,46 +1072,35 @@ export async function checkSourceVerification(
     return { sourceVerified: null, suspiciousFunctions: [], secondaryAdminDetected: false, secondaryAdminSnippet: null };
   }
   try {
-    const url = `${ETHERSCAN_API_BASE}?chainid=${BASE_CHAIN_ID}&module=contract&action=getsourcecode&address=${tokenAddress}&apikey=${apiKey}`;
-    const res = await fetch(url);
+    const url  = `${ETHERSCAN_API_BASE}?chainid=${BASE_CHAIN_ID}&module=contract&action=getsourcecode&address=${tokenAddress}&apikey=${apiKey}`;
+    const res  = await fetch(url);
     const json = await res.json();
     const source: string = json?.result?.[0]?.SourceCode ?? "";
     if (!source) {
       return { sourceVerified: false, suspiciousFunctions: [], secondaryAdminDetected: false, secondaryAdminSnippet: null };
     }
-    
-    // Extract function bodies for each suspicious keyword found
-    const suspiciousFunctions: {name: string, snippet: string}[] = [];
+
+    const suspiciousFunctions: { name: string; snippet: string }[] = [];
     for (const kw of SUSPICIOUS_SOURCE_KEYWORDS) {
       if (source.includes(kw)) {
-        const snippet = extractFunctionBody(source, kw);
-        if (snippet) {
-          // Try to extract function name from the snippet
-          const nameMatch = snippet.match(/function\s+(\w+)/);
-          const funcName = nameMatch ? nameMatch[1] : "unknown";
-          suspiciousFunctions.push({ name: funcName, snippet });
-        } else {
-          // Fallback if we can't extract the function body
-          suspiciousFunctions.push({ name: kw, snippet: `// Keyword "${kw}" found but function body extraction failed` });
-        }
+        const snippet  = extractFunctionBody(source, kw);
+        const nameMatch = snippet?.match(/function\s+(\w+)/);
+        suspiciousFunctions.push({
+          name:    nameMatch ? nameMatch[1] : kw,
+          snippet: snippet ?? `// Keyword "${kw}" found but function body extraction failed`,
+        });
       }
     }
-    
-    // Check for secondary admin if ownership is renounced
+
     let secondaryAdminDetected = false;
     let secondaryAdminSnippet: string | null = null;
     if (ownershipRenounced === true && ownerAddress) {
       const adminCheck = detectSecondaryAdmin(source, ownerAddress);
       secondaryAdminDetected = adminCheck.detected;
-      secondaryAdminSnippet = adminCheck.snippet;
+      secondaryAdminSnippet  = adminCheck.snippet;
     }
-    
-    return { 
-      sourceVerified: true, 
-      suspiciousFunctions,
-      secondaryAdminDetected,
-      secondaryAdminSnippet
-    };
+
+    return { sourceVerified: true, suspiciousFunctions, secondaryAdminDetected, secondaryAdminSnippet };
   } catch (err) {
     warn(warnings, "sourceCheck", "Etherscan API call failed", err);
     return { sourceVerified: null, suspiciousFunctions: [], secondaryAdminDetected: false, secondaryAdminSnippet: null };
@@ -779,19 +1112,29 @@ export async function checkSourceVerification(
 export async function collectEvidence(
   client: AnyClient,
   tokenAddress: Address,
+  /** V3: pool contract address. V4: bytes32 PoolId hex-encoded as Address. */
   poolAddress: Address,
   pairedAsset: string,
   deployBlock: bigint,
-  /** pre-fetched ERC-20 metadata (avoids a second round of reads) */
   meta: { name: string; symbol: string; decimals: number; totalSupply: bigint; totalSupplyFormatted: string },
-  /** optional deployer history from persistent state */
   deployerHistory?: { deployerSeenBefore: boolean; deployerPriorTokens: string[] },
-  /** optional state for liquidity delta monitoring */
-  state?: BotState
+  state?: BotState,
+  venue?: Venue,
+  /** V4 only: the hook contract address from the Initialize event. */
+  hookAddress?: string | null,
+  /** V4 only: PoolKey parameters needed for the sell-simulation Quoter call. */
+  v4PoolParams?: {
+    currency0: Address;
+    currency1: Address;
+    fee: number;
+    tickSpacing: number;
+    hooks: Address;
+  }
 ): Promise<TokenEvidence> {
   const warnings: string[] = [];
+  const resolvedVenue: Venue = venue ?? "v3";
 
-  // ── 1. ERC-20 supply / decimals (already in meta, just surface them) ──────
+  // ── 1. ERC-20 supply / decimals ────────────────────────────────────────────
   const { name, symbol, decimals, totalSupply, totalSupplyFormatted } = meta;
 
   // ── 2. Ownership ───────────────────────────────────────────────────────────
@@ -800,7 +1143,7 @@ export async function collectEvidence(
   try {
     ownerAddress = await client.readContract({
       address: tokenAddress,
-      abi: OWNER_ABI,
+      abi:     OWNER_ABI,
       functionName: "owner",
     }) as string;
     ownershipRenounced = ownerAddress === NULL_ADDRESS;
@@ -821,23 +1164,17 @@ export async function collectEvidence(
   const deployer = await findDeployer(client, tokenAddress, deployBlock, warnings);
 
   // ── 5. Holder balances ─────────────────────────────────────────────────────
-  // Anchor the holder scan from the mint block if we found it (most accurate),
-  // otherwise from deployBlock - 10k (conservative fallback).
   const holderScanFrom = deployer.mintBlock !== null
     ? deployer.mintBlock
     : deployBlock > 10_000n ? deployBlock - 10_000n : 0n;
 
   const holderScan = await scanHolderBalances(client, tokenAddress, holderScanFrom, warnings);
 
-  // Deployer's current balance from the holder scan
   let deployerCurrentBalance: bigint | null = null;
   if (!holderScan.failed && deployer.address) {
     deployerCurrentBalance = holderScan.balances.get(deployer.address.toLowerCase()) ?? 0n;
   }
 
-  // If we found the deployer via wide scan and their mint predates the holder
-  // scan window, the current balance will be 0 (transfer not in range) —
-  // fall back to mint amount as a floor estimate and record it.
   if (
     deployer.source === "wide" &&
     deployer.mintBlock !== null &&
@@ -846,9 +1183,7 @@ export async function collectEvidence(
     deployer.mintAmount !== null
   ) {
     deployerCurrentBalance = deployer.mintAmount;
-    warnings.push(
-      "[holderScan] deployer balance is a floor estimate — mint predates scan window"
-    );
+    warnings.push("[holderScan] deployer balance is a floor estimate — mint predates scan window");
   }
 
   const deployerPct: number | null =
@@ -867,116 +1202,177 @@ export async function collectEvidence(
     pct: totalSupply > 0n ? Number((balance * 10_000n) / totalSupply) / 100 : 0,
   }));
 
-  const top5Balance = sortedHolders
-    .slice(0, 5)
-    .reduce((acc, [, bal]) => acc + bal, 0n);
-
+  const top5Balance = sortedHolders.slice(0, 5).reduce((acc, [, bal]) => acc + bal, 0n);
   const top5HoldersPct: number | null = holderScan.failed
     ? null
     : totalSupply > 0n ? Number((top5Balance * 10_000n) / totalSupply) / 100 : 0;
 
-  // ── 6. Pool liquidity ──────────────────────────────────────────────────────
-  const poolLiquidityRaw = await safeReadNullable<bigint>(
-    () => client.readContract({ address: poolAddress, abi: POOL_LIQUIDITY_ABI, functionName: "liquidity" }) as Promise<bigint>,
-    "pool.liquidity",
-    warnings
-  );
-  const liquidityLocked = poolLiquidityRaw === null ? null : poolLiquidityRaw > 0n;
-
+  // ── 6. Pool liquidity + initial ETH value ─────────────────────────────────
+  let poolLiquidityRaw: bigint | null = null;
+  let liquidityLocked: boolean | null = null;
   let initialLiquidityEth: number | null = null;
-  if (poolLiquidityRaw !== null && poolLiquidityRaw > 0n) {
-    try {
-      const slot0 = await client.readContract({
-        address: poolAddress,
-        abi: POOL_SLOT0_ABI,
-        functionName: "slot0",
-      }) as readonly [bigint, ...unknown[]];
-      const sqrtPriceX96 = slot0[0];
-      if (sqrtPriceX96 > 0n) {
-        const Q96 = 2n ** 96n;
-        const raw = Number(formatEther((poolLiquidityRaw * Q96) / sqrtPriceX96));
 
-        // Sanity bound: total ETH ever in existence is ~120M.
-        // Values above this are a sqrtPriceX96 math artifact (near-zero price
-        // → near-zero divisor → astronomically large quotient). Treat as invalid.
-        const ETH_SUPPLY_MAX = 200_000_000; // 200M — generous headroom
-        if (raw > ETH_SUPPLY_MAX) {
-          warnings.push(
-            `[pool.slot0] initialLiquidityEth computation yielded ${raw.toFixed(0)} ETH — ` +
-            `physically impossible (total ETH supply ~120M). Likely a near-zero sqrtPriceX96 ` +
-            `artifact. Value nulled; treat pool liquidity as unverified.`
-          );
-          initialLiquidityEth = null;
-        } else {
-          initialLiquidityEth = raw;
+  if (resolvedVenue === "v4") {
+    // V4: read from StateView using the poolId as bytes32
+    poolLiquidityRaw = await safeReadNullable<bigint>(
+      () => client.readContract({
+        address: UNISWAP_V4_STATE_VIEW as Address,
+        abi:     V4_STATE_VIEW_LIQUIDITY_ABI,
+        functionName: "getLiquidity",
+        args: [poolAddress],
+      }) as Promise<bigint>,
+      "pool.liquidity.v4",
+      warnings
+    );
+    liquidityLocked = poolLiquidityRaw === null ? null : poolLiquidityRaw > 0n;
+
+    if (poolLiquidityRaw !== null && poolLiquidityRaw > 0n) {
+      try {
+        const slot0 = await client.readContract({
+          address: UNISWAP_V4_STATE_VIEW as Address,
+          abi:     V4_STATE_VIEW_SLOT0_ABI,
+          functionName: "getSlot0",
+          args: [poolAddress],
+        }) as readonly [bigint, ...unknown[]];
+        const sqrtPriceX96 = slot0[0];
+        if (sqrtPriceX96 > 0n) {
+          const Q96 = 2n ** 96n;
+          const raw = Number(formatEther((poolLiquidityRaw * Q96) / sqrtPriceX96));
+          const ETH_SUPPLY_MAX = 200_000_000;
+          if (raw > ETH_SUPPLY_MAX) {
+            warnings.push(
+              `[pool.slot0.v4] initialLiquidityEth=${raw.toFixed(0)} ETH is physically impossible — nulled`
+            );
+            initialLiquidityEth = null;
+          } else {
+            initialLiquidityEth = raw;
+          }
         }
+      } catch (err) {
+        warn(warnings, "pool.slot0.v4", "StateView.getSlot0 failed", err);
       }
-    } catch (err) {
-      warn(warnings, "pool.slot0", "slot0 read failed", err);
+    }
+  } else {
+    // V3: read directly from the pool contract
+    poolLiquidityRaw = await safeReadNullable<bigint>(
+      () => client.readContract({
+        address: poolAddress,
+        abi:     POOL_LIQUIDITY_ABI,
+        functionName: "liquidity",
+      }) as Promise<bigint>,
+      "pool.liquidity",
+      warnings
+    );
+    liquidityLocked = poolLiquidityRaw === null ? null : poolLiquidityRaw > 0n;
+
+    if (poolLiquidityRaw !== null && poolLiquidityRaw > 0n) {
+      try {
+        const slot0 = await client.readContract({
+          address: poolAddress,
+          abi:     POOL_SLOT0_ABI,
+          functionName: "slot0",
+        }) as readonly [bigint, ...unknown[]];
+        const sqrtPriceX96 = slot0[0];
+        if (sqrtPriceX96 > 0n) {
+          const Q96 = 2n ** 96n;
+          const raw = Number(formatEther((poolLiquidityRaw * Q96) / sqrtPriceX96));
+          const ETH_SUPPLY_MAX = 200_000_000;
+          if (raw > ETH_SUPPLY_MAX) {
+            warnings.push(
+              `[pool.slot0] initialLiquidityEth=${raw.toFixed(0)} ETH is physically impossible — nulled`
+            );
+            initialLiquidityEth = null;
+          } else {
+            initialLiquidityEth = raw;
+          }
+        }
+      } catch (err) {
+        warn(warnings, "pool.slot0", "slot0 read failed", err);
+      }
     }
   }
 
-  // ── 7. New checks: sell test, LP lock, burn history, source, deployer ────
-  const sellTest = await testSellability(client, tokenAddress, poolAddress, top5, ownerAddress, deployer.address, warnings);
-  const lpLock = await checkLpLockStatus(client, poolAddress, deployBlock, warnings);
-  const pullHistory = await checkLiquidityPullHistory(
-    client, poolAddress, deployBlock, holderScan.scanTo, warnings
+  // ── 7. Sell test, LP lock, burn history ───────────────────────────────────
+  const sellTest   = await testSellability(
+    client, tokenAddress, poolAddress, top5, ownerAddress, deployer.address,
+    warnings, resolvedVenue, v4PoolParams
   );
-  const sourceCheck = await checkSourceVerification(tokenAddress, warnings, ownershipRenounced, ownerAddress);
+  const lpLock     = await checkLpLockStatus(
+    client, poolAddress, deployBlock, warnings, resolvedVenue
+  );
+  const pullHistory = await checkLiquidityPullHistory(
+    client, poolAddress, deployBlock, holderScan.scanTo, warnings, resolvedVenue
+  );
+  const sourceCheck = await checkSourceVerification(
+    tokenAddress, warnings, ownershipRenounced, ownerAddress
+  );
   const deployerHistoryData = deployerHistory ?? { deployerSeenBefore: false, deployerPriorTokens: [] };
 
   // ── 8. Liquidity delta check (if state provided) ──────────────────────────
-  let liquidityDeltaData: { liquidityDeltaPct: number | null; liquidityPreviousReading: string | null; snapshotAgeMinutes: number | null } = { liquidityDeltaPct: null, liquidityPreviousReading: null, snapshotAgeMinutes: null };
+  let liquidityDeltaData: {
+    liquidityDeltaPct: number | null;
+    liquidityPreviousReading: string | null;
+    snapshotAgeMinutes: number | null;
+  } = { liquidityDeltaPct: null, liquidityPreviousReading: null, snapshotAgeMinutes: null };
+
   if (state) {
-    const deltaResult = await checkLiquidityDelta(client, poolAddress, state);
-    liquidityDeltaData = {
-      liquidityDeltaPct: deltaResult.liquidityDeltaPct,
-      liquidityPreviousReading: deltaResult.liquidityPreviousReading,
-      snapshotAgeMinutes: deltaResult.snapshotAgeMinutes,
-    };
-    // Save the current snapshot
-    if (deltaResult.currentSnapshot) {
-      recordLiquiditySnapshot(state, poolAddress, deltaResult.currentSnapshot);
-      saveState(state);
+    try {
+      const deltaResult = await checkLiquidityDelta(client, poolAddress, state, resolvedVenue);
+      liquidityDeltaData = {
+        liquidityDeltaPct:        deltaResult.liquidityDeltaPct,
+        liquidityPreviousReading: deltaResult.liquidityPreviousReading,
+        snapshotAgeMinutes:       deltaResult.snapshotAgeMinutes,
+      };
+      if (deltaResult.currentSnapshot) {
+        recordLiquiditySnapshot(state, poolAddress, deltaResult.currentSnapshot);
+        saveState(state);
+      }
+    } catch (err) {
+      warn(warnings, "liquidityDelta", "checkLiquidityDelta failed", err);
     }
   }
 
   // ── 9. Trade activity scan (wash trading detection) ───────────────────────
-  // Determine if the target token is token0 or token1 in the pool
+  // For V3, determine token0/token1 order via the pool contract.
+  // For V4, the order is already known from the Initialize event (currency0/currency1).
   let token0IsTarget = false;
-  try {
-    const token0 = await client.readContract({
-      address: poolAddress,
-      abi: POOL_TOKENS_ABI,
-      functionName: "token0",
-    }) as string;
-    token0IsTarget = token0.toLowerCase() === tokenAddress.toLowerCase();
-  } catch (err) {
-    warn(warnings, "tradeScan", "failed to read pool token0/token1", err);
+
+  if (resolvedVenue === "v4" && v4PoolParams) {
+    token0IsTarget = tokenAddress.toLowerCase() === v4PoolParams.currency0.toLowerCase();
+  } else if (resolvedVenue === "v3") {
+    try {
+      const token0 = await client.readContract({
+        address: poolAddress,
+        abi:     POOL_TOKENS_ABI,
+        functionName: "token0",
+      }) as string;
+      token0IsTarget = token0.toLowerCase() === tokenAddress.toLowerCase();
+    } catch (err) {
+      warn(warnings, "tradeScan", "failed to read pool token0/token1", err);
+    }
   }
 
   const tradeActivity = await scanTradeActivity(
-    client, 
-    poolAddress, 
-    deployBlock, 
-    token0IsTarget, 
-    warnings
+    client, poolAddress, deployBlock, token0IsTarget, warnings, resolvedVenue
   );
 
-  const buySellRatio: number | null = tradeActivity.sellCount > 0 
-    ? tradeActivity.buyCount / tradeActivity.sellCount 
+  const buySellRatio: number | null = tradeActivity.sellCount > 0
+    ? tradeActivity.buyCount / tradeActivity.sellCount
     : null;
 
   const roundTripTraderPct: number | null = tradeActivity.uniqueTraders > 0
     ? (tradeActivity.roundTripTraders.length / tradeActivity.uniqueTraders) * 100
     : null;
 
-  // ── 8. Assemble ────────────────────────────────────────────────────────────
+  // ── 10. Assemble ──────────────────────────────────────────────────────────
   return {
     tokenAddress,
     poolAddress,
     pairedAsset,
+    venue: resolvedVenue,
     deployBlock: deployBlock.toString(),
+
+    hookAddress: resolvedVenue === "v4" ? (hookAddress ?? null) : null,
 
     name,
     symbol,
@@ -1005,36 +1401,36 @@ export async function collectEvidence(
     liquidityLocked,
     initialLiquidityEth,
 
-    liquidityDeltaPct:      liquidityDeltaData.liquidityDeltaPct,
+    liquidityDeltaPct:        liquidityDeltaData.liquidityDeltaPct,
     liquidityPreviousReading: liquidityDeltaData.liquidityPreviousReading,
-    snapshotAgeMinutes:     liquidityDeltaData.snapshotAgeMinutes,
+    snapshotAgeMinutes:       liquidityDeltaData.snapshotAgeMinutes,
 
-    sellTestPassed:      sellTest.sellTestPassed,
-    sellTestAmountSent:  sellTest.sellTestAmountSent,
-    sellTestError:       sellTest.sellTestError,
+    sellTestPassed:     sellTest.sellTestPassed,
+    sellTestAmountSent: sellTest.sellTestAmountSent,
+    sellTestError:      sellTest.sellTestError,
 
-    lpTokenId:           lpLock.lpTokenId,
-    lpPositionOwner:     lpLock.lpPositionOwner,
-    lpPositionStatus:    lpLock.lpPositionStatus,
+    lpTokenId:        lpLock.lpTokenId,
+    lpPositionOwner:  lpLock.lpPositionOwner,
+    lpPositionStatus: lpLock.lpPositionStatus,
 
     liquidityEverPulled: pullHistory.liquidityEverPulled,
     burnEventCount:      pullHistory.burnEventCount,
 
-    sourceVerified:       sourceCheck.sourceVerified,
-    suspiciousFunctions:  sourceCheck.suspiciousFunctions,
-    secondaryAdminDetected: sourceCheck.secondaryAdminDetected,
-    secondaryAdminSnippet: sourceCheck.secondaryAdminSnippet,
+    sourceVerified:          sourceCheck.sourceVerified,
+    suspiciousFunctions:     sourceCheck.suspiciousFunctions,
+    secondaryAdminDetected:  sourceCheck.secondaryAdminDetected,
+    secondaryAdminSnippet:   sourceCheck.secondaryAdminSnippet,
 
-    deployerSeenBefore:   deployerHistoryData.deployerSeenBefore,
-    deployerPriorTokens:  deployerHistoryData.deployerPriorTokens,
+    deployerSeenBefore:  deployerHistoryData.deployerSeenBefore,
+    deployerPriorTokens: deployerHistoryData.deployerPriorTokens,
 
     totalSwaps:           tradeActivity.totalSwaps,
     uniqueTraders:        tradeActivity.uniqueTraders,
     buyCount:             tradeActivity.buyCount,
     sellCount:            tradeActivity.sellCount,
-    buySellRatio:         buySellRatio,
+    buySellRatio,
     roundTripTraderCount: tradeActivity.roundTripTraders.length,
-    roundTripTraderPct:   roundTripTraderPct,
+    roundTripTraderPct,
     topTraderSwapSharePct: tradeActivity.topTraderSwapShare,
     tradeScanPartial:     tradeActivity.scanPartial,
 

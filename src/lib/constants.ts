@@ -2,16 +2,30 @@
 
 export const BASE_CHAIN_ID = 8453;
 
+// ─── Venue types ───────────────────────────────────────────────────────────────
+
+export type Venue = "v3" | "v4";
+
 // ─── Contract addresses ───────────────────────────────────────────────────────
 
 /** Uniswap V3 Factory on Base — source: https://docs.uniswap.org/contracts/v3/reference/deployments/base-deployments */
 export const UNISWAP_V3_FACTORY =
   "0x33128a8fC17869897dcE68Ed026d694621f6FDfD" as const;
 
+/** Uniswap V4 PoolManager on Base — source: https://docs.uniswap.org/contracts/v4/deployments */
+export const UNISWAP_V4_POOL_MANAGER =
+  "0x498581fF718922c3f8e6A244956aF099B2652b2b" as const;
+
+/** Uniswap V4 StateView on Base — used for reading pool state */
+export const UNISWAP_V4_STATE_VIEW =
+  "0xA3c0c9b65baD0b08107Aa264b0f3dB444b867A71" as const;
+
 /** Well-known "quote asset" addresses on Base (all lowercase for easy comparison).
  *  A newly created pool almost always pairs the new token against one of these.
+ *  Note: V4 uses address(0) for native ETH instead of WETH.
  */
 export const KNOWN_QUOTE_ASSETS = new Set<string>([
+  "0x0000000000000000000000000000000000000000", // ETH   (native, V4 only)
   "0x4200000000000000000000000000000000000006", // WETH  (OP-Stack predeploy)
   "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", // USDC  (native)
   "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca", // USDbC (bridged USDC)
@@ -20,6 +34,7 @@ export const KNOWN_QUOTE_ASSETS = new Set<string>([
 
 /** Human-readable labels for known quote assets (used in log output) */
 export const QUOTE_ASSET_LABELS: Record<string, string> = {
+  "0x0000000000000000000000000000000000000000": "ETH",
   "0x4200000000000000000000000000000000000006": "WETH",
   "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": "USDC",
   "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca": "USDbC",
@@ -39,6 +54,24 @@ export const POOL_CREATED_ABI = [
       { name: "fee", type: "uint24", indexed: true },
       { name: "tickSpacing", type: "int24", indexed: false },
       { name: "pool", type: "address", indexed: false },
+    ],
+  },
+] as const;
+
+/** Single-event ABI fragment for Uniswap V4 Initialize */
+export const V4_INITIALIZE_ABI = [
+  {
+    type: "event",
+    name: "Initialize",
+    inputs: [
+      { name: "id", type: "bytes32", indexed: true },
+      { name: "currency0", type: "address", indexed: true },
+      { name: "currency1", type: "address", indexed: true },
+      { name: "fee", type: "uint24", indexed: false },
+      { name: "tickSpacing", type: "int24", indexed: false },
+      { name: "hooks", type: "address", indexed: false },
+      { name: "sqrtPriceX96", type: "uint160", indexed: false },
+      { name: "tick", type: "int24", indexed: false },
     ],
   },
 ] as const;
@@ -89,6 +122,33 @@ export const POOL_TOKENS_ABI = [
     name: "token1",
     inputs: [],
     outputs: [{ name: "", type: "address" }],
+    stateMutability: "view",
+  },
+] as const;
+
+/** V4 StateView.getSlot0 ABI */
+export const V4_STATE_VIEW_SLOT0_ABI = [
+  {
+    type: "function",
+    name: "getSlot0",
+    inputs: [{ name: "poolId", type: "bytes32" }],
+    outputs: [
+      { name: "sqrtPriceX96", type: "uint160" },
+      { name: "tick", type: "int24" },
+      { name: "protocolFee", type: "uint16" },
+      { name: "lpFee", type: "uint24" },
+    ],
+    stateMutability: "view",
+  },
+] as const;
+
+/** V4 StateView.getLiquidity ABI */
+export const V4_STATE_VIEW_LIQUIDITY_ABI = [
+  {
+    type: "function",
+    name: "getLiquidity",
+    inputs: [{ name: "poolId", type: "bytes32" }],
+    outputs: [{ name: "", type: "uint128" }],
     stateMutability: "view",
   },
 ] as const;
@@ -175,6 +235,55 @@ export const UNCX_V3_LOCKER =
 export const BURN_ADDRESS =
   "0x000000000000000000000000000000000000dEaD" as const;
 
+/**
+ * Uniswap V4 Universal Router on Base.
+ * Used for simulating V4 swaps in the sell-ability test.
+ * Source: https://docs.uniswap.org/contracts/v4/deployments
+ */
+export const UNISWAP_V4_UNIVERSAL_ROUTER =
+  "0x6fF5693b99212Da76ad316178A184AB56D299b43" as const;
+
+/**
+ * Uniswap V4 Quoter on Base.
+ * Used for quoting V4 swaps without executing them.
+ * Source: https://docs.uniswap.org/contracts/v4/deployments
+ */
+export const UNISWAP_V4_QUOTER =
+  "0x0d5e0F971ED27FBfF6c2837bf31316121532048D" as const;
+
+/**
+ * V4 Quoter.quoteExactInputSingle ABI — simulates a single-hop V4 swap and
+ * returns the output amount.  We use this for the sell-ability test on V4
+ * tokens: if the call reverts, the pool has a hook that blocks sells.
+ */
+export const V4_QUOTER_EXACT_INPUT_SINGLE_ABI = [{
+  type: "function",
+  name: "quoteExactInputSingle",
+  stateMutability: "nonpayable",
+  inputs: [
+    {
+      name: "params",
+      type: "tuple",
+      components: [
+        { name: "poolKey", type: "tuple", components: [
+          { name: "currency0", type: "address" },
+          { name: "currency1", type: "address" },
+          { name: "fee", type: "uint24" },
+          { name: "tickSpacing", type: "int24" },
+          { name: "hooks", type: "address" },
+        ]},
+        { name: "zeroForOne", type: "bool" },
+        { name: "exactAmount", type: "uint128" },
+        { name: "hookData", type: "bytes" },
+      ],
+    },
+  ],
+  outputs: [
+    { name: "amountOut", type: "uint256" },
+    { name: "gasEstimate", type: "uint256" },
+  ],
+}] as const;
+
 export const ETHERSCAN_API_BASE = "https://api.etherscan.io/v2/api";
 
 export const POOL_MINT_EVENT_ABI = [{
@@ -215,6 +324,37 @@ export const POOL_SWAP_EVENT_ABI = [{
     { name: "sqrtPriceX96", type: "uint160", indexed: false },
     { name: "liquidity", type: "uint128", indexed: false },
     { name: "tick", type: "int24", indexed: false },
+  ],
+}] as const;
+
+/** V4 Swap event ABI (emitted on PoolManager, filtered by PoolId) */
+export const V4_SWAP_EVENT_ABI = [{
+  type: "event",
+  name: "Swap",
+  inputs: [
+    { name: "id", type: "bytes32", indexed: true },
+    { name: "sender", type: "address", indexed: true },
+    { name: "recipient", type: "address", indexed: true },
+    { name: "amount0", type: "int256", indexed: false },
+    { name: "amount1", type: "int256", indexed: false },
+    { name: "sqrtPriceX96", type: "uint160", indexed: false },
+    { name: "liquidity", type: "uint128", indexed: false },
+    { name: "tick", type: "int24", indexed: false },
+  ],
+}] as const;
+
+/** V4 ModifyLiquidity event ABI (emitted on PoolManager, filtered by PoolId) */
+export const V4_MODIFY_LIQUIDITY_EVENT_ABI = [{
+  type: "event",
+  name: "ModifyLiquidity",
+  inputs: [
+    { name: "id", type: "bytes32", indexed: true },
+    { name: "sender", type: "address", indexed: true },
+    { name: "tickLower", type: "int24", indexed: true },
+    { name: "tickUpper", type: "int24", indexed: true },
+    { name: "liquidityDelta", type: "int128", indexed: false },
+    { name: "amount0", type: "uint256", indexed: false },
+    { name: "amount1", type: "uint256", indexed: false },
   ],
 }] as const;
 

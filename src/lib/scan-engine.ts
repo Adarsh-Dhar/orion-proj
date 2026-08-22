@@ -10,13 +10,15 @@
  *   scanBlockRange(client, from, to)       — fetch PoolCreated → rug-check → print report
  */
 
-import { createPublicClient, http, type Address, type PublicClient } from "viem";
-import { base } from "viem/chains";
+import { type Address, type PublicClient } from "viem";
 import {
   UNISWAP_V3_FACTORY,
+  UNISWAP_V4_POOL_MANAGER,
   POOL_CREATED_ABI,
+  V4_INITIALIZE_ABI,
   KNOWN_QUOTE_ASSETS,
   QUOTE_ASSET_LABELS,
+  type Venue,
 } from "./constants.js";
 import { fetchTokenMetadata } from "./erc20.js";
 import { runRugCheckLLM, formatRugReport } from "./rugcheck.js";
@@ -151,16 +153,19 @@ export interface ResolvedPool {
   poolAddress: Address;
   pairedLabel: string;
   pairedAsset: Address; // Add the paired asset address for watchlist
+  venue: Venue;
 }
 
 /**
  * Try every (quoteAsset × feeTier) combination until we find a real pool.
- * Returns null if the token has no Uniswap V3 pool on Base.
+ * Checks V3 first (factory.getPool), then falls back to V4 (StateView.getSlot0).
+ * Returns null if the token has no Uniswap pool on Base.
  */
 export async function resolveTokenPool(
   client: AnyClient,
   tokenAddress: Address
 ): Promise<ResolvedPool | null> {
+  // ── V3 path ──────────────────────────────────────────────────────────────
   for (const quote of QUOTE_ASSETS_LIST) {
     for (const fee of FEE_TIERS) {
       try {
@@ -171,13 +176,69 @@ export async function resolveTokenPool(
           args: [tokenAddress, quote.address, fee],
         }) as Address;
         if (pool && pool.toLowerCase() !== NULL_POOL) {
-          return { poolAddress: pool, pairedLabel: quote.label, pairedAsset: quote.address };
+          return { poolAddress: pool, pairedLabel: quote.label, pairedAsset: quote.address, venue: "v3" };
         }
       } catch {
-        // non-existent pair just returns zero address or reverts — keep trying
+        // non-existent pair — keep trying
       }
     }
   }
+
+  // ── V4 path — scan recent Initialize events to find a matching pool ──────
+  // We look back ~100k blocks (≈ 5 days on Base) for an Initialize event
+  // where one of the currencies matches the token address.
+  try {
+    const currentBlock = await client.getBlockNumber();
+    const lookback     = 100_000n;
+    const fromBlock    = currentBlock > lookback ? currentBlock - lookback : 0n;
+    const CHUNK        = 10_000n;
+
+    for (let chunkStart = fromBlock; chunkStart <= currentBlock; chunkStart += CHUNK) {
+      const chunkEnd = chunkStart + CHUNK - 1n < currentBlock ? chunkStart + CHUNK - 1n : currentBlock;
+      try {
+        const logs = await client.getLogs({
+          address: UNISWAP_V4_POOL_MANAGER,
+          event:   V4_INITIALIZE_ABI[0],
+          fromBlock: chunkStart,
+          toBlock:   chunkEnd,
+        });
+
+        for (const log of logs) {
+          const { id, currency0, currency1, fee, tickSpacing, hooks } = log.args as {
+            id: `0x${string}`;
+            currency0: Address;
+            currency1: Address;
+            fee: number;
+            tickSpacing: number;
+            hooks: Address;
+          };
+
+          const c0 = currency0.toLowerCase();
+          const c1 = currency1.toLowerCase();
+          const t  = tokenAddress.toLowerCase();
+
+          if (c0 !== t && c1 !== t) continue;
+
+          // Determine the paired asset and its label
+          const pairedAddr   = (c0 === t ? currency1 : currency0);
+          const pairedLower  = pairedAddr.toLowerCase();
+          const pairedLabel  = QUOTE_ASSET_LABELS[pairedLower] ?? shortAddr(pairedAddr);
+
+          return {
+            poolAddress: id as Address,  // poolId used as the pool identifier
+            pairedLabel,
+            pairedAsset: pairedAddr,
+            venue: "v4",
+          };
+        }
+      } catch {
+        // chunk failed — keep scanning
+      }
+    }
+  } catch {
+    // V4 scan failed entirely — fall through to null
+  }
+
   return null;
 }
 
@@ -190,6 +251,7 @@ export interface TokenSummary {
   verdict: string;
   score: number;
   flags: number;
+  venue: Venue;
 }
 
 // ─── Core block-range scanner ─────────────────────────────────────────────────
@@ -247,11 +309,21 @@ export async function scanBlockRange(
   const numChunks   = Number((totalBlocks + CHUNK_SIZE - 1n) / CHUNK_SIZE);
 
   // ── Chunked getLogs ───────────────────────────────────────────────────────
-  interface PoolLog {
+  interface V3PoolLog {
+    venue: "v3";
     args: { token0: Address; token1: Address; fee: number; tickSpacing: number; pool: Address };
     blockNumber: bigint | null;
     transactionHash: `0x${string}` | null;
   }
+
+  interface V4PoolLog {
+    venue: "v4";
+    args: { id: `0x${string}`; currency0: Address; currency1: Address; fee: number; tickSpacing: number; hooks: Address; sqrtPriceX96: bigint; tick: number };
+    blockNumber: bigint | null;
+    transactionHash: `0x${string}` | null;
+  }
+
+  type PoolLog = V3PoolLog | V4PoolLog;
 
   const allLogs: PoolLog[] = [];
   let chunksFetched = 0;
@@ -263,13 +335,28 @@ export async function scanBlockRange(
       : toBlock;
 
     try {
-      const logs = await client.getLogs({
+      // Fetch V3 PoolCreated events
+      const v3Logs = await client.getLogs({
         address: UNISWAP_V3_FACTORY,
         event:   POOL_CREATED_ABI[0],
         fromBlock: chunkStart,
         toBlock:   chunkEnd,
       });
-      allLogs.push(...(logs as unknown as PoolLog[]));
+
+      // Fetch V4 Initialize events
+      const v4Logs = await client.getLogs({
+        address: UNISWAP_V4_POOL_MANAGER,
+        event:   V4_INITIALIZE_ABI[0],
+        fromBlock: chunkStart,
+        toBlock:   chunkEnd,
+      });
+
+      // Tag V3 logs with venue
+      const taggedV3Logs = (v3Logs as unknown as V3PoolLog[]).map(log => ({ ...log, venue: "v3" as const }));
+      // Tag V4 logs with venue
+      const taggedV4Logs = (v4Logs as unknown as V4PoolLog[]).map(log => ({ ...log, venue: "v4" as const }));
+
+      allLogs.push(...taggedV3Logs, ...taggedV4Logs);
       chunksFetched++;
       process.stdout.write(
         `\r  Fetching chunks: ${chunksFetched}/${numChunks} (${allLogs.length} pools so far)   `
@@ -291,7 +378,7 @@ export async function scanBlockRange(
   console.log(`  Total pools found  : ${allLogs.length}\n`);
 
   if (allLogs.length === 0) {
-    console.log("  No PoolCreated events found in this window.\n");
+    console.log("  No pool creation events found in this window.\n");
     return { summary: [], totalPools: 0, processed: 0, skipped: 0 };
   }
 
@@ -309,7 +396,7 @@ export async function scanBlockRange(
 
   for (let i = 0; i < allLogs.length; i++) {
     const log = allLogs[i];
-    const { token0, token1, fee, pool } = log.args;
+    const venue = log.venue;
     const txHash   = log.transactionHash ?? "unknown";
     const blockNum = log.blockNumber ?? toBlock;
 
@@ -322,8 +409,37 @@ export async function scanBlockRange(
       blockTime = "(timestamp unavailable)";
     }
 
+    let token0: Address, token1: Address, fee: number, poolAddress: Address;
+    let hookAddress: string | null = null;
+    let v4PoolParams: { currency0: Address; currency1: Address; fee: number; tickSpacing: number; hooks: Address } | undefined;
+
+    if (venue === "v3") {
+      const v3Log = log as V3PoolLog;
+      token0 = v3Log.args.token0;
+      token1 = v3Log.args.token1;
+      fee = v3Log.args.fee;
+      poolAddress = v3Log.args.pool;
+    } else {
+      // V4
+      const v4Log = log as V4PoolLog;
+      token0 = v4Log.args.currency0;
+      token1 = v4Log.args.currency1;
+      fee = v4Log.args.fee;
+      // For V4, use the poolId as the pool identifier (bytes32 cast to Address)
+      poolAddress = v4Log.args.id as Address;
+      hookAddress = v4Log.args.hooks;
+      v4PoolParams = {
+        currency0:   v4Log.args.currency0,
+        currency1:   v4Log.args.currency1,
+        fee:         v4Log.args.fee,
+        tickSpacing: v4Log.args.tickSpacing,
+        hooks:       v4Log.args.hooks,
+      };
+    }
+
     console.log(`  [${i + 1}/${allLogs.length}] Block ${blockNum.toLocaleString()} | ${blockTime}`);
-    console.log(`  Pool   : ${pool}`);
+    console.log(`  Venue  : ${venue.toUpperCase()}`);
+    console.log(`  Pool   : ${poolAddress}`);
     console.log(`  Fee    : ${formatFee(fee)}  |  Tx: ${txHash}`);
     console.log(`  BaseScan: https://basescan.org/tx/${txHash}\n`);
 
@@ -337,7 +453,7 @@ export async function scanBlockRange(
     }
 
     // Early skip check (e.g., already posted) before expensive evidence collection
-    if (opts?.shouldSkip && opts.shouldSkip(newToken, pool, pairedLabel)) {
+    if (opts?.shouldSkip && opts.shouldSkip(newToken, poolAddress, pairedLabel)) {
       console.log(`  [scan-engine] Skipping ${newToken} — shouldSkip returned true\n`);
       console.log(`${"─".repeat(66)}\n`);
       skipped++;
@@ -358,7 +474,13 @@ export async function scanBlockRange(
     // Run LLM rug check
     let rugResult;
     try {
-      rugResult = await runRugCheckLLM(client, newToken, pool, pairedLabel, blockNum, meta, { mode: "alert", state: opts?.state });
+      rugResult = await runRugCheckLLM(client, newToken, poolAddress, pairedLabel, blockNum, meta, {
+        mode: "alert",
+        state: opts?.state,
+        venue,
+        hookAddress,
+        v4PoolParams,
+      });
     } catch (err) {
       console.error(`  [scan-engine] rug check failed for ${newToken}: ${err}\n`);
       console.log(`${"─".repeat(66)}\n`);
@@ -386,6 +508,7 @@ export async function scanBlockRange(
       verdict: rugResult.verdict,
       score:   rugResult.score,
       flags:   rugResult.flags.length,
+      venue:   venue,
     });
     processed++;
 

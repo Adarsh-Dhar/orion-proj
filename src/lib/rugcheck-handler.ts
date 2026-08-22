@@ -76,7 +76,7 @@ export async function answerTokenQuestion(
     return { error: `Pool resolution failed: ${err}` };
   }
   if (!resolved) {
-    return { error: `No Uniswap V3 pool found for ${tokenAddress} on Base. The token may not have launched yet or uses a different DEX.` };
+    return { error: `No Uniswap pool found for ${tokenAddress} on Base. The token may not have launched yet, or it uses a DEX other than Uniswap V3/V4.` };
   }
 
   // ── 2. Fetch metadata ───────────────────────────────────────────────────
@@ -104,7 +104,7 @@ export async function answerTokenQuestion(
       resolved.pairedLabel,
       deployBlock,
       meta,
-      { userQuestion, mode, state }
+      { userQuestion, mode, state, venue: resolved.venue }
     );
     return { result, meta };
   } catch (err) {

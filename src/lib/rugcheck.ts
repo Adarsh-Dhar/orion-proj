@@ -26,6 +26,7 @@ import { getDeployerHistory, recordDeployerToken } from "./state.js";
 import { runAgentLoop } from "./agent-loop.js";
 import type { ToolContext } from "./agent-tools.js";
 import { storeAnalysis } from "./analysis-store.js";
+import type { Venue } from "./constants.js";
 
 // ─── Re-export shared types ───────────────────────────────────────────────────
 
@@ -100,7 +101,22 @@ export async function runRugCheckLLM(
   pairedAsset: string,
   deployBlock: bigint,
   meta: { name: string; symbol: string; decimals: number; totalSupply: bigint; totalSupplyFormatted: string },
-  opts?: { userQuestion?: string; mode?: "alert" | "chat"; state?: BotState }
+  opts?: {
+    userQuestion?: string;
+    mode?: "alert" | "chat";
+    state?: BotState;
+    venue?: Venue;
+    /** V4 only: hook contract address from the Initialize event */
+    hookAddress?: string | null;
+    /** V4 only: PoolKey params for the sell-simulation Quoter call */
+    v4PoolParams?: {
+      currency0: Address;
+      currency1: Address;
+      fee: number;
+      tickSpacing: number;
+      hooks: Address;
+    };
+  }
 ): Promise<RugCheckResult> {
 
   // ── 1. Check deployer history from persistent state (before evidence collection) ─────────────────────
@@ -112,7 +128,8 @@ export async function runRugCheckLLM(
 
   // ── 2. Collect evidence ───────────────────────────────────────────────────
   const evidence: TokenEvidence = await collectEvidence(
-    client, tokenAddress, poolAddress, pairedAsset, deployBlock, meta, deployerHistoryData, opts?.state
+    client, tokenAddress, poolAddress, pairedAsset, deployBlock, meta,
+    deployerHistoryData, opts?.state, opts?.venue, opts?.hookAddress, opts?.v4PoolParams
   );
 
   // ── 3. Update deployer history from persistent state ──────────────────────
@@ -197,7 +214,8 @@ export async function runRugCheckLLM(
       points:   100,
     };
     return {
-      tokenAddress, poolAddress, pairedAsset,
+      tokenAddress, poolAddress, pairedAsset, venue: opts?.venue ?? "v3",
+      hookAddress: evidence.hookAddress ?? null,
       ownerAddress, ownershipRenounced, isProxy,
       totalSupply, decimals,
       deployerAddress, deployerBalance, deployerBalanceIsEstimate,
@@ -273,7 +291,8 @@ export async function runRugCheckLLM(
   }
 
   return {
-    tokenAddress, poolAddress, pairedAsset,
+    tokenAddress, poolAddress, pairedAsset, venue: opts?.venue ?? "v3",
+    hookAddress: evidence.hookAddress ?? null,
     ownerAddress, ownershipRenounced, isProxy,
     totalSupply, decimals,
     deployerAddress, deployerBalance, deployerBalanceIsEstimate,
@@ -326,6 +345,11 @@ export function formatRugReport(
   lines.push(`║  Token    : ${meta.name} (${meta.symbol})`);
   lines.push(`║  Address  : ${r.tokenAddress}`);
   lines.push(`║  Pool     : ${r.poolAddress}`);
+  lines.push(`║  Venue    : ${r.venue === "v4" ? "Uniswap V4" : "Uniswap V3"}`);
+  if (r.venue === "v4" && r.hookAddress) {
+    const nullHook = "0x0000000000000000000000000000000000000000";
+    lines.push(`║  Hook     : ${r.hookAddress === nullHook ? "None (0x0)" : `⚠️  ${r.hookAddress}`}`);
+  }
   lines.push(`║  Paired   : ${r.pairedAsset}`);
   lines.push(`║  Scored by: ${scoredBy}`);
   lines.push(`║`);
@@ -421,12 +445,18 @@ export function formatAlertCard(
   const v = VERDICT_EMOJI[r.verdict];
   const lines: string[] = [];
 
-  lines.push(`${v} ${r.verdict} — ${meta.name} ($${meta.symbol})  ·  ${r.score}/100`);
+  const venueTag = r.venue === "v4" ? " · V4" : " · V3";
+  lines.push(`${v} ${r.verdict} — ${meta.name} ($${meta.symbol})  ·  ${r.score}/100${venueTag}`);
   lines.push(r.summary);
 
   const topFlags = [...r.flags].sort((a, b) => b.points - a.points).slice(0, 2);
   for (const f of topFlags) {
     lines.push(`${SEVERITY_EMOJI[f.severity]} ${f.label}`);
+  }
+
+  // Surface non-zero hook address for V4 pools — this is a key trust signal
+  if (r.venue === "v4" && r.hookAddress && r.hookAddress !== "0x0000000000000000000000000000000000000000") {
+    lines.push(`🪝 Hook: ${r.hookAddress}`);
   }
 
   lines.push(r.tokenAddress);
@@ -456,12 +486,17 @@ export function formatChatReply(
     lines.push(r.answer, "");
   }
 
-  lines.push(`${v} ${r.verdict}  ·  ${r.score}/100  ·  ${meta.name} ($${meta.symbol})`);
+  const venueTag = r.venue === "v4" ? " · V4" : " · V3";
+  lines.push(`${v} ${r.verdict}  ·  ${r.score}/100  ·  ${meta.name} ($${meta.symbol})${venueTag}`);
 
   const topFlags = [...r.flags].sort((a, b) => b.points - a.points).slice(0, 3);
   if (topFlags.length > 0) {
     lines.push("");
     for (const f of topFlags) lines.push(`${SEVERITY_EMOJI[f.severity]} ${f.label} — ${f.detail}`);
+  }
+
+  if (r.venue === "v4" && r.hookAddress && r.hookAddress !== "0x0000000000000000000000000000000000000000") {
+    lines.push("", `🪝 V4 Hook: ${r.hookAddress}`);
   }
 
   lines.push("", r.tokenAddress, `Send /full ${r.tokenAddress} for the complete report.`);

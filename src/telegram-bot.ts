@@ -23,7 +23,7 @@ import { registerInlineHandler } from "./lib/inline-handler.js";
 import { formatAlertCard } from "./lib/rugcheck.js";
 import { loadState, saveState, alreadyPosted, markPosted, addToWatchlist, getWatchlistTokens, recordLiquiditySnapshot } from "./lib/state.js";
 import { checkLiquidityDelta } from "./lib/evidence.js";
-import { UNISWAP_V3_FACTORY } from "./lib/constants.js";
+import { UNISWAP_V3_FACTORY, UNISWAP_V4_POOL_MANAGER } from "./lib/constants.js";
 
 // ─── Env validation ───────────────────────────────────────────────────────────
 
@@ -128,7 +128,8 @@ async function sniperTick(): Promise<void> {
         
         // Backfill: this token was posted before the watchlist existed, or before
         // this restart re-discovered it — make sure it's still being monitored.
-        addToWatchlist(state, tokenAddress, poolAddress, pairedAsset);
+        // Default to v3 for backfilled entries (historic tokens are v3)
+        addToWatchlist(state, tokenAddress, poolAddress, pairedAsset, "v3");
         
         console.log(`  [bot] Already posted ${tokenAddress} — skipping full check (watchlist ensured)`);
         return true;
@@ -145,7 +146,7 @@ async function sniperTick(): Promise<void> {
           formatAlertCard(result, meta)
         );
         markPosted(state, result.tokenAddress);
-        addToWatchlist(state, result.tokenAddress, result.poolAddress, result.pairedAsset);
+        addToWatchlist(state, result.tokenAddress, result.poolAddress, result.pairedAsset, result.venue);
       },
       state: state,
     }
@@ -170,7 +171,12 @@ async function sniperTick(): Promise<void> {
     console.log(`  Checking liquidity for ${watchlistEntries.length} watchlist tokens...`);
     for (const entry of watchlistEntries) {
       try {
-        const deltaResult = await checkLiquidityDelta(client as any, entry.poolAddress as any, state);
+        const deltaResult = await checkLiquidityDelta(
+          client as any,
+          entry.poolAddress as any,
+          state,
+          entry.venue          // V3: reads pool.liquidity(); V4: reads StateView.getLiquidity(poolId)
+        );
         // Save the current snapshot for next comparison
         if (deltaResult.currentSnapshot) {
           recordLiquiditySnapshot(state, entry.poolAddress, deltaResult.currentSnapshot);
@@ -248,7 +254,8 @@ async function main(): Promise<void> {
   console.log(`  RugHound Telegram Bot`);
   console.log(`  Network  : Base Mainnet (chain ID 8453)`);
   console.log(`  RPC      : ${RPC_URL}`);
-  console.log(`  Factory  : ${UNISWAP_V3_FACTORY}  [Uniswap V3]`);
+  console.log(`  V3 Factory: ${UNISWAP_V3_FACTORY}`);
+  console.log(`  V4 PoolMgr: ${UNISWAP_V4_POOL_MANAGER}`);
   console.log(`  Scoring  : Gemini LLM (${process.env.GEMINI_MODEL ?? "gemini-2.0-flash-lite"})`);
   console.log(`  Interval : 5 min after each scan completes`);
   console.log(`  Filter   : posting ALL verdicts (LOW, MEDIUM, HIGH, CRITICAL)`);

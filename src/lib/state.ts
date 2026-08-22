@@ -6,6 +6,7 @@
  */
 
 import { readFileSync, writeFileSync, existsSync } from "fs";
+import type { Venue } from "./constants.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -19,6 +20,7 @@ export interface WatchlistEntry {
   tokenAddress: string;
   poolAddress: string;
   pairedAsset: string;
+  venue: Venue;
   firstPostedTimestamp: number;
 }
 
@@ -45,11 +47,18 @@ export function loadState(): BotState {
   if (!existsSync(STATE_PATH)) return { postedTokens: [], deployerHistory: {}, liquidityHistory: {}, watchlist: {}, lastScannedBlock: null };
   try {
     const parsed = JSON.parse(readFileSync(STATE_PATH, "utf-8")) as Partial<BotState>;
+    const watchlist = parsed.watchlist ?? {};
+    // Backwards compatibility: add default venue for existing watchlist entries
+    for (const key in watchlist) {
+      if (!watchlist[key].venue) {
+        watchlist[key].venue = "v3"; // existing entries are V3
+      }
+    }
     return {
       postedTokens: parsed.postedTokens ?? [],
       deployerHistory: parsed.deployerHistory ?? {},
       liquidityHistory: parsed.liquidityHistory ?? {},
-      watchlist: parsed.watchlist ?? {},
+      watchlist,
       lastScannedBlock: parsed.lastScannedBlock ?? null
     };
   } catch (err) {
@@ -103,13 +112,14 @@ export function recordLiquiditySnapshot(state: BotState, poolAddress: string, sn
   // Note: caller must call saveState() after batch operations
 }
 
-export function addToWatchlist(state: BotState, tokenAddress: string, poolAddress: string, pairedAsset: string): void {
+export function addToWatchlist(state: BotState, tokenAddress: string, poolAddress: string, pairedAsset: string, venue: Venue): void {
   const key = tokenAddress.toLowerCase();
   if (!state.watchlist[key]) {
     state.watchlist[key] = {
       tokenAddress: tokenAddress.toLowerCase(),
       poolAddress: poolAddress.toLowerCase(),
       pairedAsset: pairedAsset.toLowerCase(),
+      venue,
       firstPostedTimestamp: Date.now(),
     };
     saveState(state);

@@ -61,6 +61,10 @@ export interface StoredAnalysis {
   toolCallTranscript?: ToolCallRecord[];
   flags: RiskFlag[];
   scoringMethod: string;
+  /** Per-factor breakdown of how the deterministic score (scoring.ts) was built,
+   *  so the frontend can show why the score landed where it did, down to
+   *  individual continuous contributions rather than flat flag buckets. */
+  scoreBreakdown?: Array<{ id: string; label: string; contribution: number }>;
 }
 
 // ─── Storage functions ─────────────────────────────────────────────────────────

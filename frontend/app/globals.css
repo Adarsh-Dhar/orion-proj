@@ -1,38 +1,96 @@
-@import "tailwindcss";
+@import 'tailwindcss';
+@import 'tw-animate-css';
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
+@custom-variant dark (&:is(.dark *));
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-  --font-display: var(--font-display);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-brand-tan: var(--brand-tan);
+  --color-brand-cream: var(--brand-cream);
+  --color-brand-green: var(--brand-green);
+  /* Risk severity — light-theme-appropriate */
+  --color-risk-low: var(--risk-low);
+  --color-risk-medium: var(--risk-medium);
+  --color-risk-high: var(--risk-high);
+  --color-risk-critical: var(--risk-critical);
+  --font-sans: 'Geist', 'Geist Fallback';
+  --font-serif: 'DM Serif Display', 'DM Serif Display Fallback';
+  --font-mono: 'Geist Mono', 'Geist Mono Fallback';
+  --radius-sm: calc(var(--radius) * .6);
+  --radius-md: calc(var(--radius) * .8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+:root {
+  color-scheme: light;
+  --background: oklch(0.98 0.008 88);
+  --foreground: oklch(0.22 0.025 255);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.22 0.025 255);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.22 0.025 255);
+  --primary: #322e70;
+  --primary-foreground: #fbfaf7;
+  --secondary: oklch(0.94 0.025 82);
+  --secondary-foreground: oklch(0.28 0.05 255);
+  --muted: oklch(0.94 0.012 250);
+  --muted-foreground: oklch(0.5 0.03 255);
+  --accent: oklch(0.78 0.12 75);
+  --accent-foreground: oklch(0.23 0.04 255);
+  --destructive: oklch(0.58 0.2 25);
+  --border: oklch(0.87 0.02 250);
+  --input: oklch(0.87 0.02 250);
+  --ring: #4a4690;
+  --brand-tan: oklch(0.78 0.13 75);
+  --brand-cream: oklch(0.94 0.025 82);
+  --brand-green: oklch(0.64 0.15 150);
+  /* Risk severity tokens — readable on cream/white backgrounds */
+  --risk-low: #16a34a;      /* green-700 */
+  --risk-medium: #b45309;   /* amber-700 */
+  --risk-high: #c2410c;     /* orange-700 */
+  --risk-critical: #b91c1c; /* red-700 */
+  --radius: .85rem;
 }
 
+* { @apply border-border outline-ring/50; }
+html { scroll-behavior: smooth; }
+body { @apply bg-background text-foreground font-sans; }
+
+/* Rughound utility classes */
+.eyebrow { @apply font-mono text-xs font-bold uppercase tracking-[0.18em] text-primary; }
+.section-title { @apply mt-3 font-serif text-4xl leading-tight tracking-tight text-primary text-balance sm:text-5xl; }
+.media-placeholder { @apply flex items-center justify-center rounded-3xl border-2 border-dashed border-primary/20 bg-brand-cream/60 p-8; }
+.prose-rughound h2 { @apply font-serif text-2xl text-primary; }
+.prose-rughound p { @apply leading-8 text-muted-foreground; }
+
+/* Preserved animations from Orion */
 @keyframes pulse-dot {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: 0.4; transform: scale(0.8); }
 }
-
-.pulse-dot {
-  animation: pulse-dot 1.8s ease-in-out infinite;
-}
+.pulse-dot { animation: pulse-dot 1.8s ease-in-out infinite; }
 
 @keyframes row-in {
   from { opacity: 0; transform: translateY(-4px); }
   to { opacity: 1; transform: translateY(0); }
 }
-
-.row-in {
-  animation: row-in 400ms ease-out;
-}
+.row-in { animation: row-in 400ms ease-out; }

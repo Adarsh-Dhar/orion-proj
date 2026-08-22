@@ -10,6 +10,13 @@
 
 export type RiskLevel = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
 
+/**
+ * Verdict is RiskLevel plus UNKNOWN — reserved for analyses where scoring
+ * itself failed (LLM error, etc). Kept distinct from CRITICAL so a scoring
+ * failure never gets displayed as if it were a real high-risk finding.
+ */
+export type VerdictLevel = RiskLevel | 'UNKNOWN';
+
 export interface RiskFlag {
   id: string;
   label: string;
@@ -109,11 +116,14 @@ export interface StoredAnalysis {
   venue?: 'v3' | 'v4';
   /** V4 only: hook contract address. null / absent for V3. */
   hookAddress?: string | null;
+  /** 0–100, 2 decimal places. -1 means scoring failed (verdict === 'UNKNOWN'). */
   score: number;
-  verdict: RiskLevel;
+  verdict: VerdictLevel;
   summary: string;
   evidence?: TokenEvidence;
   toolCallTranscript?: ToolCallRecord[];
   flags: RiskFlag[];
   scoringMethod: string;
+  /** Optional per-factor breakdown of how the deterministic score was built. */
+  scoreBreakdown?: Array<{ id: string; label: string; contribution: number }>;
 }

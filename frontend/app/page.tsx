@@ -2,20 +2,31 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
+import { ArrowRight, ShieldCheck, CircleCheck } from 'lucide-react';
+import { SiteHeader, SiteFooter } from '@/components/rughound-site';
 import type { StoredAnalysis, RiskLevel } from './analysis/[id]/types';
 
+// ─── Risk severity mappings (light-theme tokens) ─────────────────────────────
+
 const SEVERITY_DOT: Record<RiskLevel, string> = {
-  LOW: 'bg-emerald-400',
-  MEDIUM: 'bg-amber-400',
-  HIGH: 'bg-orange-400',
-  CRITICAL: 'bg-red-400',
+  LOW:      'bg-[var(--risk-low)]',
+  MEDIUM:   'bg-[var(--risk-medium)]',
+  HIGH:     'bg-[var(--risk-high)]',
+  CRITICAL: 'bg-[var(--risk-critical)]',
 };
 
 const SEVERITY_TEXT: Record<RiskLevel, string> = {
-  LOW: 'text-emerald-400',
-  MEDIUM: 'text-amber-400',
-  HIGH: 'text-orange-400',
-  CRITICAL: 'text-red-400',
+  LOW:      'text-[var(--risk-low)]',
+  MEDIUM:   'text-[var(--risk-medium)]',
+  HIGH:     'text-[var(--risk-high)]',
+  CRITICAL: 'text-[var(--risk-critical)]',
+};
+
+const SEVERITY_BADGE: Record<RiskLevel, string> = {
+  LOW:      'bg-green-50 text-green-700 border-green-200',
+  MEDIUM:   'bg-amber-50 text-amber-700 border-amber-200',
+  HIGH:     'bg-orange-50 text-orange-700 border-orange-200',
+  CRITICAL: 'bg-red-50 text-red-700 border-red-200',
 };
 
 const POLL_MS = 30_000;
@@ -77,100 +88,99 @@ export default function HomePage() {
   }, [analyses, query]);
 
   return (
-    <div className="min-h-screen bg-[#0B0C0E] text-[#EDEEF0] selection:bg-[#FF6B35]/30">
-      <Nav totalScanned={stats.total} />
-      <Hero total={stats.total} critical={stats.critical} />
-      <CatchLog
-        loading={loading}
-        rows={filtered}
-        query={query}
-        onQueryChange={setQuery}
-        lastPolled={lastPolled}
-      />
-      <StatsStrip total={stats.total} critical={stats.critical} v4Share={stats.v4Share} />
-      <HowItWorks />
-      <Footer />
+    <div className="min-h-screen bg-background text-foreground">
+      <SiteHeader />
+      <main>
+        <Hero total={stats.total} critical={stats.critical} />
+        <TrustBar />
+        <CatchLog
+          loading={loading}
+          rows={filtered}
+          query={query}
+          onQueryChange={setQuery}
+          lastPolled={lastPolled}
+        />
+        <StatsStrip total={stats.total} critical={stats.critical} v4Share={stats.v4Share} />
+        <HowItWorks />
+      </main>
+      <SiteFooter />
     </div>
   );
 }
 
-// ─── Nav ────────────────────────────────────────────────────────────────────
-
-function Nav({ totalScanned }: { totalScanned: number }) {
-  return (
-    <header className="sticky top-0 z-20 border-b border-[#24272C] bg-[#0B0C0E]/90 backdrop-blur-sm">
-      <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
-        <div className="flex items-center gap-3">
-          <span
-            className="font-[family-name:var(--font-display)] text-xl font-black tracking-tight"
-            style={{ letterSpacing: '-0.02em' }}
-          >
-            ORION
-          </span>
-          <span className="hidden items-center gap-1.5 rounded-full border border-[#24272C] px-2.5 py-1 text-[10px] font-mono uppercase tracking-widest text-[#8B9198] sm:flex">
-            <span className="pulse-dot h-1.5 w-1.5 rounded-full bg-[#FF6B35]" />
-            scanning base · {totalScanned} logged
-          </span>
-        </div>
-        <Link
-          href="/analysis"
-          className="rounded-full border border-[#24272C] px-4 py-1.5 text-sm text-[#EDEEF0] transition-colors hover:border-[#FF6B35]/50 hover:text-[#FF6B35]"
-        >
-          Full log →
-        </Link>
-      </div>
-    </header>
-  );
-}
-
-// ─── Hero ───────────────────────────────────────────────────────────────────
+// ─── Hero ────────────────────────────────────────────────────────────────────
 
 function Hero({ total, critical }: { total: number; critical: number }) {
   return (
-    <section className="mx-auto max-w-6xl px-6 pb-16 pt-16 sm:pt-24">
-      <p className="mb-5 font-mono text-xs uppercase tracking-[0.2em] text-[#FF6B35]">
-        Base Mainnet · Uniswap V3 &amp; V4
-      </p>
-      <h1
-        className="font-[family-name:var(--font-display)] font-black leading-[0.92] tracking-tight"
-        style={{ fontSize: 'clamp(2.75rem, 7vw, 6.25rem)', letterSpacing: '-0.02em' }}
-      >
-        ORION HUNTS
-        <br />
-        RUGS ON BASE
-        <br />
-        <span className="text-[#FF6B35]">BEFORE YOU BUY THEM.</span>
-      </h1>
-      <p className="mt-8 max-w-xl text-lg leading-relaxed text-[#8B9198]">
-        Every new pool on Base gets read the moment it&apos;s created. An LLM agent pulls the
-        deployer&apos;s history, checks whether liquidity is locked, and simulates a real sell —
-        then posts a verdict, usually before the pool has its first trade.
-      </p>
-      <div className="mt-9 flex flex-wrap items-center gap-4">
-        <Link
-          href="/analysis"
-          className="rounded-lg bg-[#FF6B35] px-6 py-3 text-sm font-semibold text-[#0B0C0E] transition-transform hover:scale-[1.02] active:scale-[0.98]"
-        >
-          See the live catch log
-        </Link>
-        <a
-          href="#how-it-works"
-          className="text-sm text-[#8B9198] underline decoration-[#24272C] underline-offset-4 transition-colors hover:text-[#EDEEF0]"
-        >
-          How the hunt works
-        </a>
+    <section className="relative overflow-hidden bg-primary px-5 py-20 text-primary-foreground lg:px-8 lg:py-28">
+      <div className="mx-auto grid max-w-6xl items-center gap-14 lg:grid-cols-[1.05fr_.95fr]">
+        <div>
+          <div className="mb-7 inline-flex items-center gap-2 rounded-full border border-primary-foreground/20 bg-primary-foreground/10 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.14em] text-primary-foreground/80">
+            <ShieldCheck className="size-4" /> Base Mainnet · Uniswap V3 &amp; V4
+          </div>
+          <h1 className="max-w-3xl font-serif text-5xl leading-[0.98] tracking-tight text-balance sm:text-6xl lg:text-7xl">
+            Don&apos;t get rugged.
+            <br />
+            <span className="text-brand-tan">Get Rughound.</span>
+          </h1>
+          <p className="mt-7 max-w-xl text-lg leading-8 text-primary-foreground/80">
+            Every new pool on Base gets read the moment it&apos;s created. An agent pulls
+            deployer history, checks whether liquidity is locked, simulates a real sell —
+            and posts a verdict before the pool has its first trade.
+          </p>
+          <div className="mt-9 flex flex-wrap gap-3">
+            <Link
+              href="/analysis"
+              className="inline-flex items-center gap-2 rounded-full bg-brand-tan px-5 py-3 font-semibold text-primary transition-transform hover:-translate-y-0.5"
+            >
+              See the live catch log <ArrowRight className="size-4" />
+            </Link>
+            <a
+              href="#how-it-works"
+              className="inline-flex items-center rounded-full border border-primary-foreground/25 px-5 py-3 font-semibold text-primary-foreground hover:bg-primary-foreground/10"
+            >
+              How the hunt works
+            </a>
+          </div>
+          {total > 0 && (
+            <p className="mt-10 font-mono text-xs text-primary-foreground/60">
+              <span className="text-primary-foreground">{total.toLocaleString()}</span> pools scored so far ·{' '}
+              <span className="text-brand-tan">{critical}</span> came back CRITICAL
+            </p>
+          )}
+        </div>
+        <div className="relative flex justify-center">
+          <div className="absolute inset-12 rounded-full bg-brand-tan/15 blur-3xl" />
+          <img
+            src="/rughound-purple.png"
+            alt="Rughound mascot"
+            className="relative w-full max-w-md object-contain"
+            style={{
+              maskImage: 'radial-gradient(ellipse at center, black 58%, transparent 82%)',
+              WebkitMaskImage: 'radial-gradient(ellipse at center, black 58%, transparent 82%)',
+            }}
+          />
+        </div>
       </div>
-      {total > 0 && (
-        <p className="mt-10 font-mono text-xs text-[#8B9198]">
-          <span className="text-[#EDEEF0]">{total}</span> pools scored so far ·{' '}
-          <span className="text-red-400">{critical}</span> came back CRITICAL
-        </p>
-      )}
     </section>
   );
 }
 
-// ─── Live catch log ─────────────────────────────────────────────────────────
+// ─── Trust bar ───────────────────────────────────────────────────────────────
+
+function TrustBar() {
+  return (
+    <section className="border-b border-border bg-brand-cream px-5 py-5 lg:px-8">
+      <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-center gap-x-8 gap-y-3 text-sm font-semibold text-primary sm:justify-between">
+        <span className="flex items-center gap-2"><CircleCheck className="size-4 text-brand-green" /> Scans every new Base pool</span>
+        <span className="flex items-center gap-2"><CircleCheck className="size-4 text-brand-green" /> Honeypot sell simulation</span>
+        <span className="flex items-center gap-2"><CircleCheck className="size-4 text-brand-green" /> LP lock &amp; deployer history</span>
+      </div>
+    </section>
+  );
+}
+
+// ─── Live catch log ──────────────────────────────────────────────────────────
 
 function CatchLog({
   loading,
@@ -186,16 +196,17 @@ function CatchLog({
   lastPolled: Date | null;
 }) {
   return (
-    <section className="border-y border-[#24272C] bg-[#0E1012]">
-      <div className="mx-auto max-w-6xl px-6 py-12">
+    <section className="bg-brand-cream/40 border-y border-border">
+      <div className="mx-auto max-w-6xl px-5 py-14 lg:px-8">
         <div className="mb-6 flex flex-wrap items-end justify-between gap-4">
           <div>
-            <h2 className="font-[family-name:var(--font-display)] text-2xl font-bold tracking-tight sm:text-3xl">
+            <p className="eyebrow">Live feed</p>
+            <h2 className="mt-2 font-serif text-3xl tracking-tight text-primary sm:text-4xl">
               Recent catches
             </h2>
-            <p className="mt-1 text-sm text-[#8B9198]">
+            <p className="mt-1 text-sm text-muted-foreground">
               {lastPolled
-                ? `Live — last checked ${lastPolled.toLocaleTimeString()}, refreshes every 30s` 
+                ? `Last checked ${lastPolled.toLocaleTimeString()} · refreshes every 30s`
                 : 'Connecting…'}
             </p>
           </div>
@@ -204,23 +215,34 @@ function CatchLog({
             value={query}
             onChange={(e) => onQueryChange(e.target.value)}
             placeholder="Filter by name, symbol or address"
-            className="w-full max-w-xs rounded-lg border border-[#24272C] bg-[#131519] px-3.5 py-2 text-sm text-[#EDEEF0] placeholder:text-[#5C6167] outline-none focus:border-[#FF6B35]/50"
+            className="w-full max-w-xs rounded-xl border border-border bg-background px-3.5 py-2 text-sm text-foreground placeholder:text-muted-foreground outline-none ring-primary focus:ring-2"
           />
         </div>
 
         {loading ? (
           <div className="space-y-2">
             {Array.from({ length: 4 }).map((_, i) => (
-              <div key={i} className="h-16 animate-pulse rounded-lg border border-[#24272C] bg-[#131519]" />
+              <div key={i} className="h-16 animate-pulse rounded-xl border border-border bg-background" />
             ))}
           </div>
         ) : rows.length === 0 ? (
           <EmptyLog hasQuery={query.trim().length > 0} />
         ) : (
-          <div className="divide-y divide-[#1A1D21] overflow-hidden rounded-lg border border-[#24272C]">
+          <div className="divide-y divide-border overflow-hidden rounded-2xl border border-border bg-background shadow-sm">
             {rows.map((a) => (
               <CatchRow key={a.id} analysis={a} />
             ))}
+          </div>
+        )}
+
+        {rows.length > 0 && (
+          <div className="mt-6 text-center">
+            <Link
+              href="/analysis"
+              className="inline-flex items-center gap-2 font-semibold text-primary hover:gap-3 transition-all"
+            >
+              View full log <ArrowRight className="size-4" />
+            </Link>
           </div>
         )}
       </div>
@@ -230,40 +252,42 @@ function CatchLog({
 
 function EmptyLog({ hasQuery }: { hasQuery: boolean }) {
   return (
-    <div className="rounded-lg border border-dashed border-[#24272C] px-6 py-14 text-center">
-      <p className="text-[#8B9198]">
+    <div className="rounded-2xl border border-dashed border-border px-6 py-14 text-center">
+      <p className="text-muted-foreground">
         {hasQuery
-          ? "No catches match that filter — try a different name, symbol, or address."
-          : "No catches logged yet. Orion posts here the moment it scores a new pool."}
+          ? 'No catches match that filter — try a different name, symbol, or address.'
+          : 'No catches logged yet. Rughound posts here the moment it scores a new pool.'}
       </p>
     </div>
   );
 }
 
 function CatchRow({ analysis }: { analysis: StoredAnalysis }) {
-  const verdict = (analysis.verdict as RiskLevel) in SEVERITY_TEXT ? (analysis.verdict as RiskLevel) : 'MEDIUM';
+  const verdict = (analysis.verdict as RiskLevel) in SEVERITY_TEXT
+    ? (analysis.verdict as RiskLevel)
+    : 'MEDIUM';
   return (
     <Link
       href={`/analysis/${analysis.id}`}
-      className="row-in flex items-center gap-4 bg-[#131519] px-5 py-4 transition-colors hover:bg-[#181B1F]"
+      className="row-in flex items-center gap-4 px-5 py-4 transition-colors hover:bg-brand-cream/50"
     >
       <span className={`h-2 w-2 flex-shrink-0 rounded-full ${SEVERITY_DOT[verdict]}`} />
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
-          <span className="truncate font-medium text-[#EDEEF0]">{analysis.tokenName}</span>
-          <span className="flex-shrink-0 font-mono text-xs text-[#5C6167]">${analysis.tokenSymbol}</span>
+          <span className="truncate font-medium text-foreground">{analysis.tokenName}</span>
+          <span className="flex-shrink-0 font-mono text-xs text-muted-foreground">${analysis.tokenSymbol}</span>
           {analysis.venue && (
-            <span className="flex-shrink-0 rounded border border-[#24272C] px-1.5 py-0.5 font-mono text-[10px] uppercase text-[#8B9198]">
+            <span className="flex-shrink-0 rounded border border-border px-1.5 py-0.5 font-mono text-[10px] uppercase text-muted-foreground">
               {analysis.venue}
             </span>
           )}
         </div>
-        <p className="mt-0.5 truncate text-sm text-[#8B9198]">{analysis.summary}</p>
+        <p className="mt-0.5 truncate text-sm text-muted-foreground">{analysis.summary}</p>
       </div>
-      <span className={`flex-shrink-0 font-mono text-sm font-semibold ${SEVERITY_TEXT[verdict]}`}>
-        {analysis.score}
+      <span className={`flex-shrink-0 rounded-full border px-2.5 py-0.5 font-mono text-xs font-semibold ${SEVERITY_BADGE[verdict]}`}>
+        {verdict}
       </span>
-      <span className="hidden flex-shrink-0 font-mono text-xs text-[#5C6167] sm:block">
+      <span className="hidden flex-shrink-0 font-mono text-xs text-muted-foreground sm:block">
         {timeAgo(analysis.timestamp)}
       </span>
     </Link>
@@ -280,26 +304,23 @@ function timeAgo(ts: number): string {
   return `${Math.floor(hrs / 24)}d ago`;
 }
 
-// ─── Stats strip ────────────────────────────────────────────────────────────
+// ─── Stats strip ─────────────────────────────────────────────────────────────
 
 function StatsStrip({ total, critical, v4Share }: { total: number; critical: number; v4Share: number }) {
-  const stats = [
+  const items = [
     { label: 'Pools scanned', value: total.toLocaleString() },
     { label: 'Critical catches', value: critical.toLocaleString() },
     { label: 'On Uniswap V4', value: total > 0 ? `${v4Share}%` : '—' },
   ];
   return (
-    <section className="mx-auto max-w-6xl px-6 py-14">
-      <div className="grid grid-cols-1 gap-px overflow-hidden rounded-lg border border-[#24272C] bg-[#24272C] sm:grid-cols-3">
-        {stats.map((s) => (
-          <div key={s.label} className="bg-[#0B0C0E] px-6 py-8">
-            <p
-              className="font-[family-name:var(--font-display)] font-black tabular-nums"
-              style={{ fontSize: 'clamp(2rem, 4vw, 3rem)' }}
-            >
+    <section className="mx-auto max-w-6xl px-5 py-14 lg:px-8">
+      <div className="grid grid-cols-1 gap-px overflow-hidden rounded-2xl border border-border bg-border sm:grid-cols-3">
+        {items.map((s) => (
+          <div key={s.label} className="bg-background px-6 py-8">
+            <p className="font-serif text-4xl font-normal text-primary tabular-nums sm:text-5xl">
               {s.value}
             </p>
-            <p className="mt-1 text-sm text-[#8B9198]">{s.label}</p>
+            <p className="mt-2 text-sm text-muted-foreground">{s.label}</p>
           </div>
         ))}
       </div>
@@ -307,13 +328,13 @@ function StatsStrip({ total, critical, v4Share }: { total: number; critical: num
   );
 }
 
-// ─── How it works ───────────────────────────────────────────────────────────
+// ─── How it works ─────────────────────────────────────────────────────────────
 
 const STEPS = [
   {
     n: '01',
     title: 'Detect',
-    body: "Every PoolCreated event on Uniswap V3 and every Initialize event on V4's singleton pool manager gets picked up within one scan interval.",
+    body: 'Every PoolCreated event on Uniswap V3 and every Initialize event on V4\'s singleton pool manager gets picked up within one scan interval.',
   },
   {
     n: '02',
@@ -323,7 +344,7 @@ const STEPS = [
   {
     n: '03',
     title: 'Score',
-    body: "That evidence goes to an LLM, which weighs it against known rug patterns — honeypots, unlocked liquidity, serial deployers — and returns a 0–100 risk score.",
+    body: 'That evidence goes to an LLM, which weighs it against known rug patterns — honeypots, unlocked liquidity, serial deployers — and returns a 0–100 risk score.',
   },
   {
     n: '04',
@@ -334,61 +355,22 @@ const STEPS = [
 
 function HowItWorks() {
   return (
-    <section id="how-it-works" className="border-t border-[#24272C]">
-      <div className="mx-auto max-w-6xl px-6 py-16">
-        <h2 className="font-[family-name:var(--font-display)] text-2xl font-bold tracking-tight sm:text-3xl">
-          How the hunt works
-        </h2>
-        <div className="mt-10 grid grid-cols-1 gap-8 sm:grid-cols-2 lg:grid-cols-4">
+    <section id="how-it-works" className="bg-brand-cream px-5 py-20 lg:px-8 lg:py-28">
+      <div className="mx-auto max-w-6xl">
+        <div className="max-w-2xl">
+          <p className="eyebrow">How it works</p>
+          <h2 className="section-title">Four steps between you and a bad buy.</h2>
+        </div>
+        <div className="mt-12 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           {STEPS.map((step) => (
-            <div key={step.n}>
-              <span className="font-[family-name:var(--font-display)] text-3xl font-black text-[#FF6B35]">
-                {step.n}
-              </span>
-              <h3 className="mt-3 text-lg font-semibold text-[#EDEEF0]">{step.title}</h3>
-              <p className="mt-2 text-sm leading-relaxed text-[#8B9198]">{step.body}</p>
+            <div key={step.n} className="rounded-2xl border border-border bg-background p-6">
+              <span className="font-mono text-sm font-bold text-primary">{step.n}</span>
+              <h3 className="mt-8 text-xl font-semibold text-primary">{step.title}</h3>
+              <p className="mt-3 leading-7 text-muted-foreground">{step.body}</p>
             </div>
           ))}
         </div>
       </div>
     </section>
-  );
-}
-
-// ─── Footer ─────────────────────────────────────────────────────────────────
-
-function Footer() {
-  return (
-    <footer className="border-t border-[#24272C]">
-      <div className="mx-auto max-w-6xl px-6 py-10">
-        <div className="flex flex-col gap-6 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <span className="font-[family-name:var(--font-display)] text-lg font-black tracking-tight">
-              ORION
-            </span>
-            <p className="mt-1 text-sm text-[#8B9198]">A hunting dog for Base liquidity pools.</p>
-          </div>
-          <div className="flex flex-col gap-1.5 font-mono text-xs text-[#5C6167] sm:text-right">
-            <span>Watching every pool on:</span>
-            <a
-              href="https://basescan.org/address/0x33128a8fC17869897dcE68Ed026d694621f6FDfD"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="hover:text-[#8B9198]"
-            >
-              Uniswap V3 Factory — 0x3312…6FDf
-            </a>
-            <a
-              href="https://basescan.org/address/0x498581fF718922c3f8e6A244956aF099B2652b2b"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="hover:text-[#8B9198]"
-            >
-              Uniswap V4 PoolManager — 0x4985…52b2
-            </a>
-          </div>
-        </div>
-      </div>
-    </footer>
   );
 }

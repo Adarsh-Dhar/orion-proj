@@ -5,9 +5,10 @@ import { useState } from 'react'
 import { ArrowRight, Check, ChevronDown, CircleAlert, CircleCheck, Play, ShieldCheck, Sparkles, X } from 'lucide-react'
 
 const navItems = [
-  { label: 'Product', href: '#product' },
-  { label: 'How it works', href: '#how-it-works' },
-  { label: 'FAQ', href: '#faq' },
+  { label: 'Product', href: '/#product' },
+  { label: 'How it works', href: '/#how-it-works' },
+  { label: 'FAQ', href: '/#faq' },
+  { label: 'Live catches', href: '/analysis' },
 ]
 
 export function Logo({ compact = false }: { compact?: boolean }) {
@@ -27,7 +28,13 @@ export function SiteHeader() {
       <div className="mx-auto flex max-w-6xl items-center justify-between px-5 py-4 lg:px-8">
         <Logo />
         <nav className="hidden items-center gap-7 md:flex" aria-label="Main navigation">
-          {navItems.map((item) => <a key={item.href} href={item.href} className="text-sm font-medium text-muted-foreground transition-colors hover:text-primary">{item.label}</a>)}
+          {navItems.map((item) =>
+            item.href.startsWith('/') ? (
+              <Link key={item.href} href={item.href} className="text-sm font-medium text-muted-foreground transition-colors hover:text-primary">{item.label}</Link>
+            ) : (
+              <a key={item.href} href={item.href} className="text-sm font-medium text-muted-foreground transition-colors hover:text-primary">{item.label}</a>
+            )
+          )}
         </nav>
         <a href="https://web.telegram.org/a/#8992459816" target="_blank" rel="noreferrer" className="inline-flex items-center gap-2 rounded-full bg-primary px-4 py-2.5 text-sm font-semibold text-primary-foreground transition-transform hover:-translate-y-0.5">Try Rughound <ArrowRight className="size-4" /></a>
       </div>

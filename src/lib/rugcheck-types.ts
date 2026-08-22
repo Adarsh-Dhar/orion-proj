@@ -5,6 +5,15 @@ import type { Venue } from "./constants.js";
 
 export type RiskLevel = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
 
+/**
+ * Verdict is RiskLevel plus UNKNOWN — reserved for when scoring itself
+ * failed (e.g. the LLM call errored). This is deliberately distinct from
+ * CRITICAL: a failure is not a risk finding, and conflating the two used to
+ * silently inflate the CRITICAL bucket with tokens that were never actually
+ * evaluated.
+ */
+export type VerdictLevel = RiskLevel | "UNKNOWN";
+
 export interface RiskFlag {
   id: string;          // machine-readable key
   label: string;       // short human label
@@ -70,12 +79,14 @@ export interface RugCheckResult {
 
   // ── Scoring ────────────────────────────────────────────────────────────────
   flags: RiskFlag[];
-  score: number;                     // 0 (safe) → 100 (certain rug)
-  verdict: RiskLevel;
+  /** 0 (safe) → 100 (certain rug), 2 decimal places. -1 means scoring failed
+   *  (see verdict === "UNKNOWN") — never treat -1 as a real low-risk score. */
+  score: number;
+  verdict: VerdictLevel;
   summary: string;
 
   // ── Metadata ───────────────────────────────────────────────────────────────
-  scoringMethod?: "rules" | "llm" | "llm-agentic";
+  scoringMethod?: "rules" | "llm" | "llm-agentic" | "failed";
   scoringError?: string;             // set when LLM scoring fails
   /** Direct answer to the user's question, only present when asked via chat */
   answer?: string;

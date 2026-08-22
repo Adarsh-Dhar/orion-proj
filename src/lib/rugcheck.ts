@@ -20,6 +20,7 @@ type AnyClient = PublicClient<any>;
 
 import { collectEvidence }   from "./evidence.js";
 import { scoreWithLLM }      from "./llm-score.js";
+import { computeScore }      from "./scoring.js";
 import type { TokenEvidence } from "./evidence.js";
 import type { BotState } from "./state.js";
 import { getDeployerHistory, recordDeployerToken } from "./state.js";
@@ -30,8 +31,8 @@ import type { Venue } from "./constants.js";
 
 // ─── Re-export shared types ───────────────────────────────────────────────────
 
-export type { RiskLevel, RiskFlag, RugCheckResult } from "./rugcheck-types.js";
-import type { RiskLevel, RiskFlag, RugCheckResult } from "./rugcheck-types.js";
+export type { RiskLevel, VerdictLevel, RiskFlag, RugCheckResult } from "./rugcheck-types.js";
+import type { RiskLevel, VerdictLevel, RiskFlag, RugCheckResult } from "./rugcheck-types.js";
 
 // ─── Ambiguity detector ──────────────────────────────────────────────────────────
 
@@ -206,12 +207,18 @@ export async function runRugCheckLLM(
 
   if (!llmResult.ok) {
     console.error(`  [LLM] Scoring failed: ${llmResult.reason}`);
+    // IMPORTANT: we no longer force score=100/CRITICAL here. A scoring
+    // *failure* is not evidence of risk — faking a 100 made "100" mean
+    // "worst token" AND "Gemini timed out" indistinguishably, which both
+    // inflated the CRITICAL bucket and hid real outages. Instead we mark
+    // this analysis as UNKNOWN and surface the failure explicitly so it's
+    // never confused with a genuinely scored CRITICAL token.
     const errorFlag: RiskFlag = {
       id:       "llm_scoring_failed",
       label:    "LLM scoring failed",
-      detail:   `Gemini could not score this token: ${llmResult.reason}. Defaulting to maximum risk.`,
-      severity: "CRITICAL",
-      points:   100,
+      detail:   `Gemini could not score this token: ${llmResult.reason}. This is a scoring failure, not a risk finding.`,
+      severity: "MEDIUM",
+      points:   0,
     };
     return {
       tokenAddress, poolAddress, pairedAsset, venue: opts?.venue ?? "v3",
@@ -239,17 +246,26 @@ export async function runRugCheckLLM(
       deployerSeenBefore: evidence.deployerSeenBefore,
       deployerPriorTokens: evidence.deployerPriorTokens,
       flags:   [errorFlag],
-      score:   100,
-      verdict: "CRITICAL",
-      summary: `LLM scoring failed: ${llmResult.reason}`,
-      scoringMethod: toolCallTranscript ? "llm-agentic" : "llm",
+      score:   -1,
+      verdict: "UNKNOWN",
+      summary: `Scoring failed: ${llmResult.reason}`,
+      scoringMethod: "failed",
       scoringError:  llmResult.reason,
       toolCallTranscript,
       analysisId: undefined,
     };
   }
 
-  console.log(`  Gemini verdict: ${llmResult.verdict} (${llmResult.score}/100)`);
+  // ── Compute the authoritative, decimal-precision score deterministically ──
+  // We keep the LLM's flags/summary/verdict-reasoning (qualitative judgment)
+  // but the actual number is recomputed from raw evidence in scoring.ts so
+  // it reflects the exact percentages/amounts for THIS token rather than an
+  // LLM-guessed round integer. See scoring.ts for why this fixes clustering.
+  const computed = computeScore(evidence);
+  llmResult = { ...llmResult, score: computed.score, verdict: computed.verdict };
+
+  console.log(`  Gemini flags + deterministic score: ${llmResult.verdict} (${llmResult.score}/100)`);
+  console.log(`  Score breakdown: ${computed.breakdown.map(b => `${b.id}=${b.contribution}`).join(", ")}`);
   
   // Log tool call transcript if it exists
   if (toolCallTranscript && toolCallTranscript.length > 0) {
@@ -282,6 +298,7 @@ export async function runRugCheckLLM(
         toolCallTranscript, // undefined for single-shot runs — storage handles that gracefully
         flags: llmResult.flags,
         scoringMethod: toolCallTranscript ? "llm-agentic" : "llm",
+        scoreBreakdown: computed.breakdown,
       });
       if (storedId) {
         analysisId = storedId;
@@ -331,7 +348,7 @@ export async function runRugCheckLLM(
 
 // ─── Report formatter ─────────────────────────────────────────────────────────
 
-const VERDICT_EMOJI:  Record<RiskLevel, string> = { LOW: "🟢", MEDIUM: "🟡", HIGH: "🟠", CRITICAL: "🔴" };
+const VERDICT_EMOJI:  Record<VerdictLevel, string> = { LOW: "🟢", MEDIUM: "🟡", HIGH: "🟠", CRITICAL: "🔴", UNKNOWN: "⚪" };
 const SEVERITY_EMOJI: Record<RiskLevel, string> = { LOW: "🟢", MEDIUM: "🟡", HIGH: "🟠", CRITICAL: "🔴" };
 
 export function formatRugReport(
@@ -425,7 +442,7 @@ export function formatRugReport(
   }
   lines.push(`║`);
   lines.push(`║  ── Verdict ─────────────────────────────────────────────────`);
-  lines.push(`║  Score    : ${r.score}/100`);
+  lines.push(`║  Score    : ${r.score.toFixed(2)}/100`);
   lines.push(`║  Verdict  : ${v} ${r.verdict}`);
   lines.push(`║  Summary  : ${r.summary}`);
   lines.push(`║  BaseScan : https://basescan.org/address/${r.tokenAddress}`);
@@ -449,7 +466,7 @@ export function formatAlertCard(
   const lines: string[] = [];
 
   const venueTag = r.venue === "v4" ? " · V4" : " · V3";
-  lines.push(`${v} ${r.verdict} — ${meta.name} ($${meta.symbol})  ·  ${r.score}/100${venueTag}`);
+  lines.push(`${v} ${r.verdict} — ${meta.name} ($${meta.symbol})  ·  ${r.score.toFixed(2)}/100${venueTag}`);
   lines.push(r.summary);
 
   const topFlags = [...r.flags].sort((a, b) => b.points - a.points).slice(0, 2);
@@ -490,7 +507,7 @@ export function formatChatReply(
   }
 
   const venueTag = r.venue === "v4" ? " · V4" : " · V3";
-  lines.push(`${v} ${r.verdict}  ·  ${r.score}/100  ·  ${meta.name} ($${meta.symbol})${venueTag}`);
+  lines.push(`${v} ${r.verdict}  ·  ${r.score.toFixed(2)}/100  ·  ${meta.name} ($${meta.symbol})${venueTag}`);
 
   const topFlags = [...r.flags].sort((a, b) => b.points - a.points).slice(0, 3);
   if (topFlags.length > 0) {

@@ -7,12 +7,19 @@
  * Design principles:
  * - Never returns a default/fallback score. If the LLM call fails for any
  *   reason (missing key, network error, bad JSON, missing fields), the result
- *   is { ok: false, reason }. The caller decides what to do with a failure —
- *   typically force score=100/CRITICAL so failures never look clean.
+ *   is { ok: false, reason }. The caller marks the analysis as UNKNOWN/failed
+ *   rather than faking a clean-looking score.
  * - Strict field validation: every required field is type-checked before
  *   the result is accepted. Malformed responses are rejected outright.
  * - rpcWarnings from evidence are injected into the prompt so the LLM
  *   explicitly knows which fields could not be verified.
+ * - IMPORTANT: the `score` field returned here is advisory only. LLMs
+ *   reliably round to "clean" integers (85, 65, 45...) regardless of how
+ *   granular the evidence actually is, which causes unrelated tokens to
+ *   collide on identical scores. The authoritative, decimal-precision score
+ *   shown to users is computed deterministically in scoring.ts from the raw
+ *   evidence — see computeScore(). Callers should use flags/verdict/summary
+ *   from this module but NOT this module's `score` for display.
  */
 
 import type { TokenEvidence } from "./evidence.js";

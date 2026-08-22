@@ -2,20 +2,32 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
-import type { StoredAnalysis, RiskLevel } from './[id]/types';
+import { ArrowRight } from 'lucide-react';
+import { SiteHeader, SiteFooter } from '@/components/rughound-site';
+import type { StoredAnalysis, VerdictLevel } from './[id]/types';
 
-const SEVERITY_DOT: Record<RiskLevel, string> = {
-  LOW: 'bg-emerald-400',
-  MEDIUM: 'bg-amber-400',
-  HIGH: 'bg-orange-400',
-  CRITICAL: 'bg-red-400',
+const SEVERITY_DOT: Record<VerdictLevel, string> = {
+  LOW:      'bg-[var(--risk-low)]',
+  MEDIUM:   'bg-[var(--risk-medium)]',
+  HIGH:     'bg-[var(--risk-high)]',
+  CRITICAL: 'bg-[var(--risk-critical)]',
+  UNKNOWN:  'bg-muted-foreground',
 };
 
-const SEVERITY_TEXT: Record<RiskLevel, string> = {
-  LOW: 'text-emerald-400',
-  MEDIUM: 'text-amber-400',
-  HIGH: 'text-orange-400',
-  CRITICAL: 'text-red-400',
+const SEVERITY_TEXT: Record<VerdictLevel, string> = {
+  LOW:      'text-[var(--risk-low)]',
+  MEDIUM:   'text-[var(--risk-medium)]',
+  HIGH:     'text-[var(--risk-high)]',
+  CRITICAL: 'text-[var(--risk-critical)]',
+  UNKNOWN:  'text-muted-foreground',
+};
+
+const SEVERITY_BADGE: Record<VerdictLevel, string> = {
+  LOW:      'bg-green-50 text-green-700 border-green-200',
+  MEDIUM:   'bg-amber-50 text-amber-700 border-amber-200',
+  HIGH:     'bg-orange-50 text-orange-700 border-orange-200',
+  CRITICAL: 'bg-red-50 text-red-700 border-red-200',
+  UNKNOWN:  'bg-muted text-muted-foreground border-border',
 };
 
 export default function AnalysisListPage() {
@@ -55,89 +67,101 @@ export default function AnalysisListPage() {
   }, [analyses, query]);
 
   return (
-    <div className="min-h-screen bg-[#0B0C0E] text-[#EDEEF0]">
-      <header className="sticky top-0 z-20 border-b border-[#24272C] bg-[#0B0C0E]/90 backdrop-blur-sm">
-        <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
-          <Link href="/" className="font-[family-name:var(--font-display)] text-xl font-black tracking-tight">
-            ORION
-          </Link>
-          <span className="text-sm text-[#8B9198]">{analyses.length} analyses logged</span>
-        </div>
-      </header>
+    <div className="min-h-screen bg-background text-foreground">
+      <SiteHeader />
 
-      <main className="mx-auto max-w-6xl px-6 py-12">
-        <div className="mb-6">
-          <h1 className="font-[family-name:var(--font-display)] text-3xl font-bold tracking-tight">
-            Analysis Log
-          </h1>
-          <p className="mt-2 text-[#8B9198]">
-            Complete history of pool analyses and risk assessments
+      <main className="mx-auto max-w-6xl px-5 py-14 lg:px-8">
+        {/* Page header */}
+        <div className="mb-8">
+          <p className="eyebrow">Complete history</p>
+          <h1 className="section-title max-w-2xl">Analysis log</h1>
+          <p className="mt-4 text-muted-foreground">
+            Every pool Rughound has scored, newest first.{' '}
+            {analyses.length > 0 && (
+              <span className="font-semibold text-primary">{analyses.length.toLocaleString()} analyses logged.</span>
+            )}
           </p>
         </div>
 
+        {/* Search */}
         <div className="mb-6">
           <input
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Filter by name, symbol or address"
-            className="w-full max-w-md rounded-lg border border-[#24272C] bg-[#131519] px-4 py-2 text-sm text-[#EDEEF0] placeholder:text-[#5C6167] outline-none focus:border-[#FF6B35]/50"
+            className="w-full max-w-md rounded-xl border border-border bg-background px-4 py-2.5 text-sm text-foreground placeholder:text-muted-foreground outline-none ring-primary focus:ring-2"
           />
         </div>
 
+        {/* List */}
         {loading ? (
           <div className="space-y-2">
             {Array.from({ length: 8 }).map((_, i) => (
-              <div key={i} className="h-16 animate-pulse rounded-lg border border-[#24272C] bg-[#131519]" />
+              <div key={i} className="h-16 animate-pulse rounded-xl border border-border bg-brand-cream/40" />
             ))}
           </div>
         ) : filtered.length === 0 ? (
-          <div className="rounded-lg border border-dashed border-[#24272C] px-6 py-14 text-center">
-            <p className="text-[#8B9198]">
+          <div className="rounded-2xl border border-dashed border-border px-6 py-14 text-center">
+            <p className="text-muted-foreground">
               {query.trim().length > 0
-                ? "No analyses match that filter."
-                : "No analyses logged yet."}
+                ? 'No analyses match that filter.'
+                : 'No analyses logged yet.'}
             </p>
           </div>
         ) : (
-          <div className="divide-y divide-[#1A1D21] overflow-hidden rounded-lg border border-[#24272C]">
+          <div className="divide-y divide-border overflow-hidden rounded-2xl border border-border bg-background shadow-sm">
             {filtered.map((a) => (
               <AnalysisRow key={a.id} analysis={a} />
             ))}
           </div>
         )}
       </main>
+
+      <SiteFooter />
     </div>
   );
 }
 
 function AnalysisRow({ analysis }: { analysis: StoredAnalysis }) {
-  const verdict = (analysis.verdict as RiskLevel) in SEVERITY_TEXT ? (analysis.verdict as RiskLevel) : 'MEDIUM';
-  
+  const verdict = (analysis.verdict as VerdictLevel) in SEVERITY_TEXT
+    ? (analysis.verdict as VerdictLevel)
+    : 'MEDIUM';
+  const scoringFailed = verdict === 'UNKNOWN' || analysis.score < 0;
+  const date = new Date(analysis.timestamp);
+  const dateStr = date.toLocaleDateString(undefined, { day: '2-digit', month: '2-digit', year: '2-digit' });
+  const timeStr = date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+
   return (
     <Link
       href={`/analysis/${analysis.id}`}
-      className="flex items-center gap-4 bg-[#131519] px-5 py-4 transition-colors hover:bg-[#181B1F]"
+      className="flex items-center gap-4 px-5 py-4 transition-colors hover:bg-brand-cream/50"
     >
       <span className={`h-2 w-2 flex-shrink-0 rounded-full ${SEVERITY_DOT[verdict]}`} />
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
-          <span className="truncate font-medium text-[#EDEEF0]">{analysis.tokenName}</span>
-          <span className="flex-shrink-0 font-mono text-xs text-[#5C6167]">${analysis.tokenSymbol}</span>
+          <span className="truncate font-medium text-foreground">{analysis.tokenName}</span>
+          <span className="flex-shrink-0 font-mono text-xs text-muted-foreground">${analysis.tokenSymbol}</span>
           {analysis.venue && (
-            <span className="flex-shrink-0 rounded border border-[#24272C] px-1.5 py-0.5 font-mono text-[10px] uppercase text-[#8B9198]">
+            <span className="flex-shrink-0 rounded border border-border px-1.5 py-0.5 font-mono text-[10px] uppercase text-muted-foreground">
               {analysis.venue}
             </span>
           )}
         </div>
-        <p className="mt-0.5 truncate text-sm text-[#8B9198]">{analysis.summary}</p>
+        <p className="mt-0.5 truncate text-sm text-muted-foreground">{analysis.summary}</p>
       </div>
-      <span className={`flex-shrink-0 font-mono text-sm font-semibold ${SEVERITY_TEXT[verdict]}`}>
-        {analysis.score}
-      </span>
-      <span className="flex-shrink-0 font-mono text-xs text-[#5C6167]">
-        {new Date(analysis.timestamp).toLocaleDateString()}
-      </span>
+      <div className="flex flex-shrink-0 items-center gap-3">
+        <span className={`hidden rounded-full border px-2.5 py-0.5 font-mono text-xs font-semibold sm:inline-block ${SEVERITY_BADGE[verdict]}`}>
+          {verdict}
+        </span>
+        <span className={`font-mono text-sm font-semibold sm:hidden ${SEVERITY_TEXT[verdict]}`}>
+          {scoringFailed ? '—' : analysis.score.toFixed(2)}
+        </span>
+      </div>
+      <div className="flex-shrink-0 text-right">
+        <div className="font-mono text-xs text-muted-foreground">{dateStr}</div>
+        <div className="font-mono text-xs text-muted-foreground">{timeStr}</div>
+      </div>
     </Link>
   );
 }

@@ -68,6 +68,17 @@ type AnyClient = PublicClient<any>;
  *  Alchemy free tier: 10 blocks. PAYG / Growth: raise to 500 or 2000. */
 const SCAN_CHUNK   = 10n;
 const MAX_LOOKBACK = 200_000n;
+
+/**
+ * Window used when searching for the initial LP-add event (Mint on V3,
+ * ModifyLiquidity on V4).  On Base (~2 s/block) this is roughly 15–20 min,
+ * which is wide enough to catch deployers who add liquidity well after pool
+ * creation, while still being a bounded single getLogs call.
+ *
+ * NOTE: this exceeds Alchemy free-tier limits (10 blocks) so it makes
+ * multiple chunked requests internally — see checkLpLockStatusV3/V4.
+ */
+const LP_LOCK_SCAN_WINDOW = 500n;
 const ZERO_SLOT    =
   "0x0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -635,17 +646,38 @@ async function checkLpLockStatusV3(
   warnings: string[]
 ): Promise<{ lpTokenId: string | null; lpPositionOwner: string | null; lpPositionStatus: TokenEvidence["lpPositionStatus"] }> {
   try {
-    const mintLogs = await client.getLogs({
-      address: poolAddress,
-      event: POOL_MINT_EVENT_ABI[0],
-      fromBlock: deployBlock,
-      toBlock: deployBlock + SCAN_CHUNK - 1n,
-    });
-    if (mintLogs.length === 0) {
-      return { lpTokenId: null, lpPositionOwner: null, lpPositionStatus: "unverified" };
+    // Scan LP_LOCK_SCAN_WINDOW blocks in SCAN_CHUNK-sized requests (Alchemy free
+    // tier only allows 10 blocks per getLogs call).  We stop at the first Mint
+    // event rather than scanning the whole window every time.
+    const scanEnd = deployBlock + LP_LOCK_SCAN_WINDOW - 1n;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let mintLog: any | undefined;
+
+    for (
+      let chunkStart = deployBlock;
+      chunkStart <= scanEnd && !mintLog;
+      chunkStart += SCAN_CHUNK
+    ) {
+      const chunkEnd = chunkStart + SCAN_CHUNK - 1n < scanEnd
+        ? chunkStart + SCAN_CHUNK - 1n
+        : scanEnd;
+      try {
+        const logs = await client.getLogs({
+          address: poolAddress,
+          event: POOL_MINT_EVENT_ABI[0],
+          fromBlock: chunkStart,
+          toBlock: chunkEnd,
+        });
+        if (logs.length > 0) mintLog = logs[0];
+      } catch (err) {
+        warn(warnings, "lpLock", `V3 Mint scan chunk [${chunkStart}, ${chunkEnd}] failed`, err);
+        break;
+      }
     }
 
-    const mintLog  = mintLogs[0];
+    if (!mintLog) {
+      return { lpTokenId: null, lpPositionOwner: null, lpPositionStatus: "unverified" };
+    }
     const mintOwner = (mintLog.args as { owner: string }).owner;
 
     if (mintOwner.toLowerCase() !== UNISWAP_V3_POSITION_MANAGER.toLowerCase()) {
@@ -693,25 +725,39 @@ async function checkLpLockStatusV4(
   // We look within a generous window (deploy block + 500) to catch the initial
   // liquidity add, then check whether the same sender later pulled it.
   try {
-    const scanTo = deployBlock + SCAN_CHUNK - 1n;
-
-    const addLogs = await client.getLogs({
-      address: UNISWAP_V4_POOL_MANAGER as Address,
-      event:   V4_MODIFY_LIQUIDITY_EVENT_ABI[0],
-      // No args filter — bytes32 topic filter rejected by Alchemy free tier.
-      // Filter by poolId client-side after fetching.
-      fromBlock: deployBlock,
-      toBlock:   scanTo,
-    });
+    // Scan up to LP_LOCK_SCAN_WINDOW blocks in SCAN_CHUNK-sized chunks for the
+    // initial ModifyLiquidity add event.  Stop at first positive-delta match.
+    const scanEnd = deployBlock + LP_LOCK_SCAN_WINDOW - 1n;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let firstAdd: any | undefined;
     const poolIdLower = poolId.toLowerCase();
-    const poolAddLogs = addLogs.filter(
-      (l) => (l.args as { id: string }).id?.toLowerCase() === poolIdLower
-    );
 
-    // Find the first event with a positive liquidityDelta (initial LP add)
-    const firstAdd = poolAddLogs.find(
-      (l) => (l.args as { liquidityDelta: bigint }).liquidityDelta > 0n
-    );
+    for (
+      let chunkStart = deployBlock;
+      chunkStart <= scanEnd && !firstAdd;
+      chunkStart += SCAN_CHUNK
+    ) {
+      const chunkEnd = chunkStart + SCAN_CHUNK - 1n < scanEnd
+        ? chunkStart + SCAN_CHUNK - 1n
+        : scanEnd;
+      try {
+        const addLogs = await client.getLogs({
+          address: UNISWAP_V4_POOL_MANAGER as Address,
+          event:   V4_MODIFY_LIQUIDITY_EVENT_ABI[0],
+          fromBlock: chunkStart,
+          toBlock:   chunkEnd,
+        });
+        const poolAddLogs = (addLogs as unknown[]).filter(
+          (l: unknown) => ((l as { args: { id: string } }).args?.id?.toLowerCase() === poolIdLower)
+        );
+        firstAdd = (poolAddLogs as unknown[]).find(
+          (l: unknown) => ((l as { args: { liquidityDelta: bigint } }).args?.liquidityDelta ?? 0n) > 0n
+        );
+      } catch (err) {
+        warn(warnings, "lpLock", `V4 add-scan chunk [${chunkStart}, ${chunkEnd}] failed`, err);
+        break;
+      }
+    }
     if (!firstAdd) {
       return { lpTokenId: null, lpPositionOwner: null, lpPositionStatus: "unverified" };
     }
@@ -1552,4 +1598,179 @@ export async function collectEvidence(
 
     rpcWarnings: warnings,
   };
+}
+
+// ─── Re-verification pass ─────────────────────────────────────────────────────
+
+/**
+ * Fields that the re-verification pass can improve.
+ * Returned by reVerifyEvidence(); caller decides which to apply.
+ */
+export interface ReVerifyResult {
+  /** Updated LP lock fields — only present when they changed from "unverified". */
+  lpPositionStatus?: TokenEvidence["lpPositionStatus"];
+  lpTokenId?: string | null;
+  lpPositionOwner?: string | null;
+  /** Updated pool liquidity — only present when the pool now has liquidity. */
+  poolLiquidity?: string | null;
+  liquidityLocked?: boolean | null;
+  initialLiquidityEth?: number | null;
+  /** True if any field improved vs the original snapshot. */
+  improved: boolean;
+  warnings: string[];
+}
+
+/**
+ * Lightweight re-check that only re-runs the two fields most likely to be
+ * wrong on a first-pass analysis run too close to pool creation:
+ *
+ *   1. LP lock status — was "unverified" because the Mint/ModifyLiquidity
+ *      event hadn't landed yet.  Now re-scanned with a fresh block window.
+ *
+ *   2. Pool liquidity / initialLiquidityEth — was 0 / null because the
+ *      LP-add tx hadn't been mined yet at evidence-collection time.
+ *
+ * Everything else (holder scan, source check, trade activity, sell test) is
+ * left untouched — those reads are expensive and their values don't change in
+ * the first few minutes.
+ *
+ * @param original     The TokenEvidence from the first pass.
+ * @param deployBlock  Pool deploy block (bigint).
+ * @param venue        "v3" or "v4".
+ * @param v4PoolParams V4-only: needed to call StateView.getLiquidity(poolId).
+ */
+export async function reVerifyEvidence(
+  client: AnyClient,
+  original: TokenEvidence,
+  deployBlock: bigint,
+  venue: Venue,
+  v4PoolParams?: {
+    currency0: Address;
+    currency1: Address;
+    fee: number;
+    tickSpacing: number;
+    hooks: Address;
+  }
+): Promise<ReVerifyResult> {
+  const warnings: string[] = [];
+  const poolAddress = original.poolAddress as Address;
+  const result: ReVerifyResult = { improved: false, warnings };
+
+  // ── 1. Re-check LP lock status if the first pass came back "unverified" ──
+  if (original.lpPositionStatus === "unverified") {
+    try {
+      const lpLock = await checkLpLockStatus(
+        client, poolAddress, deployBlock, warnings, venue
+      );
+      if (lpLock.lpPositionStatus !== "unverified") {
+        result.lpPositionStatus = lpLock.lpPositionStatus;
+        result.lpTokenId        = lpLock.lpTokenId;
+        result.lpPositionOwner  = lpLock.lpPositionOwner;
+        result.improved = true;
+        console.log(
+          `  [reverify] LP lock upgraded: unverified → ${lpLock.lpPositionStatus}` +
+          (lpLock.lpPositionOwner ? ` (owner: ${lpLock.lpPositionOwner})` : "")
+        );
+      } else {
+        console.log(`  [reverify] LP lock still unverified — no Mint/ModifyLiquidity found yet`);
+      }
+    } catch (err) {
+      warn(warnings, "reverify:lpLock", "LP lock re-check failed", err);
+    }
+  }
+
+  // ── 2. Re-check pool liquidity if the first pass read 0 or null ───────────
+  const firstPassLiqZero =
+    original.poolLiquidity === null ||
+    original.poolLiquidity === "0" ||
+    BigInt(original.poolLiquidity ?? "0") === 0n;
+
+  if (firstPassLiqZero) {
+    try {
+      let poolLiquidityRaw: bigint | null = null;
+      let initialLiquidityEth: number | null = null;
+      let liquidityLocked: boolean | null = null;
+
+      if (venue === "v4") {
+        // V4: read StateView.getLiquidity(poolId) + getSlot0(poolId)
+        try {
+          poolLiquidityRaw = await client.readContract({
+            address: UNISWAP_V4_STATE_VIEW as Address,
+            abi:     V4_STATE_VIEW_LIQUIDITY_ABI,
+            functionName: "getLiquidity",
+            args:    [poolAddress],
+          }) as bigint;
+        } catch (err) {
+          warn(warnings, "reverify:liquidity", "V4 getLiquidity failed", err);
+        }
+
+        if (poolLiquidityRaw && poolLiquidityRaw > 0n) {
+          try {
+            const slot0 = await client.readContract({
+              address: UNISWAP_V4_STATE_VIEW as Address,
+              abi:     V4_STATE_VIEW_SLOT0_ABI,
+              functionName: "getSlot0",
+              args:    [poolAddress],
+            }) as readonly [bigint, ...unknown[]];
+            const sqrtPriceX96 = slot0[0];
+            if (sqrtPriceX96 > 0n) {
+              const Q96 = 2n ** 96n;
+              const raw = Number(formatEther((poolLiquidityRaw * Q96) / sqrtPriceX96));
+              initialLiquidityEth = raw > 100_000 ? null : raw;
+            }
+          } catch (err) {
+            warn(warnings, "reverify:slot0", "V4 getSlot0 failed", err);
+          }
+          liquidityLocked = null; // will be set by LP lock check above if applicable
+        }
+      } else {
+        // V3: read pool.liquidity() + pool.slot0()
+        try {
+          poolLiquidityRaw = await client.readContract({
+            address: poolAddress,
+            abi:     POOL_LIQUIDITY_ABI,
+            functionName: "liquidity",
+          }) as bigint;
+        } catch (err) {
+          warn(warnings, "reverify:liquidity", "V3 pool.liquidity() failed", err);
+        }
+
+        if (poolLiquidityRaw && poolLiquidityRaw > 0n) {
+          try {
+            const slot0 = await client.readContract({
+              address: poolAddress,
+              abi:     POOL_SLOT0_ABI,
+              functionName: "slot0",
+            }) as readonly [bigint, ...unknown[]];
+            const sqrtPriceX96 = slot0[0];
+            if (sqrtPriceX96 > 0n) {
+              const Q96 = 2n ** 96n;
+              const raw = Number(formatEther((poolLiquidityRaw * Q96) / sqrtPriceX96));
+              initialLiquidityEth = raw > 100_000 ? null : raw;
+            }
+          } catch (err) {
+            warn(warnings, "reverify:slot0", "V3 slot0 failed", err);
+          }
+          liquidityLocked = null;
+        }
+      }
+
+      if (poolLiquidityRaw !== null && poolLiquidityRaw > 0n) {
+        result.poolLiquidity      = poolLiquidityRaw.toString();
+        result.initialLiquidityEth = initialLiquidityEth;
+        result.liquidityLocked    = liquidityLocked;
+        result.improved = true;
+        console.log(
+          `  [reverify] Liquidity updated: 0 → ${poolLiquidityRaw}` +
+          (initialLiquidityEth !== null ? ` (~${initialLiquidityEth.toFixed(4)} ETH)` : "")
+        );
+      } else {
+        console.log(`  [reverify] Pool liquidity still 0 — LP add not yet confirmed`);
+      }
+    } catch (err) {
+      warn(warnings, "reverify:liquidity", "liquidity re-check failed", err);
+    }
+  }
+
+  return result;
 }

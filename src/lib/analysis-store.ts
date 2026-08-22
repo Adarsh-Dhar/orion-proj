@@ -203,3 +203,62 @@ export async function getMultipleAnalyses(ids: string[]): Promise<StoredAnalysis
     return [];
   }
 }
+
+/**
+ * Patch an existing stored analysis with updated fields.
+ *
+ * Only the keys present in `patch` are overwritten — everything else in the
+ * stored record is preserved.  Used by the re-verification pass to update
+ * LP-lock status and initial liquidity after the grace period has elapsed.
+ *
+ * Special key: if `patch.evidencePatch` is present (a plain object), its keys
+ * are deep-merged into the stored record's `evidence` field rather than
+ * replacing it wholesale.  This lets callers update individual evidence fields
+ * without fetching the full evidence object first.
+ *
+ * Returns true if the record was found and updated, false otherwise.
+ */
+export async function updateAnalysis(
+  analysisId: string,
+  patch: Partial<Omit<StoredAnalysis, "id" | "timestamp">> & {
+    /** Merged into stored evidence instead of replacing it. */
+    evidencePatch?: Record<string, unknown>;
+  }
+): Promise<boolean> {
+  const client = getRedisClient();
+  if (!client) return false;
+
+  try {
+    const existing = await getAnalysis(analysisId);
+    if (!existing) {
+      console.warn(`[analysis-store] updateAnalysis: record ${analysisId} not found`);
+      return false;
+    }
+
+    // Pull out evidencePatch before spreading so it doesn't land on the top-level record
+    const { evidencePatch, ...topLevelPatch } = patch as typeof patch & { evidencePatch?: Record<string, unknown> };
+
+    const updated: StoredAnalysis = {
+      ...existing,
+      ...topLevelPatch,
+      // Deep-merge evidence patch if provided
+      ...(evidencePatch
+        ? { evidence: { ...existing.evidence, ...evidencePatch } as typeof existing.evidence }
+        : {}),
+    };
+
+    await client.set(`analysis:${analysisId}`, updated, {
+      ex: 2592000, // reset 30-day TTL
+    });
+
+    const patchedKeys = [
+      ...Object.keys(topLevelPatch),
+      ...(evidencePatch ? [`evidence.{${Object.keys(evidencePatch).join(",")}}`] : []),
+    ];
+    console.log(`[analysis-store] Updated analysis ${analysisId} (fields: ${patchedKeys.join(", ")})`);
+    return true;
+  } catch (err) {
+    console.error(`[analysis-store] Failed to update analysis ${analysisId}:`, err);
+    return false;
+  }
+}

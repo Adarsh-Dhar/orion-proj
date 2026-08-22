@@ -294,11 +294,6 @@ async function main(): Promise<void> {
   console.log(`${"═".repeat(66)}\n`);
 
   // Run the first scan immediately, then schedule the recurring loop
-  await sniperTick().catch((err) =>
-    console.error(`[sniper] Fatal on first run: ${err}`)
-  );
-  setTimeout(() => loop(sniperTick, SNIPER_INTERVAL_MS), SNIPER_INTERVAL_MS);
-
   // Register command menu for Telegram's native "/" autocomplete
   await bot.api.setMyCommands([
     { command: "start", description: "Show welcome message" },
@@ -306,8 +301,15 @@ async function main(): Promise<void> {
     { command: "full", description: "Get full detailed report" },
   ]).catch((err) => console.error("[bot] Failed to set commands:", err));
 
-  // Start the bot for handling chat messages
+  // Start grammy polling FIRST so chat messages are handled immediately,
+  // even while the sniper is running its first (potentially long) scan.
   bot.start();
+
+  // Kick off the sniper in the background — do NOT await so bot.start()
+  // can begin receiving messages right away.
+  sniperTick()
+    .catch((err) => console.error(`[sniper] Fatal on first run: ${err}`))
+    .then(() => setTimeout(() => loop(sniperTick, SNIPER_INTERVAL_MS), SNIPER_INTERVAL_MS));
 
   process.on("SIGINT", () => {
     console.log("\n[bot] Shutting down — saving state…");

@@ -22,6 +22,8 @@ import {
 } from "./constants.js";
 import { fetchTokenMetadata } from "./erc20.js";
 import { runRugCheckLLM, formatRugReport } from "./rugcheck.js";
+import { reVerifyEvidence } from "./evidence.js";
+import { updateAnalysis } from "./analysis-store.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = PublicClient<any>;
@@ -190,57 +192,69 @@ export async function resolveTokenPool(
     }
   }
 
-  // ── V4 path — scan recent Initialize events to find a matching pool ──────
-  // We look back ~100k blocks (≈ 5 days on Base) for an Initialize event
-  // where one of the currencies matches the token address.
+  // ── V4 path — scan Initialize events near the token's deploy block ──────
+  // Strategy:
+  //   1. Binary-search the token contract's deploy block (fast, ~26 RPC calls).
+  //   2. Scan deployBlock-10 → deployBlock+200 for a V4 Initialize event that
+  //      contains this token as currency0 or currency1.
+  //      On Base, pools are almost always initialized within a few blocks of
+  //      token deployment.  200 blocks ≈ 7 minutes — enough headroom.
+  //   3. If still not found, do one wider backward pass: deployBlock-500 → deployBlock-10
+  //      to catch tokens that were deployed long before their pool was created.
+  //
+  // Total worst-case: (210 + 490) / 10 = 70 getLogs calls vs the old 10,000.
   try {
+    const deployBlock  = await findContractDeployBlock(client, tokenAddress);
     const currentBlock = await client.getBlockNumber();
-    const lookback     = 100_000n;
-    const fromBlock    = currentBlock > lookback ? currentBlock - lookback : 0n;
-    const CHUNK        = 10n; // Alchemy free tier: max 10 blocks per eth_getLogs
+    const CHUNK        = 10n;
 
-    for (let chunkStart = fromBlock; chunkStart <= currentBlock; chunkStart += CHUNK) {
-      const chunkEnd = chunkStart + CHUNK - 1n < currentBlock ? chunkStart + CHUNK - 1n : currentBlock;
-      try {
-        const logs = await client.getLogs({
-          address: UNISWAP_V4_POOL_MANAGER,
-          event:   V4_INITIALIZE_ABI[0],
-          fromBlock: chunkStart,
-          toBlock:   chunkEnd,
-        });
-
-        for (const log of logs) {
-          const { id, currency0, currency1, fee, tickSpacing, hooks } = log.args as {
-            id: `0x${string}`;
-            currency0: Address;
-            currency1: Address;
-            fee: number;
-            tickSpacing: number;
-            hooks: Address;
-          };
-
-          const c0 = currency0.toLowerCase();
-          const c1 = currency1.toLowerCase();
-          const t  = tokenAddress.toLowerCase();
-
-          if (c0 !== t && c1 !== t) continue;
-
-          // Determine the paired asset and its label
-          const pairedAddr   = (c0 === t ? currency1 : currency0);
-          const pairedLower  = pairedAddr.toLowerCase();
-          const pairedLabel  = QUOTE_ASSET_LABELS[pairedLower] ?? shortAddr(pairedAddr);
-
-          return {
-            poolAddress: id as Address,  // poolId used as the pool identifier
-            pairedLabel,
-            pairedAsset: pairedAddr,
-            venue: "v4",
-          };
+    // Helper: scan a [from, to] range for a matching Initialize event
+    const scanRange = async (from: bigint, to: bigint): Promise<ResolvedPool | null> => {
+      const scanTo = to < currentBlock ? to : currentBlock;
+      for (let chunkStart = from; chunkStart <= scanTo; chunkStart += CHUNK) {
+        const chunkEnd = chunkStart + CHUNK - 1n < scanTo ? chunkStart + CHUNK - 1n : scanTo;
+        try {
+          const logs = await client.getLogs({
+            address: UNISWAP_V4_POOL_MANAGER,
+            event:   V4_INITIALIZE_ABI[0],
+            fromBlock: chunkStart,
+            toBlock:   chunkEnd,
+          });
+          for (const log of logs) {
+            const { id, currency0, currency1 } = log.args as {
+              id: `0x${string}`; currency0: Address; currency1: Address;
+              fee: number; tickSpacing: number; hooks: Address;
+            };
+            const c0 = currency0.toLowerCase();
+            const c1 = currency1.toLowerCase();
+            const t  = tokenAddress.toLowerCase();
+            if (c0 !== t && c1 !== t) continue;
+            const pairedAddr  = c0 === t ? currency1 : currency0;
+            const pairedLower = pairedAddr.toLowerCase();
+            const pairedLabel = QUOTE_ASSET_LABELS[pairedLower] ?? shortAddr(pairedAddr);
+            return { poolAddress: id as Address, pairedLabel, pairedAsset: pairedAddr, venue: "v4" };
+          }
+        } catch {
+          // chunk failed — keep scanning
         }
-      } catch {
-        // chunk failed — keep scanning
+        await sleep(150);
       }
-      await sleep(150); // respect Alchemy free tier rate limit
+      return null;
+    };
+
+    // Pass 1: forward scan from (deployBlock-10) to (deployBlock+200)
+    const forwardFrom = deployBlock > 10n ? deployBlock - 10n : 0n;
+    const forwardTo   = deployBlock + 200n;
+    const forwardHit  = await scanRange(forwardFrom, forwardTo);
+    if (forwardHit) return forwardHit;
+
+    // Pass 2: backward scan (deployBlock-500) to (deployBlock-11) for tokens
+    // whose pool was created well before or after deployment
+    if (deployBlock > 11n) {
+      const backwardFrom = deployBlock > 500n ? deployBlock - 500n : 0n;
+      const backwardTo   = deployBlock - 11n;
+      const backwardHit  = await scanRange(backwardFrom, backwardTo);
+      if (backwardHit) return backwardHit;
     }
   } catch {
     // V4 scan failed entirely — fall through to null
@@ -473,6 +487,13 @@ export async function scanBlockRange(
       continue;
     }
 
+    // Grace delay — give the deployer's LP-add transaction time to land before
+    // evidence collection starts.  On Base (~2 s/block) 30 s ≈ 15 blocks, which
+    // combined with the new LP_LOCK_SCAN_WINDOW covers the vast majority of pools
+    // that add liquidity within the first few minutes of creation.
+    console.log(`  [scan-engine] Waiting 30 s before evidence collection (grace period for LP add)…`);
+    await sleep(30_000);
+
     // Run LLM rug check
     let rugResult;
     try {
@@ -501,6 +522,81 @@ export async function scanBlockRange(
       } catch (err) {
         console.error(`  [scan-engine] onResult callback failed for ${newToken}: ${err}`);
       }
+    }
+
+    // ── Deferred re-verification pass ────────────────────────────────────────
+    // If the initial analysis has an unverified LP lock or zero liquidity,
+    // schedule a recheck 3 minutes later.  By then the deployer's LP-add tx
+    // has almost always landed even on slow signers.  The recheck runs in the
+    // background — it never blocks the scan loop.
+    const analysisId  = rugResult.analysisId;
+    const needsRecheck =
+      analysisId &&
+      (rugResult.lpPositionStatus === "unverified" ||
+        rugResult.poolLiquidity === null ||
+        rugResult.poolLiquidity === 0n);
+
+    if (needsRecheck) {
+      const recheckDelay = 3 * 60_000; // 3 minutes
+      console.log(
+        `  [scan-engine] Scheduling re-verification for ${newToken} in 3 min` +
+        ` (lpStatus=${rugResult.lpPositionStatus}, liq=${rugResult.poolLiquidity?.toString() ?? "null"})`
+      );
+      setTimeout(async () => {
+        try {
+          console.log(`\n  [reverify] Starting re-verification for ${newToken} (id: ${analysisId})`);
+
+          // Build a minimal TokenEvidence stub from the fields already on rugResult —
+          // reVerifyEvidence only reads poolAddress, lpPositionStatus and poolLiquidity
+          // from the original evidence; everything else is re-fetched live.
+          const evidenceStub = {
+            poolAddress:      rugResult.poolAddress as string,
+            lpPositionStatus: rugResult.lpPositionStatus,
+            poolLiquidity:    rugResult.poolLiquidity !== null
+              ? rugResult.poolLiquidity.toString()
+              : null,
+          } as import("./evidence.js").TokenEvidence;
+
+          const recheck = await reVerifyEvidence(
+            client as AnyClient,
+            evidenceStub,
+            blockNum,
+            venue,
+            v4PoolParams
+          );
+
+          if (!recheck.improved) {
+            console.log(`  [reverify] No improvement found for ${newToken} — record unchanged`);
+            return;
+          }
+
+          // Build the evidence patch — only include fields that actually changed
+          const evidencePatch: Record<string, unknown> = {};
+          if (recheck.lpPositionStatus !== undefined) {
+            evidencePatch.lpPositionStatus = recheck.lpPositionStatus;
+            evidencePatch.lpTokenId        = recheck.lpTokenId ?? null;
+            evidencePatch.lpPositionOwner  = recheck.lpPositionOwner ?? null;
+          }
+          if (recheck.poolLiquidity !== undefined) {
+            evidencePatch.poolLiquidity       = recheck.poolLiquidity;
+            evidencePatch.initialLiquidityEth = recheck.initialLiquidityEth ?? null;
+            evidencePatch.liquidityLocked     = recheck.liquidityLocked ?? null;
+          }
+
+          await updateAnalysis(analysisId, {
+            // evidencePatch is deep-merged into the stored evidence object by updateAnalysis
+            ...(Object.keys(evidencePatch).length > 0 ? { evidencePatch } : {}),
+            // Surface LP status at the top level for the list view
+            ...(recheck.lpPositionStatus !== undefined
+              ? { lpPositionStatus: recheck.lpPositionStatus } as never
+              : {}),
+          });
+
+          console.log(`  [reverify] Record ${analysisId} patched for ${newToken}`);
+        } catch (err) {
+          console.error(`  [reverify] Re-verification failed for ${newToken}: ${err}`);
+        }
+      }, recheckDelay);
     }
 
     summary.push({

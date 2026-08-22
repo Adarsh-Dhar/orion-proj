@@ -29,7 +29,24 @@ async function sendFullReport(
   if (!chatId) return;
 
   await ctx.api.sendMessage(chatId, "Running full on-chain rug check…");
-  const outcome = await answerTokenQuestion(client, address as `0x${string}`, undefined, "chat", state);
+
+  const TIMEOUT_MS = 3 * 60_000;
+  let outcome: Awaited<ReturnType<typeof answerTokenQuestion>>;
+  try {
+    outcome = await Promise.race([
+      answerTokenQuestion(client, address as `0x${string}`, undefined, "chat", state),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Analysis timed out after 3 minutes")), TIMEOUT_MS)
+      ),
+    ]);
+  } catch (err) {
+    await ctx.api.sendMessage(
+      chatId,
+      `Couldn't check that token: ${err instanceof Error ? err.message : String(err)}`
+    );
+    return;
+  }
+
   if ("error" in outcome) {
     await ctx.api.sendMessage(chatId, `Couldn't check that token: ${outcome.error}`);
     return;
@@ -109,13 +126,30 @@ export function registerChatHandler(bot: Bot<any>, client: AnyClient, state?: Bo
 
     await ctx.api.sendMessage(chatId, "Running on-chain rug check…");
 
-    const outcome = await answerTokenQuestion(
-      client,
-      address,
-      question.length > 0 ? question : undefined,
-      "chat",
-      state
-    );
+    // Wrap the full pipeline in a 3-minute timeout so the user always gets
+    // a reply — without this, a hung RPC call silently swallows the response.
+    const TIMEOUT_MS = 3 * 60_000;
+    let outcome: Awaited<ReturnType<typeof answerTokenQuestion>>;
+    try {
+      outcome = await Promise.race([
+        answerTokenQuestion(
+          client,
+          address,
+          question.length > 0 ? question : undefined,
+          "chat",
+          state
+        ),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("Analysis timed out after 3 minutes")), TIMEOUT_MS)
+        ),
+      ]);
+    } catch (err) {
+      await ctx.api.sendMessage(
+        chatId,
+        `Couldn't check that token: ${err instanceof Error ? err.message : String(err)}`
+      );
+      return;
+    }
 
     if ("error" in outcome) {
       await ctx.api.sendMessage(chatId, `Couldn't check that token: ${outcome.error}`);

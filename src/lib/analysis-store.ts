@@ -154,3 +154,48 @@ export async function getLatestAnalysis(tokenAddress: string): Promise<StoredAna
     return null;
   }
 }
+
+/**
+ * Retrieve all analysis IDs (for the list view).
+ * Returns an array of analysis IDs, empty array if none found or on error.
+ */
+export async function getAllAnalysisIds(): Promise<string[]> {
+  const client = getRedisClient();
+  if (!client) return [];
+  
+  try {
+    const keys = await client.keys("analysis:*");
+    if (!keys) return [];
+    
+    // Extract analysis IDs from keys (remove "analysis:" prefix)
+    return keys.map((key) => key.replace("analysis:", ""));
+  } catch (err) {
+    console.error("[analysis-store] Failed to retrieve analysis IDs:", err);
+    return [];
+  }
+}
+
+/**
+ * Retrieve multiple analyses by their IDs.
+ * Returns an array of StoredAnalysis objects (excluding any that failed to load).
+ */
+export async function getMultipleAnalyses(ids: string[]): Promise<StoredAnalysis[]> {
+  const client = getRedisClient();
+  if (!client) return [];
+  
+  try {
+    const analyses: StoredAnalysis[] = [];
+    
+    for (const id of ids) {
+      const analysis = await getAnalysis(id);
+      if (analysis) {
+        analyses.push(analysis);
+      }
+    }
+    
+    return analyses;
+  } catch (err) {
+    console.error("[analysis-store] Failed to retrieve multiple analyses:", err);
+    return [];
+  }
+}

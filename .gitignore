@@ -48,6 +48,7 @@ temp/
 *.json
 !package.json
 !package-lock.json
+!tsconfig.json
 
 # Lock files (optional - remove if you want to commit them)
 # package-lock.json

@@ -303,7 +303,11 @@ async function main(): Promise<void> {
 
   // Start grammy polling FIRST so chat messages are handled immediately,
   // even while the sniper is running its first (potentially long) scan.
-  bot.start();
+  bot.start({
+    allowed_updates: ["message", "callback_query", "inline_query"], // Only process relevant updates
+    drop_pending_updates: true, // Drop any pending updates on startup
+  });
+  console.log("[bot] Telegram polling started");
 
   // Kick off the sniper in the background — do NOT await so bot.start()
   // can begin receiving messages right away.

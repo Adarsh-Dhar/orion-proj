@@ -22,26 +22,48 @@ import {
   fmtPct,
 } from './components';
 
+// How often to re-poll the backend for a fresher copy of this analysis.
+// The re-verification watcher (npm run watch-analysis) patches the stored
+// record in the background; polling here is what surfaces those patches
+// without the user having to manually refresh the page.
+const POLL_INTERVAL_MS = 15_000;
+
 export default function AnalysisPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const [analysis, setAnalysis] = useState<StoredAnalysis | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
 
   useEffect(() => {
-    async function loadAnalysis() {
+    let cancelled = false;
+
+    async function loadAnalysis(isInitial: boolean) {
       try {
-        const res = await fetch(`/api/analysis/${id}`);
+        const res = await fetch(`/api/analysis/${id}`, { cache: 'no-store' });
         if (!res.ok) throw new Error('Failed to load analysis');
         const data = await res.json();
+        if (cancelled) return;
         setAnalysis(data);
+        setLastUpdated(new Date());
+        setError(null);
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'Unknown error');
+        if (cancelled) return;
+        // Don't blow away already-loaded data on a transient poll failure —
+        // only surface the error state if we never managed to load anything.
+        if (isInitial) setError(err instanceof Error ? err.message : 'Unknown error');
       } finally {
-        setLoading(false);
+        if (isInitial && !cancelled) setLoading(false);
       }
     }
-    loadAnalysis();
+
+    loadAnalysis(true);
+    const intervalId = setInterval(() => loadAnalysis(false), POLL_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      clearInterval(intervalId);
+    };
   }, [id]);
 
   if (loading) {
@@ -87,12 +109,23 @@ export default function AnalysisPage({ params }: { params: Promise<{ id: string 
       <main className="mx-auto max-w-6xl px-5 py-12 lg:px-8 space-y-6">
 
         {/* Breadcrumb */}
-        <Link
-          href="/analysis"
-          className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-primary transition-colors"
-        >
-          <ArrowLeft className="size-3.5" /> Analysis log
-        </Link>
+        <div className="flex items-center justify-between gap-4">
+          <Link
+            href="/analysis"
+            className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-primary transition-colors"
+          >
+            <ArrowLeft className="size-3.5" /> Analysis log
+          </Link>
+          {lastUpdated && (
+            <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+              <span className="relative flex size-2">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                <span className="relative inline-flex size-2 rounded-full bg-emerald-500" />
+              </span>
+              Live · updated {lastUpdated.toLocaleTimeString()}
+            </span>
+          )}
+        </div>
 
         {/* Hero card */}
         <div className={`rounded-2xl border ${tone.border} ${tone.bg} p-6 flex flex-col md:flex-row items-start md:items-center gap-6`}>
@@ -245,7 +278,13 @@ export default function AnalysisPage({ params }: { params: Promise<{ id: string 
                     <span className="text-muted-foreground">Initial Liquidity</span>
                     <span className="font-mono text-foreground">
                       {evidence.initialLiquidityEth !== null
-                        ? `${evidence.initialLiquidityEth.toFixed(4)} ETH`
+                        ? evidence.initialLiquidityEth === 0
+                          ? '0 ETH'
+                          : evidence.initialLiquidityEth < 0.000001
+                          ? `~${(evidence.initialLiquidityEth * 1e18).toFixed(0)} wei (raw: ${evidence.poolLiquidity})`
+                          : evidence.initialLiquidityEth < 0.001
+                          ? `${(evidence.initialLiquidityEth * 1e6).toFixed(2)} µETH`
+                          : `${evidence.initialLiquidityEth.toFixed(4)} ETH`
                         : 'unverified'}
                     </span>
                   </div>

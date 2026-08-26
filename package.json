@@ -4,7 +4,9 @@
   "description": "",
   "scripts": {
     "telegram-bot": "tsx src/telegram-bot.ts",
-    "server": "tsx src/server.ts"
+    "server": "tsx src/server.ts",
+    "watch-analysis": "tsx src/watch-analysis.ts",
+    "start-all": "tsx start-all.ts"
   },
   "keywords": [],
   "author": "",

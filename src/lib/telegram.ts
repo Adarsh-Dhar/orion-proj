@@ -22,9 +22,22 @@ export const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN!);
  *  split on a safe boundary if a report ever exceeds that (rare for your format). */
 export async function sendReport(chatId: string | number, report: string): Promise<void> {
   const chunks = splitForTelegram(report);
-  for (const chunk of chunks) {
-    await bot.api.sendMessage(chatId, `<pre>${escapeHtml(chunk)}</pre>`, { parse_mode: "HTML" });
+  console.log(`[telegram] Sending ${chunks.length} chunk(s) to chat ${chatId}`);
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    try {
+      console.log(`[telegram] Sending chunk ${i + 1}/${chunks.length} (${chunk.length} chars)`);
+      await bot.api.sendMessage(chatId, `<pre>${escapeHtml(chunk)}</pre>`, { parse_mode: "HTML" });
+      console.log(`[telegram] Successfully sent chunk ${i + 1}/${chunks.length}`);
+    } catch (err) {
+      console.error(`[telegram] Failed to send chunk ${i + 1}/${chunks.length} to chat ${chatId}:`, err);
+      if (err instanceof Error) {
+        console.error(`[telegram] Error message: ${err.message}`);
+      }
+      // Don't throw - log and continue with remaining chunks
+    }
   }
+  console.log(`[telegram] Finished sending report to chat ${chatId}`);
 }
 
 /** Sends short-form text (alert cards, chat replies) without monospace formatting.

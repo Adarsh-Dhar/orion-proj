@@ -117,6 +117,10 @@ export async function runRugCheckLLM(
       tickSpacing: number;
       hooks: Address;
     };
+    /** Skip expensive checks for faster analysis */
+    quickMode?: boolean;
+    /** Use efficient sniper-style analysis (recent blocks only) */
+    sniperMode?: boolean;
   }
 ): Promise<RugCheckResult> {
 
@@ -130,7 +134,7 @@ export async function runRugCheckLLM(
   // ── 2. Collect evidence ───────────────────────────────────────────────────
   const evidence: TokenEvidence = await collectEvidence(
     client, tokenAddress, poolAddress, pairedAsset, deployBlock, meta,
-    deployerHistoryData, opts?.state, opts?.venue, opts?.hookAddress, opts?.v4PoolParams
+    deployerHistoryData, opts?.state, opts?.venue, opts?.hookAddress, opts?.v4PoolParams, opts?.quickMode, opts?.sniperMode
   );
 
   // ── 3. Update deployer history from persistent state ──────────────────────

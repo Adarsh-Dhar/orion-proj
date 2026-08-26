@@ -1234,7 +1234,11 @@ export async function collectEvidence(
     fee: number;
     tickSpacing: number;
     hooks: Address;
-  }
+  },
+  /** Skip expensive checks for faster analysis */
+  quickMode?: boolean,
+  /** Use efficient sniper-style analysis (recent blocks only) */
+  sniperMode?: boolean
 ): Promise<TokenEvidence> {
   const warnings: string[] = [];
   const resolvedVenue: Venue = venue ?? "v3";
@@ -1297,11 +1301,30 @@ export async function collectEvidence(
   const deployer = await findDeployer(client, tokenAddress, deployBlock, warnings);
 
   // ── 5. Holder balances ─────────────────────────────────────────────────────
-  const holderScanFrom = deployer.mintBlock !== null
-    ? deployer.mintBlock
-    : deployBlock > SCAN_CHUNK ? deployBlock - SCAN_CHUNK : 0n;
+  let holderScan: HolderScanResult;
+  let holderScanFrom: bigint;
 
-  const holderScan = await scanHolderBalances(client, tokenAddress, holderScanFrom, warnings);
+  // Determine scan range based on mode
+  if (sniperMode) {
+    // In sniper mode, only scan recent blocks (like the sniper does)
+    const latestBlock = await client.getBlockNumber();
+    holderScanFrom = latestBlock > SCAN_CHUNK ? latestBlock - SCAN_CHUNK : 0n;
+    console.log(`[evidence] Sniper mode: scanning recent blocks from ${holderScanFrom}`);
+  } else if (quickMode) {
+    console.log("[evidence] Quick mode: skipping holder balance scan");
+    holderScanFrom = deployBlock;
+  } else {
+    holderScanFrom = deployer.mintBlock !== null
+      ? deployer.mintBlock
+      : deployBlock > SCAN_CHUNK ? deployBlock - SCAN_CHUNK : 0n;
+  }
+
+  if (quickMode) {
+    holderScan = { balances: new Map(), partial: true, failed: false, scanFrom: holderScanFrom, scanTo: holderScanFrom };
+    warnings.push("[holderScan] Skipped in quick mode");
+  } else {
+    holderScan = await scanHolderBalances(client, tokenAddress, holderScanFrom, warnings);
+  }
 
   let deployerCurrentBalance: bigint | null = null;
   if (!holderScan.failed && deployer.address) {
@@ -1514,9 +1537,17 @@ export async function collectEvidence(
     }
   }
 
-  const tradeActivity = await scanTradeActivity(
-    client, poolAddress, deployBlock, token0IsTarget, warnings, resolvedVenue
-  );
+  const tradeActivity = quickMode
+    ? { totalSwaps: 0, uniqueTraders: 0, buyCount: 0, sellCount: 0, roundTripTraders: [], topTraderSwapShare: 0, scanPartial: true }
+    : sniperMode
+      ? await scanTradeActivity(client, poolAddress, holderScanFrom, token0IsTarget, warnings, resolvedVenue)
+      : await scanTradeActivity(client, poolAddress, deployBlock, token0IsTarget, warnings, resolvedVenue);
+
+  if (quickMode) {
+    warnings.push("[tradeScan] Skipped in quick mode");
+  } else if (sniperMode) {
+    console.log(`[evidence] Sniper mode: trade scan limited to recent blocks from ${holderScanFrom}`);
+  }
 
   const buySellRatio: number | null = tradeActivity.sellCount > 0
     ? tradeActivity.buyCount / tradeActivity.sellCount

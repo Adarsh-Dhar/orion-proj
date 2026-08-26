@@ -8,8 +8,7 @@
 
 import type { Address } from "viem";
 import type { PublicClient } from "viem";
-import type { BotState } from "./state.js";
-import type { ToolContext } from "./utils/interface.js";
+import type { BotState } from "../state.js";
 import {
   scanHolderBalances,
   checkSourceVerification,
@@ -17,9 +16,9 @@ import {
   checkLpLockStatus,
   findDeployer,
   scanTradeActivity,
-} from "./evidence.js";
-import { getDeployerHistory } from "./state.js";
-import { POOL_TOKENS_ABI, ERC20_ABI } from "./utils/constants.js";
+} from "../evidence.js";
+import { getDeployerHistory } from "../state.js";
+import { POOL_TOKENS_ABI, ERC20_ABI } from "../constants.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = PublicClient<any>;
@@ -97,6 +96,16 @@ export const AGENT_TOOLS = [
 
 // ─── Tool context ─────────────────────────────────────────────────────────────
 
+export interface ToolContext {
+  client: AnyClient;
+  tokenAddress: Address;
+  poolAddress: Address;
+  deployBlock: bigint;
+  state?: BotState;
+  // Cached values from initial evidence collection
+  ownershipRenounced: boolean | null;
+  ownerAddress: string | null;
+}
 
 // ─── Dispatcher ───────────────────────────────────────────────────────────────
 

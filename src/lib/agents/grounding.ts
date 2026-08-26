@@ -5,7 +5,7 @@
  * a tool result, preventing hallucination of numbers.
  */
 
-import type { ToolCallRecord, RiskFlag } from "./rugcheck-types.js";
+import type { ToolCallRecord, RiskFlag } from "../rugcheck-types.js";
 
 // ─── Number extraction ───────────────────────────────────────────────────────────
 

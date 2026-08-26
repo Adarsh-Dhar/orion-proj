@@ -19,11 +19,12 @@ import {
   KNOWN_QUOTE_ASSETS,
   QUOTE_ASSET_LABELS,
   type Venue,
-} from "./constants.js";
+} from "./utils/constants.js";
 import { fetchTokenMetadata } from "./erc20.js";
 import { runRugCheckLLM, formatRugReport } from "./rugcheck.js";
 import { reVerifyEvidence } from "./evidence.js";
 import { updateAnalysis } from "./analysis-store.js";
+import type { TokenIdentity, ResolvedPool, V3PoolLog, V4PoolLog, ScanOptions, ScanResult, TokenSummary } from "./utils/interface.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = PublicClient<any>;
@@ -45,11 +46,6 @@ export function formatFee(fee: number): string {
 
 // ─── Token identification ─────────────────────────────────────────────────────
 
-export interface TokenIdentity {
-  newToken: Address | null;   // null = both are known quote assets (ambiguous)
-  pairedWith: Address | null;
-  pairedLabel: string;
-}
 
 export function identifyTokens(token0: Address, token1: Address): TokenIdentity {
   const t0 = token0.toLowerCase();
@@ -157,12 +153,7 @@ const FEE_TIERS = [100, 500, 3_000, 10_000] as const;
 
 const NULL_POOL = "0x0000000000000000000000000000000000000000";
 
-export interface ResolvedPool {
-  poolAddress: Address;
-  pairedLabel: string;
-  pairedAsset: Address; // Add the paired asset address for watchlist
-  venue: Venue;
-}
+
 
 /**
  * Try every (quoteAsset × feeTier) combination until we find a real pool.
@@ -263,51 +254,6 @@ export async function resolveTokenPool(
   return null;
 }
 
-// ─── Summary type ─────────────────────────────────────────────────────────────
-
-export interface TokenSummary {
-  name: string;
-  symbol: string;
-  address: string;
-  verdict: string;
-  score: number;
-  flags: number;
-  venue: Venue;
-}
-
-// ─── Core block-range scanner ─────────────────────────────────────────────────
-
-export interface ScanResult {
-  summary: TokenSummary[];
-  /** Total PoolCreated events found */
-  totalPools: number;
-  /** Successfully rug-checked */
-  processed: number;
-  /** Skipped (ambiguous pair, metadata failure, etc.) */
-  skipped: number;
-}
-
-/** Optional hooks passed to scanBlockRange */
-export interface ScanOptions {
-  /**
-   * Called before evidence collection to check if a token should be skipped.
-   * Return true to skip this token (e.g., already posted).
-   */
-  shouldSkip?: (tokenAddress: string, poolAddress: string, pairedAsset: string) => boolean;
-  /**
-   * Called once per token immediately after the rug-check report is printed.
-   * Errors thrown here are caught and logged — they never abort the scan loop.
-   */
-  onResult?: (result: import("./rugcheck-types.js").RugCheckResult, meta: {
-    name: string; symbol: string; decimals: number;
-    totalSupply: bigint; totalSupplyFormatted: string;
-  }) => Promise<void>;
-  /**
-   * Bot state for persistent storage (e.g., deployer history).
-   */
-  state?: import("./state.js").BotState;
-}
-
 /**
  * Fetch all PoolCreated events between fromBlock and toBlock (chunked),
  * run the full metadata + LLM rug-check pipeline on each token, print a
@@ -325,19 +271,7 @@ export async function scanBlockRange(
   const numChunks   = Number((totalBlocks + CHUNK_SIZE - 1n) / CHUNK_SIZE);
 
   // ── Chunked getLogs ───────────────────────────────────────────────────────
-  interface V3PoolLog {
-    venue: "v3";
-    args: { token0: Address; token1: Address; fee: number; tickSpacing: number; pool: Address };
-    blockNumber: bigint | null;
-    transactionHash: `0x${string}` | null;
-  }
 
-  interface V4PoolLog {
-    venue: "v4";
-    args: { id: `0x${string}`; currency0: Address; currency1: Address; fee: number; tickSpacing: number; hooks: Address; sqrtPriceX96: bigint; tick: number };
-    blockNumber: bigint | null;
-    transactionHash: `0x${string}` | null;
-  }
 
   type PoolLog = V3PoolLog | V4PoolLog;
 

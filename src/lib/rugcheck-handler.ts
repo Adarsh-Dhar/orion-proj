@@ -17,6 +17,7 @@ import { resolveTokenPool, findContractDeployBlock } from "./scan-engine.js";
 import { runRugCheckLLM }                    from "./rugcheck.js";
 import type { RugCheckResult }               from "./rugcheck-types.js";
 import type { BotState }                     from "./state.js";
+import type { HandlerSuccess, HandlerError, HandlerOutcome, TokenMeta } from "./utils/interface.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = PublicClient<any>;
@@ -34,21 +35,7 @@ export function stripAddress(text: string, address: Address): string {
   return text.replace(address, "").trim();
 }
 
-// ─── Success / failure union ──────────────────────────────────────────────────
-
-export interface TokenMeta {
-  name:                 string;
-  symbol:               string;
-  decimals:             number;
-  totalSupply:          bigint;
-  totalSupplyFormatted: string;
-}
-
-export type HandlerSuccess = { result: RugCheckResult; meta: TokenMeta };
-export type HandlerError   = { error: string };
-export type HandlerOutcome = HandlerSuccess | HandlerError;
-
-// ─── Main pipeline ────────────────────────────────────────────────────────────
+// ─── Main pipeline ────────────────────────────────────────────────────────────// ─── Main pipeline ────────────────────────────────────────────────────────────
 
 /**
  * Full 5-step rug-check pipeline:

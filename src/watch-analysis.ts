@@ -35,8 +35,8 @@ import { base } from "viem/chains";
 import {
   getAnalysis,
   updateAnalysis,
-  type StoredAnalysis,
 } from "./lib/analysis-store.js";
+import type { StoredAnalysis } from "./lib/utils/interface.js";
 import { reVerifyEvidence, checkSourceVerification, type TokenEvidence } from "./lib/evidence.js";
 import { computeScore } from "./lib/scoring.js";
 

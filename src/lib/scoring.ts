@@ -21,12 +21,8 @@
 
 import type { TokenEvidence } from "./evidence.js";
 import type { RiskFlag, RiskLevel } from "./rugcheck-types.js";
+import type { ComputedScore } from "./utils/interface.js";
 
-export interface ComputedScore {
-  score: number;         // 0–100, 2 decimal places
-  verdict: RiskLevel;
-  breakdown: Array<{ id: string; label: string; contribution: number }>;
-}
 
 // ─── Smoothing helpers ────────────────────────────────────────────────────────
 

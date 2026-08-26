@@ -25,13 +25,12 @@ import type { TokenEvidence } from "./evidence.js";
 import type { BotState } from "./state.js";
 import { getDeployerHistory, recordDeployerToken } from "./state.js";
 import { runAgentLoop } from "./agent-loop.js";
-import type { ToolContext } from "./agent-tools.js";
+import type { ToolContext } from "./utils/interface.js";
 import { storeAnalysis } from "./analysis-store.js";
-import type { Venue } from "./constants.js";
+import type { Venue } from "./utils/constants.js";
 
 // ─── Re-export shared types ───────────────────────────────────────────────────
 
-export type { RiskLevel, VerdictLevel, RiskFlag, RugCheckResult } from "./rugcheck-types.js";
 import type { RiskLevel, VerdictLevel, RiskFlag, RugCheckResult } from "./rugcheck-types.js";
 
 // ─── Ambiguity detector ──────────────────────────────────────────────────────────

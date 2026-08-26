@@ -8,6 +8,7 @@
 import { Redis } from "@upstash/redis";
 import type { TokenEvidence } from "./evidence.js";
 import type { ToolCallRecord, RiskFlag } from "./rugcheck-types.js";
+import type { StoredAnalysis } from "./utils/interface.js";
 
 // ─── Environment validation ─────────────────────────────────────────────────────
 
@@ -38,33 +39,6 @@ function getRedisClient(): Redis | null {
     console.error("[analysis-store] Failed to initialize Upstash client:", err);
     return null;
   }
-}
-
-// ─── Data structures ───────────────────────────────────────────────────────────
-
-export interface StoredAnalysis {
-  id: string;
-  timestamp: number;
-  tokenAddress: string;
-  tokenName: string;
-  tokenSymbol: string;
-  poolAddress: string;
-  pairedAsset: string;
-  /** Which Uniswap architecture the pool is on */
-  venue?: "v3" | "v4";
-  /** V4 only: hook contract address from the Initialize event */
-  hookAddress?: string | null;
-  score: number;
-  verdict: string;
-  summary: string;
-  evidence: TokenEvidence;
-  toolCallTranscript?: ToolCallRecord[];
-  flags: RiskFlag[];
-  scoringMethod: string;
-  /** Per-factor breakdown of how the deterministic score (scoring.ts) was built,
-   *  so the frontend can show why the score landed where it did, down to
-   *  individual continuous contributions rather than flat flag buckets. */
-  scoreBreakdown?: Array<{ id: string; label: string; contribution: number }>;
 }
 
 // ─── Storage functions ─────────────────────────────────────────────────────────

@@ -23,40 +23,16 @@
  */
 
 import type { TokenEvidence } from "./evidence.js";
-import type { RiskFlag, RiskLevel } from "./rugcheck-types.js";
-import type { ToolCallRecord } from "./rugcheck-types.js";
-import type { Venue } from "./constants.js";
+import type { RiskFlag, RiskLevel, LLMScoreSuccess, LLMScoreFailure, LLMScoreResult, ToolCallRecord } from "./rugcheck-types.js";
+import type { Venue, ScoreMode } from "./utils/constants.js";
+import { GEMINI_API_KEY, GEMINI_ENDPOINT } from "./utils/constants.js";
+import type { ToolCall, ToolCallResponse, FinalResponse, MessagePart, Message } from "./utils/interface.js";
 
-export type ScoreMode = "alert" | "chat" | "agentic";
+// Re-export types for other modules
+export type { LLMScoreResult, LLMScoreSuccess, LLMScoreFailure, ToolCallRecord };
 
-// ─── Env ─────────────────────────────────────────────────────────────────────
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? "";
-const GEMINI_MODEL   = process.env.GEMINI_MODEL   ?? "gemini-2.0-flash-lite";
-const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-export interface LLMScoreSuccess {
-  ok: true;
-  score: number;
-  verdict: RiskLevel;
-  flags: RiskFlag[];
-  summary: string;
-  rawModelText: string;
-  /** Only present when opts.userQuestion was supplied */
-  answer?: string;
-  /** Only present in agentic mode: transcript of tool calls made */
-  toolCallTranscript?: ToolCallRecord[];
-}
-
-export interface LLMScoreFailure {
-  ok: false;
-  reason: string;
-  rawModelText?: string;
-}
-
-export type LLMScoreResult = LLMScoreSuccess | LLMScoreFailure;
 
 // ─── System prompt ────────────────────────────────────────────────────────────
 
@@ -316,36 +292,7 @@ export async function scoreWithLLM(
 
 // ─── Agentic function-calling variant ───────────────────────────────────────────
 
-interface ToolCall {
-  name: string;
-  args: Record<string, unknown>;
-}
-
-interface ToolCallResponse {
-  type: "tool_calls";
-  toolCalls: ToolCall[];
-  raw: string;
-}
-
-interface FinalResponse {
-  type: "final";
-  json: unknown;
-  raw: string;
-}
-
 type AgenticResponse = ToolCallResponse | FinalResponse;
-
-interface MessagePart {
-  text?: string;
-  functionCall?: { name: string; args: Record<string, unknown> };
-  functionResponse?: { name: string; response: unknown };
-  [key: string]: unknown; // Make it indexable
-}
-
-interface Message {
-  role: string;
-  parts: MessagePart[];
-}
 
 /**
  * Call Gemini with function calling support.

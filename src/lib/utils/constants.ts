@@ -1,12 +1,7 @@
-// ─── Chain ────────────────────────────────────────────────────────────────────
-
 export const BASE_CHAIN_ID = 8453;
 
-// ─── Venue types ───────────────────────────────────────────────────────────────
-
-export type Venue = "v3" | "v4";
-
-// ─── Contract addresses ───────────────────────────────────────────────────────
+// Import types from rugcheck-types to avoid circular dependencies
+export type { Venue, RiskLevel, VerdictLevel } from "../rugcheck-types.js";
 
 /** Uniswap V3 Factory on Base — source: https://docs.uniswap.org/contracts/v3/reference/deployments/base-deployments */
 export const UNISWAP_V3_FACTORY =
@@ -398,3 +393,10 @@ export const SUSPICIOUS_SOURCE_KEYWORDS = [
 export const PRIVILEGE_KEYWORDS = [
   "onlyOwner", "onlyAdmin", "onlyManager", "hasRole", "AccessControl", "modifier only",
 ] as const;
+
+export type ScoreMode = "alert" | "chat" | "agentic";
+
+// Gemini API configuration
+export const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+export const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash-lite";
+export const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;

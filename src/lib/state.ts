@@ -6,36 +6,11 @@
  */
 
 import { readFileSync, writeFileSync, existsSync } from "fs";
-import type { Venue } from "./constants.js";
+import type { Venue } from "./utils/constants.js";
+import type { BotState, LiquiditySnapshot, WatchlistEntry } from "./utils/interface.js";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-export interface LiquiditySnapshot {
-  liquidity: string;
-  blockNumber: string;
-  ts: number;
-}
-
-export interface WatchlistEntry {
-  tokenAddress: string;
-  poolAddress: string;
-  pairedAsset: string;
-  venue: Venue;
-  firstPostedTimestamp: number;
-}
-
-export interface BotState {
-  /** Lower-cased token addresses already auto-posted. */
-  postedTokens: string[];
-  /** Deployer history: maps lower-cased deployer address to array of token addresses they've deployed. */
-  deployerHistory: Record<string, string[]>;
-  /** Liquidity history: maps lower-cased pool address to array of snapshots. */
-  liquidityHistory: Record<string, LiquiditySnapshot[]>;
-  /** Watchlist: tokens to monitor for liquidity drops after initial posting. */
-  watchlist: Record<string, WatchlistEntry>; // key: token address (lowercased)
-  /** Last scanned block watermark (persisted to avoid re-scanning on restart) */
-  lastScannedBlock: string | null;
-}
+// Re-export types for other modules
+export type { BotState, LiquiditySnapshot, WatchlistEntry };
 
 // ─── Path ─────────────────────────────────────────────────────────────────────
 

@@ -6,19 +6,14 @@
  */
 
 import type { TokenEvidence } from "./evidence.js";
-import type { LLMScoreResult } from "./llm-score.js";
-import type { ToolCallRecord } from "./rugcheck-types.js";
-import type { ToolContext } from "./agent-tools.js";
+import type { LLMScoreResult, ToolCallRecord } from "./llm-score.js";
+import type { ToolContext, AgentLoopResult } from "./utils/interface.js";
 import { scoreWithLLMAgentic } from "./llm-score.js";
 import { AGENT_TOOLS, dispatchTool } from "./agent-tools.js";
 import { validateGrounding } from "./grounding.js";
 
 // ─── Main loop controller ───────────────────────────────────────────────────────
 
-export interface AgentLoopResult {
-  result: LLMScoreResult;
-  transcript: ToolCallRecord[];
-}
 
 export async function runAgentLoop(
   evidence: TokenEvidence,

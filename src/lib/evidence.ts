@@ -59,7 +59,11 @@ import {
   V4_MODIFY_LIQUIDITY_EVENT_ABI,
   V4_QUOTER_EXACT_INPUT_SINGLE_ABI,
   type Venue,
-} from "./constants.js";
+} from "./utils/constants.js";
+import type { TokenEvidence, DeployerResult, HolderScanResult, TradeActivity, ReVerifyResult } from "./utils/interface.js";
+
+// Re-export types that are used by other modules
+export type { TokenEvidence, DeployerResult, HolderScanResult, TradeActivity, ReVerifyResult };
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = PublicClient<any>;
@@ -89,96 +93,7 @@ const ZERO_SLOT    =
  * strings. The LLM receives this object serialised as JSON so bigint →
  * string conversion is done here, not in the scorer.
  */
-export interface TokenEvidence {
-  // ── Identity ──────────────────────────────────────────────────────────────
-  tokenAddress: string;
-  poolAddress: string;   // V3: pool contract address; V4: bytes32 PoolId as hex
-  pairedAsset: string;
-  venue: Venue;
-  deployBlock: string;   // bigint as string
 
-  // ── V4-specific ───────────────────────────────────────────────────────────
-  /** V4 only: the hook contract address attached to this pool. address(0) means
-   *  no hook.  Populated from the Initialize event; null for V3 pools. */
-  hookAddress: string | null;
-
-  // ── ERC-20 metadata ───────────────────────────────────────────────────────
-  name: string;
-  symbol: string;
-  decimals: number;
-  totalSupply: string;           // bigint as string
-  totalSupplyFormatted: string;  // human-readable with decimals
-
-  // ── Ownership ─────────────────────────────────────────────────────────────
-  ownerAddress: string | null;   // null = call failed
-  ownershipRenounced: boolean | null;
-  isProxy: boolean | null;       // null = storage read failed
-
-  // ── Deployer / wallet distribution ────────────────────────────────────────
-  deployerAddress: string | null;
-  deployerMintBlock: string | null;   // bigint as string
-  deployerMintAmount: string | null;  // bigint as string — original mint qty
-  deployerCurrentBalance: string | null; // bigint as string — from holder scan
-  deployerPct: number | null;         // % of total supply; null = unverified
-
-  // Holder scan metadata
-  holderScanFrom: string;    // bigint as string
-  holderScanTo: string;      // bigint as string
-  holderScanPartial: boolean; // true if some chunks failed
-  holderScanFailed: boolean;  // true if ALL chunks failed
-  top5Holders: Array<{ address: string; balance: string; pct: number }>;
-  top5HoldersPct: number | null;
-
-  // ── Liquidity ─────────────────────────────────────────────────────────────
-  poolLiquidity: string | null;      // bigint as string; null = read failed
-  liquidityLocked: boolean | null;   // null = unknown
-  initialLiquidityEth: number | null;
-
-  // ── Liquidity delta monitoring ─────────────────────────────────────────────
-  liquidityDeltaPct: number | null;       // % change since last snapshot
-  liquidityPreviousReading: string | null; // previous liquidity value
-  snapshotAgeMinutes: number | null;      // minutes since last snapshot
-
-  // ── Sell-ability (honeypot) ─────────────────────────────────────────────
-  sellTestPassed: boolean | null;      // null = couldn't run the test at all
-  sellTestAmountSent: string | null;
-  sellTestError: string | null;
-
-  // ── LP position lock status ─────────────────────────────────────────────
-  lpTokenId: string | null;
-  lpPositionOwner: string | null;
-  lpPositionStatus: "burned" | "locked_uncx" | "held_by_eoa" | "non_nft_position" | "unverified";
-
-  // ── Liquidity pull history ──────────────────────────────────────────────
-  liquidityEverPulled: boolean;
-  burnEventCount: number;
-
-  // ── Source verification ─────────────────────────────────────────────────
-  sourceVerified: boolean | null;      // null = the Etherscan call itself failed
-  suspiciousFunctions: {name: string, snippet: string}[];
-  secondaryAdminDetected: boolean;
-  secondaryAdminSnippet: string | null;
-
-  // ── Deployer history (in-process memory, resets on bot restart) ────────
-  deployerSeenBefore: boolean;
-  deployerPriorTokens: string[];
-
-  // ── Trade activity (wash trading detection) ────────────────────────────
-  totalSwaps: number;
-  uniqueTraders: number;
-  buyCount: number;
-  sellCount: number;
-  buySellRatio: number | null; // buyCount / sellCount, null if sellCount = 0
-  roundTripTraderCount: number; // addresses that both bought AND sold
-  roundTripTraderPct: number | null; // % of unique traders that round-tripped
-  topTraderSwapSharePct: number; // e.g. 68% = one wallet did 68% of all swaps
-  tradeScanPartial: boolean;
-
-  // ── RPC warnings ──────────────────────────────────────────────────────────
-  /** Every failed RPC call during collection. The LLM must treat any field
-   *  that appears in this list as "unverified" rather than as a clean signal. */
-  rpcWarnings: string[];
-}
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -210,12 +125,7 @@ async function safeReadNullable<T>(
 
 // ─── Deployer finder ─────────────────────────────────────────────────────────
 
-interface DeployerResult {
-  address: string | null;
-  mintBlock: bigint | null;
-  mintAmount: bigint | null;
-  source: "tight" | "wide" | "unknown";
-}
+
 
 export async function findDeployer(
   client: AnyClient,
@@ -267,13 +177,7 @@ export async function findDeployer(
 
 // ─── Holder balance scan ──────────────────────────────────────────────────────
 
-interface HolderScanResult {
-  balances: Map<string, bigint>;
-  partial: boolean;   // some chunks failed but we have some data
-  failed: boolean;    // all chunks failed, map is empty
-  scanFrom: bigint;
-  scanTo: bigint;
-}
+
 
 /**
  * Fetch holder balances by scanning Transfer events from `fromBlock` to the
@@ -915,17 +819,7 @@ async function checkLiquidityPullHistoryV4(
 // V3: scan Swap events on the pool contract.
 // V4: scan Swap events on the PoolManager filtered by the poolId (id field).
 
-interface TradeActivity {
-  totalSwaps: number;
-  uniqueTraders: number;
-  buyCount: number;
-  sellCount: number;
-  buyerAddresses: Set<string>;
-  sellerAddresses: Set<string>;
-  roundTripTraders: string[];
-  topTraderSwapShare: number; // % of total swaps done by the single busiest address
-  scanPartial: boolean;
-}
+
 
 export async function scanTradeActivity(
   client: AnyClient,
@@ -1637,19 +1531,6 @@ export async function collectEvidence(
  * Fields that the re-verification pass can improve.
  * Returned by reVerifyEvidence(); caller decides which to apply.
  */
-export interface ReVerifyResult {
-  /** Updated LP lock fields — only present when they changed from "unverified". */
-  lpPositionStatus?: TokenEvidence["lpPositionStatus"];
-  lpTokenId?: string | null;
-  lpPositionOwner?: string | null;
-  /** Updated pool liquidity — only present when the pool now has liquidity. */
-  poolLiquidity?: string | null;
-  liquidityLocked?: boolean | null;
-  initialLiquidityEth?: number | null;
-  /** True if any field improved vs the original snapshot. */
-  improved: boolean;
-  warnings: string[];
-}
 
 /**
  * Lightweight re-check that only re-runs the two fields most likely to be

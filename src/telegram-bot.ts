@@ -23,7 +23,7 @@ import { registerInlineHandler } from "./lib/inline-handler.js";
 import { formatAlertCard } from "./lib/rugcheck.js";
 import { loadState, saveState, alreadyPosted, markPosted, addToWatchlist, getWatchlistTokens, recordLiquiditySnapshot } from "./lib/state.js";
 import { checkLiquidityDelta } from "./lib/evidence.js";
-import { UNISWAP_V3_FACTORY, UNISWAP_V4_POOL_MANAGER } from "./lib/constants.js";
+import { UNISWAP_V3_FACTORY, UNISWAP_V4_POOL_MANAGER } from "./lib/utils/constants.js";
 
 // ─── Env validation ───────────────────────────────────────────────────────────
 

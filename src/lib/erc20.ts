@@ -1,16 +1,7 @@
 import { type PublicClient, type Address, formatUnits } from "viem";
-import { ERC20_ABI } from "./constants.js";
+import { ERC20_ABI } from "./utils/constants.js";
+import type { TokenMetadata } from "./utils/interface.js";
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-export interface TokenMetadata {
-  name: string;
-  symbol: string;
-  decimals: number;
-  totalSupply: bigint;
-  /** Total supply formatted as a human-readable string using decimals */
-  totalSupplyFormatted: string;
-}
 
 // ─── Helper ───────────────────────────────────────────────────────────────────
 

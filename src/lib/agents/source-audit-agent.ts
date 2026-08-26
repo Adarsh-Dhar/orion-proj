@@ -33,7 +33,8 @@
  *   the final judgment instead of letting the model free-associate a flag.
  */
 
-import { SUSPICIOUS_SOURCE_KEYWORDS, PRIVILEGE_KEYWORDS } from "../constants.js";
+import { createHash } from "node:crypto";
+import { SUSPICIOUS_SOURCE_KEYWORDS, PRIVILEGE_KEYWORDS } from "../utils/constants.js";
 import type { FunctionAudit, SourceAuditMethod } from "./types.js";
 
 // ─── Env ─────────────────────────────────────────────────────────────────────
@@ -54,6 +55,26 @@ const MAX_CANDIDATES = 25;
 /** Max lines per candidate body sent to the model (mirrors the old
  *  extractFunctionBody truncation in evidence.ts). */
 const MAX_SNIPPET_LINES = 40;
+
+// ─── Cache on identical input ─────────────────────────────────────────────────
+//
+// Many rug-pull tokens are deployed from the exact same boilerplate/template
+// contract (same source, different address/owner). Without a cache, every
+// re-deploy of the same template burns a fresh Gemini call for a verdict
+// we've already computed. This is an in-memory, per-process cache — it does
+// NOT survive a restart. If you need cross-restart persistence, the natural
+// place to move this is BotState (state.ts, same pattern as deployerHistory)
+// or the Upstash-backed analysis-store.ts, keyed the same way.
+//
+// Cache key includes ownershipRenounced + ownerAddress alongside a hash of
+// the source, because those two inputs can change the secondaryAdminCandidate
+// verdict even for byte-identical source — they are not just cosmetic.
+const sourceAuditCache = new Map<string, SourceAuditResult>();
+
+function cacheKey(source: string, ownershipRenounced: boolean | null, ownerAddress: string | null): string {
+  const hash = createHash("sha256").update(source).digest("hex");
+  return `${hash}|${ownershipRenounced ?? "null"}|${(ownerAddress ?? "").toLowerCase()}`;
+}
 
 // ─── Public result type ───────────────────────────────────────────────────────
 
@@ -259,7 +280,7 @@ function keywordFallback(candidates: CandidateBlock[]): {
   let secondaryAdminDetected = false;
   let secondaryAdminSnippet: string | null = null;
   for (const block of candidates) {
-    const isPrivileged = PRIVILEGE_KEYWORDS.some((kw) => new RegExp(kw, "gi").test(block.body));
+    const isPrivileged = PRIVILEGE_KEYWORDS.some((kw: string) => new RegExp(kw, "gi").test(block.body));
     if (!isPrivileged) continue;
     const addressRefMatch = block.body.match(/\b(?!owner\b|pendingOwner\b)([a-zA-Z_]\w*)\s*==\s*msg\.sender|msg\.sender\s*==\s*([a-zA-Z_]\w*)/);
     if (addressRefMatch) {
@@ -280,10 +301,19 @@ export async function analyzeSourceWithLLM(
   ownerAddress: string | null,
   warnings: string[]
 ): Promise<SourceAuditResult> {
+  const key = cacheKey(source, ownershipRenounced, ownerAddress);
+  const cached = sourceAuditCache.get(key);
+  if (cached) {
+    console.log(`  [sourceAudit] cache hit (${cached.method}) — skipping Gemini call`);
+    return cached;
+  }
+
   const candidates = splitIntoCandidateBlocks(source);
 
   if (candidates.length === 0) {
-    return { suspiciousFunctions: [], secondaryAdminDetected: false, secondaryAdminSnippet: null, method: "llm", functionAudits: [] };
+    const result: SourceAuditResult = { suspiciousFunctions: [], secondaryAdminDetected: false, secondaryAdminSnippet: null, method: "llm", functionAudits: [] };
+    sourceAuditCache.set(key, result);
+    return result;
   }
 
   if (!GEMINI_API_KEY) {
@@ -397,11 +427,13 @@ export async function analyzeSourceWithLLM(
 
   const secondaryAdminHit = confident.find((f) => f.secondaryAdminCandidate === true);
 
-  return {
+  const result: SourceAuditResult = {
     suspiciousFunctions,
     secondaryAdminDetected: secondaryAdminHit !== undefined,
     secondaryAdminSnippet: secondaryAdminHit ? secondaryAdminHit.snippet : null,
     method: "llm",
     functionAudits,
   };
+  sourceAuditCache.set(key, result);
+  return result;
 }

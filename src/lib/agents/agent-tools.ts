@@ -18,7 +18,7 @@ import {
   scanTradeActivity,
 } from "../evidence.js";
 import { getDeployerHistory } from "../state.js";
-import { POOL_TOKENS_ABI, ERC20_ABI } from "../constants.js";
+import { POOL_TOKENS_ABI, ERC20_ABI } from "../utils/constants.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = PublicClient<any>;

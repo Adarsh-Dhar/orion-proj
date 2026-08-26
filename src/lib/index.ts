@@ -105,5 +105,5 @@ export { sendReport, sendPlain, bot } from "./telegram.js";
 export { collectEvidence, findDeployer, scanHolderBalances, checkLiquidityDelta, runSellTest, checkLpLockStatus, checkLiquidityPullHistory, scanTradeActivity, checkSourceVerification, reVerifyEvidence } from "./evidence.js";
 export { computeScore, attachComputedScore } from "./scoring.js";
 export { storeAnalysis, getAnalysis, getLatestAnalysis, getAllAnalysisIds, getMultipleAnalyses, updateAnalysis } from "./analysis-store.js";
-export { runAgentLoop } from "./agent-loop.js";
-export { AGENT_TOOLS, dispatchTool } from "./agent-tools.js";
+export { runAgentLoop } from "./agents/agent-loop.js";
+export { AGENT_TOOLS, dispatchTool } from "./agents/agent-tools.js";

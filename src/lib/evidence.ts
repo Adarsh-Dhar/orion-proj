@@ -47,8 +47,6 @@ import {
   NPM_INCREASE_LIQUIDITY_EVENT_ABI,
   NPM_OWNER_OF_ABI,
   ERC20_TRANSFER_ABI,
-  SUSPICIOUS_SOURCE_KEYWORDS,
-  PRIVILEGE_KEYWORDS,
   // V4-specific
   UNISWAP_V4_POOL_MANAGER,
   UNISWAP_V4_STATE_VIEW,
@@ -61,6 +59,8 @@ import {
   type Venue,
 } from "./utils/constants.js";
 import type { TokenEvidence, DeployerResult, HolderScanResult, TradeActivity, ReVerifyResult } from "./utils/interface.js";
+import { analyzeSourceWithLLM } from "./agents/source-audit-agent.js";
+import type { FunctionAudit, SourceAuditMethod } from "./agents/types.js";
 
 // Re-export types that are used by other modules
 export type { TokenEvidence, DeployerResult, HolderScanResult, TradeActivity, ReVerifyResult };
@@ -961,99 +961,11 @@ function buildTradeActivity(
   };
 }
 
-// ── Helper: extract function body from source code ───────────────────────────
-function extractFunctionBody(source: string, keyword: string): string | null {
-  const functionPattern = /function\s+(\w+)[^{]*\{/g;
-  let match: RegExpExecArray | null;
-  const maxLines = 40;
-
-  while ((match = functionPattern.exec(source)) !== null) {
-    const funcStartIndex = match.index;
-    const funcEnd = findMatchingBrace(source, funcStartIndex + match[0].length - 1);
-    if (funcEnd === null) continue;
-
-    const funcBody = source.substring(funcStartIndex, funcEnd + 1);
-    if (funcBody.includes(keyword)) {
-      const funcLines = funcBody.split("\n");
-      if (funcLines.length <= maxLines) return funcBody;
-      return funcLines.slice(0, maxLines).join("\n") + "\n  // ... (truncated)";
-    }
-  }
-  return null;
-}
-
-// ── Helper: find matching closing brace ──────────────────────────────────────
-function findMatchingBrace(source: string, startIndex: number): number | null {
-  let braceCount = 0;
-  for (let i = startIndex; i < source.length; i++) {
-    if (source[i] === "{") braceCount++;
-    else if (source[i] === "}") {
-      braceCount--;
-      if (braceCount === 0) return i;
-    }
-  }
-  return null;
-}
-
-// ── Helper: detect secondary admin after renounce ────────────────────────────
-function detectSecondaryAdmin(
-  source: string,
-  renouncedOwner: string | null
-): { detected: boolean; snippet: string | null } {
-  if (!renouncedOwner || renouncedOwner === "unknown") {
-    return { detected: false, snippet: null };
-  }
-
-  const addressVarPattern = /address\s+(?:public|private|internal)?\s*(\w+)\s*(?:=|;)/gi;
-  const addressVars: string[] = [];
-  let match: RegExpExecArray | null;
-  while ((match = addressVarPattern.exec(source)) !== null) {
-    const varName = match[1];
-    if (
-      !varName.toLowerCase().includes("owner") &&
-      !varName.toLowerCase().includes("pending")
-    ) {
-      addressVars.push(varName);
-    }
-  }
-  if (addressVars.length === 0) return { detected: false, snippet: null };
-
-  const functionPattern = /(?:function|modifier)\s+(\w+)[^{]*\{/g;
-  const privilegedFunctions: Array<{ name: string; body: string }> = [];
-  while ((match = functionPattern.exec(source)) !== null) {
-    const funcStart     = match.index;
-    const funcBodyStart = funcStart + match[0].length - 1;
-    const funcEnd       = findMatchingBrace(source, funcBodyStart);
-    if (funcEnd !== null) {
-      const funcBody = source.substring(funcStart, funcEnd + 1);
-      for (const keyword of PRIVILEGE_KEYWORDS) {
-        if (new RegExp(keyword, "gi").test(funcBody)) {
-          privilegedFunctions.push({ name: match[1], body: funcBody });
-          break;
-        }
-      }
-    }
-  }
-
-  for (const func of privilegedFunctions) {
-    for (const addrVar of addressVars) {
-      const pat = new RegExp(
-        `require\\s*\\([^)]*${addrVar}[^)]*\\)|if\\s*\\([^)]*${addrVar}[^)]*\\)`,
-        "gi"
-      );
-      if (pat.test(func.body)) {
-        const snippet = func.body.split("\n").slice(0, 8).join("\n").trim();
-        return {
-          detected: true,
-          snippet: snippet.length > 300 ? snippet.substring(0, 300) + "..." : snippet,
-        };
-      }
-    }
-  }
-  return { detected: false, snippet: null };
-}
-
-// ── 4. Source verification + backdoor keyword scan ───────────────────────────
+// ── 4. Source verification — fetch + LLM rubric audit ─────────────────────────
+// Keyword-grep replaced by analyzeSourceWithLLM() (src/lib/agents/source-audit-agent.ts).
+// This function now only does the Etherscan fetch; all judgment (suspicious
+// function detection, secondary-admin detection) happens in the agent, which
+// falls back to a keyword heuristic internally if the LLM call fails.
 export async function checkSourceVerification(
   tokenAddress: Address,
   warnings: string[],
@@ -1064,47 +976,50 @@ export async function checkSourceVerification(
   suspiciousFunctions: { name: string; snippet: string }[];
   secondaryAdminDetected: boolean;
   secondaryAdminSnippet: string | null;
+  sourceAuditMethod: SourceAuditMethod | null;
+  functionAudits: FunctionAudit[];
 }> {
   const apiKey = process.env.ETHERSCAN_API_KEY;
   if (!apiKey) {
     warn(warnings, "sourceCheck", "ETHERSCAN_API_KEY not set — skipping", "missing env var");
-    return { sourceVerified: null, suspiciousFunctions: [], secondaryAdminDetected: false, secondaryAdminSnippet: null };
+    return {
+      sourceVerified: null, suspiciousFunctions: [], secondaryAdminDetected: false,
+      secondaryAdminSnippet: null, sourceAuditMethod: null, functionAudits: [],
+    };
   }
+
+  let source = "";
   try {
     const url  = `${ETHERSCAN_API_BASE}?chainid=${BASE_CHAIN_ID}&module=contract&action=getsourcecode&address=${tokenAddress}&apikey=${apiKey}`;
     const res  = await fetch(url);
     const json = await res.json();
-    const source: string = json?.result?.[0]?.SourceCode ?? "";
-    if (!source) {
-      return { sourceVerified: false, suspiciousFunctions: [], secondaryAdminDetected: false, secondaryAdminSnippet: null };
-    }
-
-    const suspiciousFunctions: { name: string; snippet: string }[] = [];
-    for (const kw of SUSPICIOUS_SOURCE_KEYWORDS) {
-      if (source.includes(kw)) {
-        const snippet  = extractFunctionBody(source, kw);
-        const nameMatch = snippet?.match(/function\s+(\w+)/);
-        suspiciousFunctions.push({
-          name:    nameMatch ? nameMatch[1] : kw,
-          snippet: snippet ?? `// Keyword "${kw}" found but function body extraction failed`,
-        });
-      }
-    }
-
-    let secondaryAdminDetected = false;
-    let secondaryAdminSnippet: string | null = null;
-    if (ownershipRenounced === true && ownerAddress) {
-      const adminCheck = detectSecondaryAdmin(source, ownerAddress);
-      secondaryAdminDetected = adminCheck.detected;
-      secondaryAdminSnippet  = adminCheck.snippet;
-    }
-
-    return { sourceVerified: true, suspiciousFunctions, secondaryAdminDetected, secondaryAdminSnippet };
+    source = json?.result?.[0]?.SourceCode ?? "";
   } catch (err) {
     warn(warnings, "sourceCheck", "Etherscan API call failed", err);
-    return { sourceVerified: null, suspiciousFunctions: [], secondaryAdminDetected: false, secondaryAdminSnippet: null };
+    return {
+      sourceVerified: null, suspiciousFunctions: [], secondaryAdminDetected: false,
+      secondaryAdminSnippet: null, sourceAuditMethod: null, functionAudits: [],
+    };
   }
+
+  if (!source) {
+    return {
+      sourceVerified: false, suspiciousFunctions: [], secondaryAdminDetected: false,
+      secondaryAdminSnippet: null, sourceAuditMethod: null, functionAudits: [],
+    };
+  }
+
+  const audit = await analyzeSourceWithLLM(source, ownershipRenounced, ownerAddress, warnings);
+  return {
+    sourceVerified: true,
+    suspiciousFunctions: audit.suspiciousFunctions,
+    secondaryAdminDetected: audit.secondaryAdminDetected,
+    secondaryAdminSnippet: audit.secondaryAdminSnippet,
+    sourceAuditMethod: audit.method,
+    functionAudits: audit.functionAudits,
+  };
 }
+
 
 // ─── Main collection function ─────────────────────────────────────────────────
 
@@ -1507,6 +1422,8 @@ export async function collectEvidence(
     suspiciousFunctions:     sourceCheck.suspiciousFunctions,
     secondaryAdminDetected:  sourceCheck.secondaryAdminDetected,
     secondaryAdminSnippet:   sourceCheck.secondaryAdminSnippet,
+    sourceAuditMethod:       sourceCheck.sourceAuditMethod,
+    sourceFunctionAudits:    sourceCheck.functionAudits,
 
     deployerSeenBefore:  deployerHistoryData.deployerSeenBefore,
     deployerPriorTokens: deployerHistoryData.deployerPriorTokens,

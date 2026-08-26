@@ -25,7 +25,7 @@
 import type { TokenEvidence } from "../evidence.js";
 import type { RiskFlag, RiskLevel } from "../rugcheck-types.js";
 import type { ToolCallRecord } from "../rugcheck-types.js";
-import type { Venue } from "../constants.js";
+import type { Venue } from "../utils/constants.js";
 
 export type ScoreMode = "alert" | "chat" | "agentic";
 

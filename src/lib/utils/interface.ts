@@ -1,6 +1,6 @@
 import type { Address } from "viem";
 import type { PublicClient } from "viem";
-import type { RiskLevel, VerdictLevel, Venue, RugCheckResult, RiskFlag, ToolCallRecord, LLMScoreResult } from "../rugcheck-types.js";
+import type { RiskLevel, VerdictLevel, Venue } from "../rugcheck-types.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = PublicClient<any>;
@@ -214,6 +214,10 @@ export interface TokenEvidence {
   suspiciousFunctions: {name: string, snippet: string}[];
   secondaryAdminDetected: boolean;
   secondaryAdminSnippet: string | null;
+  /** "llm" | "keyword_fallback" | null (source unverified, no audit ran). */
+  sourceAuditMethod: "llm" | "keyword_fallback" | null;
+  /** Full rubric detail per function, including low-confidence/benign findings — for logging/debugging only. */
+  sourceFunctionAudits: import("../agents/types.js").FunctionAudit[];
 
   // ── Deployer history (in-process memory, resets on bot restart) ────────
   deployerSeenBefore: boolean;
@@ -423,6 +427,8 @@ export interface RugCheckResult {
   suspiciousFunctions: {name: string, snippet: string}[];
   secondaryAdminDetected: boolean;
   secondaryAdminSnippet: string | null;
+  sourceAuditMethod?: "llm" | "keyword_fallback" | null;
+  sourceFunctionAudits?: import("../agents/types.js").FunctionAudit[];
   deployerSeenBefore: boolean;
   deployerPriorTokens: string[];
 

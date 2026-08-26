@@ -19,12 +19,12 @@ import {
 type AnyClient = PublicClient<any>;
 
 import { collectEvidence }   from "./evidence.js";
-import { scoreWithLLM }      from "./llm-score.js";
+import { scoreWithLLM }      from "./agents/llm-score.js";
 import { computeScore }      from "./scoring.js";
 import type { TokenEvidence } from "./evidence.js";
 import type { BotState } from "./state.js";
 import { getDeployerHistory, recordDeployerToken } from "./state.js";
-import { runAgentLoop } from "./agent-loop.js";
+import { runAgentLoop } from "./agents/agent-loop.js";
 import type { ToolContext } from "./utils/interface.js";
 import { storeAnalysis } from "./analysis-store.js";
 import type { Venue } from "./utils/constants.js";

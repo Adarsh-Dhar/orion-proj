@@ -102,7 +102,7 @@ export { resolveTokenPool, findContractDeployBlock, scanBlockRange, shortAddr, f
 export { answerTokenQuestion, extractAddress, stripAddress } from "./rugcheck-handler.js";
 export { loadState, saveState, alreadyPosted, markPosted, getDeployerHistory, recordDeployerToken, recordLiquiditySnapshot, addToWatchlist, getWatchlistTokens } from "./state.js";
 export { sendReport, sendPlain, bot } from "./telegram.js";
-export { collectEvidence, findDeployer, scanHolderBalances, checkLiquidityDelta, runSellTest, checkLpLockStatus, checkLiquidityPullHistory, scanTradeActivity, checkSourceVerification, reVerifyEvidence } from "./evidence.js";
+export { collectMinimalEvidence, findDeployer, scanHolderBalances, checkLiquidityDelta, runSellTest, checkLpLockStatus, checkLiquidityPullHistory, scanTradeActivity, checkSourceVerification, reVerifyEvidence } from "./evidence.js";
 export { computeScore, attachComputedScore } from "./scoring.js";
 export { storeAnalysis, getAnalysis, getLatestAnalysis, getAllAnalysisIds, getMultipleAnalyses, updateAnalysis } from "./analysis-store.js";
 export { runAgentLoop } from "./agents/agent-loop.js";

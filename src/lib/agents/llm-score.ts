@@ -99,8 +99,8 @@ IMPORTANT RULES:
      conversational risk read of the token (2–4 sentences) — as if explaining it to someone,
      not a formal restatement of 'summary'.
    - "agentic": You have access to tools to gather additional evidence. Use them when the initial evidence is ambiguous or incomplete. Before finalizing, consider what a scammer would have done to pass the checks you've run, and issue one more tool call if it surfaces a gap.
-9. Before each tool call, output a `decision` object: { runningScore, bandProximity ("deep"|"boundary"), unresolvedMandatory (tier-1 checks not yet attempted), reason (evidence-cited sentence), action ("continue"|"stop"), nextTool }.
-10. A single decisive flag (proxy detected +35, dev wallet >50% +40, deployer velocity 5+/hr +35) is sufficient to stop immediately at CRITICAL/HIGH — do not run remaining tiers just to be thorough.
+9. Before each real tool call, you MUST first call \`_reportDecision\` with your current reasoning. This is mandatory — do not call any evidence tool without calling \`_reportDecision\` immediately before it in the same turn. Fields: runningScore (your current running estimate 0–100), bandProximity ("deep" when score is clearly inside a band, "boundary" when within ~5 pts of a band edge), unresolvedMandatory (names of tier-1/2/3 tools not yet called: getSourceCode, checkLpLock, getDeployerHistory), reason (one evidence-cited sentence explaining WHY you are continuing or stopping — cite the specific field and value that drove the decision), action ("continue" to keep gathering or "stop" if you already have sufficient evidence to issue a verdict), nextTool (name of the real tool you are about to call, omit if action="stop").
+10. A single decisive flag (proxy detected +35, dev wallet >50% +40, deployer velocity 5+/hr +35) is sufficient to stop immediately at CRITICAL/HIGH — do not run remaining tiers just to be thorough. In that case call \`_reportDecision\` with action="stop" and then emit your final JSON verdict immediately (no further tool calls).
 11. A LOW verdict requires tier 1 (source), tier 2 (LP lock), and tier 3 (deployer history) to have all been attempted and come back clean — never output LOW with unresolvedMandatory non-empty.
 12. If mandatory tiers remain unresolved when the iteration budget is exhausted, output verdict "INSUFFICIENT" with unresolvedMandatory populated — never force a score onto incomplete evidence.
 13. CHECK "hasLiquidity" FIRST, BEFORE SCORING ANY LIQUIDITY-DEPENDENT FIELD. This is the single most important rule for freshly-launched tokens:
@@ -344,6 +344,31 @@ export async function scoreWithLLM(
 
 // ─── Agentic function-calling variant ───────────────────────────────────────────
 
+/**
+ * Pseudo-tool that Gemini calls to emit its stop/continue reasoning.
+ * It is passed alongside the real evidence tools so Gemini can call it as a
+ * structured function call (which we intercept and parse into IterationDecision)
+ * rather than embedding a JSON block in free text (which we'd have to scrape).
+ * It is NEVER forwarded to dispatchTool and NEVER gets a functionResponse —
+ * we simply acknowledge it and continue the loop.
+ */
+const REPORT_DECISION_TOOL = {
+  name: "_reportDecision",
+  description: "MANDATORY: Call this immediately before every evidence tool call, and also when you decide to stop early. Reports your current reasoning so the audit log captures why you continued or stopped.",
+  parameters: {
+    type: "object",
+    properties: {
+      runningScore:        { type: "number",  description: "Your running risk estimate 0–100 based on evidence gathered so far." },
+      bandProximity:       { type: "string",  enum: ["deep", "boundary"], description: "\"deep\" = clearly inside a band, \"boundary\" = within ~5 pts of a band edge." },
+      unresolvedMandatory: { type: "array",   items: { type: "string" }, description: "Names of mandatory-tier tools (getSourceCode, checkLpLock, getDeployerHistory) not yet called." },
+      reason:              { type: "string",  description: "One evidence-cited sentence: cite the specific field and value driving the continue/stop decision." },
+      action:              { type: "string",  enum: ["continue", "stop"], description: "\"continue\" to call more tools, \"stop\" if you have sufficient evidence to emit a final verdict." },
+      nextTool:            { type: "string",  description: "Name of the real tool you are about to call. Omit or set null when action=\"stop\"." },
+    },
+    required: ["runningScore", "bandProximity", "unresolvedMandatory", "reason", "action"],
+  },
+} as const;
+
 interface ToolCall {
   name: string;
   args: Record<string, unknown>;
@@ -526,9 +551,17 @@ export async function scoreWithLLMAgentic(
   const transcript: ToolCallRecord[] = [];
   let runningScore = 0;
 
+  // Prepend _reportDecision so Gemini can call it as a structured function
+  // before each real tool. We intercept it and never forward it to dispatchTool.
+  const allTools: readonly unknown[] = [REPORT_DECISION_TOOL, ...tools];
+
+  // The most recent _reportDecision call the model made in this turn.
+  // We attach it to the next real tool call's ToolCallRecord.
+  let pendingDecision: import("../utils/interface.js").IterationDecision | null = null;
+
   for (let i = 0; i < maxIterations; i++) {
     try {
-      const response = await callGeminiWithTools(messages, tools);
+      const response = await callGeminiWithTools(messages, allTools);
 
       if (response.type === "final") {
         const validated = validateParsed(response.json);
@@ -548,42 +581,69 @@ export async function scoreWithLLMAgentic(
         };
       }
 
-      // Execute all tool calls from this turn, then append them as a single
-      // model-turn / user-turn pair (see appendFunctionResults for why they
-      // must be batched rather than appended one at a time).
+      // Partition: _reportDecision calls (meta) vs. real tool calls.
+      const metaCalls  = response.toolCalls.filter(c => c.name === "_reportDecision");
+      const realCalls  = response.toolCalls.filter(c => c.name !== "_reportDecision");
+
+      // Parse _reportDecision calls first — take the LAST one if the model
+      // somehow batched several (only the immediately-preceding one matters).
+      for (const meta of metaCalls) {
+        const a = meta.args as Record<string, unknown>;
+        const parsed: import("../utils/interface.js").IterationDecision = {
+          runningScore:        typeof a.runningScore  === "number" ? a.runningScore  : runningScore,
+          bandProximity:       a.bandProximity === "boundary"       ? "boundary"     : "deep",
+          unresolvedMandatory: Array.isArray(a.unresolvedMandatory) ? (a.unresolvedMandatory as string[]) : mandatoryTiers.filter(t => !transcript.some(r => r.name === t)),
+          reason:              typeof a.reason        === "string"  ? a.reason       : `Called ${realCalls[0]?.name ?? "unknown"}`,
+          action:              a.action === "stop"                   ? "stop"         : "continue",
+          nextTool:            typeof a.nextTool      === "string"  ? a.nextTool     : realCalls[0]?.name,
+        };
+        pendingDecision = parsed;
+        decisions.push(parsed);
+
+        // Update runningScore from the model's own estimate
+        runningScore = parsed.runningScore;
+
+        // Model decided to stop — no further tool calls needed this turn.
+        // The real call list should be empty; if not, honour the stop signal.
+        if (parsed.action === "stop") {
+          // Remove any real tool calls the model included in the same turn after
+          // a stop decision — they should not be executed.
+          realCalls.length = 0;
+        }
+      }
+
+      // If only _reportDecision was called (stop signal or pre-final), ask the
+      // model for its verdict without any functionResponse (just continue loop).
+      if (realCalls.length === 0) {
+        // Append the model's turn verbatim so Gemini knows it was received.
+        // We don't send functionResponses for _reportDecision — it has no output.
+        messages = [...messages, response.modelContent];
+        continue;
+      }
+
+      // Execute all real tool calls and build transcript entries.
       const results: Array<{ call: ToolCall; output: unknown }> = [];
-      for (const call of response.toolCalls) {
+      for (const call of realCalls) {
+        // Use the model-provided decision; fall back to a minimal sentinel if
+        // the model omitted _reportDecision for this call.
+        const decision: import("../utils/interface.js").IterationDecision = pendingDecision ?? {
+          runningScore,
+          bandProximity: runningScore < 25 || runningScore > 75 ? "deep" : "boundary",
+          unresolvedMandatory: mandatoryTiers.filter(t => !transcript.some(r => r.name === t)),
+          reason: `[model omitted _reportDecision before ${call.name}]`,
+          action: "continue",
+          nextTool: call.name,
+        };
+        // Reset so the next real call doesn't reuse the same decision object.
+        pendingDecision = null;
+
         try {
           const output = await dispatchTool(call.name, call.args);
-          const decision: import("../utils/interface.js").IterationDecision = {
-            runningScore,
-            bandProximity: runningScore < 25 || runningScore > 75 ? "deep" : "boundary",
-            unresolvedMandatory: mandatoryTiers.filter(t => !transcript.some(r => r.name === t)),
-            reason: `Executed ${call.name} to gather evidence`,
-            action: "continue",
-            nextTool: call.name,
-          };
-          decisions.push(decision);
           transcript.push({ name: call.name, args: call.args, output, ts: Date.now(), decision });
           results.push({ call, output });
-          
-          // Update running score based on flag contributions
-          if (typeof output === 'object' && output !== null && 'flags' in output) {
-            const flags = (output as { flags: Array<{ points: number }> }).flags;
-            runningScore += flags.reduce((sum, f) => sum + f.points, 0);
-          }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           const output = { error: msg };
-          const decision: import("../utils/interface.js").IterationDecision = {
-            runningScore,
-            bandProximity: runningScore < 25 || runningScore > 75 ? "deep" : "boundary",
-            unresolvedMandatory: mandatoryTiers.filter(t => !transcript.some(r => r.name === t)),
-            reason: `Failed to execute ${call.name}: ${msg}`,
-            action: "continue",
-            nextTool: call.name,
-          };
-          decisions.push(decision);
           transcript.push({ name: call.name, args: call.args, output, ts: Date.now(), decision });
           results.push({ call, output });
         }

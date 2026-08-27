@@ -9,7 +9,7 @@
 import "dotenv/config";
 import { createPublicClient, http } from "viem";
 import { base } from "viem/chains";
-import { collectEvidence } from "./src/lib/evidence.js";
+import { collectMinimalEvidence } from "./src/lib/evidence.js";
 import { fetchTokenMetadata } from "./src/lib/erc20.js";
 
 // Create RPC client
@@ -47,7 +47,7 @@ async function testOwnerHandling() {
       
       // Try the evidence collection which includes owner() check
       try {
-        const evidence = await collectEvidence(
+        const evidence = await collectMinimalEvidence(
           client,
           testToken,
           "0x0000000000000000000000000000000000000000" as const, // dummy pool
@@ -111,7 +111,7 @@ async function testV4QuoterHandling() {
     
     // Test the sellability function with V4 parameters
     try {
-      const evidence = await collectEvidence(
+      const evidence = await collectMinimalEvidence(
         client,
         testToken,
         v4PoolId,
@@ -182,7 +182,7 @@ async function testInvalidAddress() {
     
     // Try evidence collection - should handle gracefully
     try {
-      const evidence = await collectEvidence(
+      const evidence = await collectMinimalEvidence(
         client,
         invalidToken,
         "0x0000000000000000000000000000000000000000" as const,

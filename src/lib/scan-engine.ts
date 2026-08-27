@@ -462,6 +462,7 @@ export async function scanBlockRange(
     }
 
     // ── Deferred re-verification pass ────────────────────────────────────────
+    const analysisId = rugResult.analysisId;
     const lastDecision = rugResult.decisionTrace?.[rugResult.decisionTrace.length - 1];
     const needsRecheck = analysisId && lastDecision?.unresolvedMandatory.length;
 
@@ -530,19 +531,6 @@ export async function scanBlockRange(
           console.log(`  [reverify] Updated analysis ${analysisId} for ${newToken}`);
         } catch (err) {
           console.error(`  [reverify] Failed for ${newToken}:`, err);
-        }
-      }, recheckDelay);
-    }
-            ...(Object.keys(evidencePatch).length > 0 ? { evidencePatch } : {}),
-            // Surface LP status at the top level for the list view
-            ...(recheck.lpPositionStatus !== undefined
-              ? { lpPositionStatus: recheck.lpPositionStatus } as never
-              : {}),
-          });
-
-          console.log(`  [reverify] Record ${analysisId} patched for ${newToken}`);
-        } catch (err) {
-          console.error(`  [reverify] Re-verification failed for ${newToken}: ${err}`);
         }
       }, recheckDelay);
     }

@@ -9,6 +9,8 @@ import type { TokenEvidence } from "../evidence.js";
 import type { LLMScoreResult } from "./llm-score.js";
 import type { ToolCallRecord } from "../rugcheck-types.js";
 import type { ToolContext, IterationDecision } from "../utils/interface.js";
+// IterationDecision is used only for the decisions[] array type — scoreWithLLMAgentic
+// owns pushing to it; agent-loop.ts reads it for post-loop validation only.
 import { scoreWithLLMAgentic } from "./llm-score.js";
 import { AGENT_TOOLS, dispatchTool } from "./agent-tools.js";
 import { validateGrounding, validateStopConditions } from "./grounding.js";
@@ -27,19 +29,19 @@ export async function runAgentLoop(
 ): Promise<AgentLoopResult> {
   const maxIter = opts.maxIterations ?? 12;
   const decisions: IterationDecision[] = [];
-  let runningScore = 0;
   const MANDATORY_TIERS = ["getSourceCode", "checkLpLock", "getDeployerHistory"];
-  let resolvedTiers = new Set<string>();
+  const resolvedTiers = new Set<string>();
 
+  // scoreWithLLMAgentic owns the decisions[] array — it pushes model-parsed
+  // IterationDecision objects from _reportDecision calls. This dispatcher only
+  // needs to unwrap the tool output and track which real tools were called.
   const toolDispatcher = async (name: string, args: Record<string, unknown>) => {
     const result = await dispatchTool(name, args, ctx);
     resolvedTiers.add(name);
-    // The dispatcher now returns { output, decision }, extract accordingly
-    if ('decision' in result && 'output' in result) {
-      decisions.push((result as { output: unknown; decision: IterationDecision }).decision);
-      return (result as { output: unknown; decision: IterationDecision }).output;
+    // dispatchTool returns { output, decision }; we only need output here.
+    if (typeof result === "object" && result !== null && "output" in result) {
+      return (result as { output: unknown }).output;
     }
-    // Fallback for compatibility during transition
     return result as unknown;
   };
 

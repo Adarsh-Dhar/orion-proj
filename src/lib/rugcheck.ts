@@ -20,7 +20,7 @@ type AnyClient = PublicClient<any>;
 
 import { collectMinimalEvidence }   from "./evidence.js";
 import { scoreWithLLM }      from "./agents/llm-score.js";
-import { computeScore }      from "./scoring.js";
+import { computeScore, breakdownToFlags, breakdownToSummary } from "./scoring.js";
 import type { TokenEvidence } from "./evidence.js";
 import type { BotState } from "./state.js";
 import { getDeployerHistory, recordDeployerToken } from "./state.js";
@@ -265,15 +265,31 @@ export async function runRugCheckLLM(
     };
   }
 
-  // ── Compute the authoritative, decimal-precision score deterministically ──
-  // We keep the LLM's flags/summary/verdict-reasoning (qualitative judgment)
-  // but the actual number is recomputed from raw evidence in scoring.ts so
-  // it reflects the exact percentages/amounts for THIS token rather than an
-  // LLM-guessed round integer. See scoring.ts for why this fixes clustering.
+  // ── Authoritative score, verdict, flags, and summary ─────────────────────
+  // computeScore() is the single source of truth for everything displayed as
+  // the judgment. The LLM/agent still drives investigation (tool calls) and
+  // may emit a qualitative verdict, but that number was never precise — and
+  // keeping the agent's flags/summary while swapping in a different score is
+  // how reports ended up saying LOW in the trace and MEDIUM in the header.
+  // INSUFFICIENT is the exception: that means mandatory evidence is missing,
+  // not that the available evidence scored low, so we must not overwrite it.
   const computed = computeScore(evidence);
-  llmResult = { ...llmResult, score: computed.score, verdict: computed.verdict };
+  if (llmResult.verdict !== "INSUFFICIENT") {
+    if (llmResult.verdict !== computed.verdict || llmResult.score !== computed.score) {
+      console.warn(
+        `  [score] Agent/LLM ${llmResult.verdict} (${llmResult.score}) overridden by deterministic ${computed.verdict} (${computed.score})`
+      );
+    }
+    llmResult = {
+      ...llmResult,
+      score:   computed.score,
+      verdict: computed.verdict,
+      flags:   breakdownToFlags(computed.breakdown, computed.verdict),
+      summary: breakdownToSummary(computed.breakdown, computed.verdict, meta.symbol),
+    };
+  }
 
-  console.log(`  Gemini flags + deterministic score: ${llmResult.verdict} (${llmResult.score}/100)`);
+  console.log(`  Deterministic score: ${llmResult.verdict} (${llmResult.score}/100)`);
   console.log(`  Score breakdown: ${computed.breakdown.map(b => `${b.id}=${b.contribution}`).join(", ")}`);
   
   // Log tool call transcript if it exists
@@ -368,8 +384,8 @@ export function formatRugReport(
 ): string {
   const lines: string[] = [];
   const v = VERDICT_EMOJI[r.verdict];
-  const scoredBy = r.scoringMethod === "llm"
-    ? `LLM (Gemini)${r.scoringError ? " — SCORING FAILED, see flags" : ""}`
+  const scoredBy = (r.scoringMethod === "llm" || r.scoringMethod === "llm-agentic")
+    ? `LLM (Gemini)${r.scoringMethod === "llm-agentic" ? " + agent" : ""}${r.scoringError ? " — SCORING FAILED, see flags" : ""}`
     : "rule engine";
 
   lines.push(`╔══ RUG CHECK REPORT ════════════════════════════════════════════`);
@@ -459,9 +475,17 @@ export function formatRugReport(
   
   const last = r.decisionTrace?.[r.decisionTrace.length - 1];
   if (last) {
-    lines.push(`║  ${r.verdict === "INSUFFICIENT"
-      ? `⚪ Insufficient data — still missing: ${last.unresolvedMandatory.join(", ")}`
-      : `📊 ${last.reason}`}`);
+    // Never echo last.reason here — it is the agent's own (possibly discarded)
+    // stop sentence, e.g. "Emitting LOW verdict", and must not sit next to a
+    // deterministic MEDIUM/HIGH/CRITICAL score. Surface investigation coverage
+    // only; the flags + summary above already explain the displayed number.
+    if (r.verdict === "INSUFFICIENT") {
+      lines.push(`║  ⚪ Insufficient data — still missing: ${last.unresolvedMandatory.join(", ")}`);
+    } else if (last.unresolvedMandatory.length === 0) {
+      lines.push(`║  📊 All mandatory tiers checked`);
+    } else {
+      lines.push(`║  📊 Score from collected evidence; still missing: ${last.unresolvedMandatory.join(", ")}`);
+    }
   }
   
   lines.push(`║  BaseScan : https://basescan.org/address/${r.tokenAddress}`);

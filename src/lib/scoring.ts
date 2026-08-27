@@ -8,13 +8,12 @@
  * exact same score, and a chunk of "100"s were actually just LLM failures
  * being force-defaulted to max risk.
  *
- * This module replaces that step. The LLM (see llm-score.ts) still decides
- * WHICH qualitative risk flags apply and writes the human-readable detail
- * sentences — that's a judgment call it's good at. But the actual number is
- * computed here, deterministically, in code, as a continuous function of
- * the real evidence values (percentages, ETH amounts, ratios) rather than
- * fixed point buckets. Two tokens that trip the "same" flags will still get
- * different scores because their underlying numbers differ.
+ * This module replaces that step. Score, verdict, flags, and summary shown
+ * to the user are all derived from this breakdown (see breakdownToFlags /
+ * breakdownToSummary) so the narrative cannot disagree with the number.
+ * The LLM/agent still runs the investigation (which tools to call); it does
+ * not own the displayed judgment. Two tokens that trip the "same" factors
+ * will still get different scores because their underlying numbers differ.
  *
  * The output is a float with 2 decimal places, e.g. 87.43, not an integer.
  */
@@ -357,15 +356,68 @@ export function computeScore(evidence: TokenEvidence): ComputedScore {
   };
 }
 
+/**
+ * Convert a computeScore() breakdown into RiskFlag[] so the displayed flags
+ * always match the displayed score when the deterministic scorer overrides the
+ * agent's verdict.  Only entries with a non-zero contribution are included.
+ */
+export function breakdownToFlags(
+  breakdown: ComputedScore["breakdown"],
+  verdict: RiskLevel
+): RiskFlag[] {
+  function severityFor(pts: number): RiskLevel {
+    if (pts >= 30) return "CRITICAL";
+    if (pts >= 20) return "HIGH";
+    if (pts >= 10) return "MEDIUM";
+    return "LOW";
+  }
+
+  return breakdown
+    // Ignore sub-1pt decay leftovers (e.g. "has any liquidity") so they
+    // don't show up as risk flags while still affecting the exact score.
+    .filter(b => b.contribution >= 1)
+    .map(b => ({
+      id:       b.id,
+      label:    toTitleCase(b.id),
+      detail:   b.label,
+      severity: severityFor(b.contribution),
+      points:   Math.round(b.contribution),
+    }));
+}
+
+/**
+ * Write a one-sentence summary from the top contributing breakdown entries.
+ */
+export function breakdownToSummary(
+  breakdown: ComputedScore["breakdown"],
+  verdict: RiskLevel,
+  tokenSymbol: string
+): string {
+  const top = [...breakdown]
+    .filter(b => b.contribution >= 1)
+    .sort((a, b) => b.contribution - a.contribution)
+    .slice(0, 2);
+
+  if (top.length === 0) return `${tokenSymbol} shows no significant risk factors (${verdict}).`;
+
+  const factors = top.map(b => b.label.replace(/\s*\(.*$/, "").toLowerCase()).join(" and ");
+  const riskWord = verdict === "CRITICAL" ? "Critical" : verdict === "HIGH" ? "High" : verdict === "MEDIUM" ? "Medium" : "Low";
+  return `${riskWord} risk: ${factors}.`;
+}
+
+function toTitleCase(id: string): string {
+  return id.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+}
+
 export function attachComputedScore(
   evidence: TokenEvidence,
-  llmFlags: RiskFlag[]
+  _llmFlags: RiskFlag[]
 ): { score: number; verdict: RiskLevel; flags: RiskFlag[]; breakdown: ComputedScore["breakdown"] } {
   const computed = computeScore(evidence);
   return {
     score: computed.score,
     verdict: computed.verdict,
-    flags: llmFlags,
+    flags: breakdownToFlags(computed.breakdown, computed.verdict),
     breakdown: computed.breakdown,
   };
 }

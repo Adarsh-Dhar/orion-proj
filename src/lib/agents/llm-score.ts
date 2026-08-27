@@ -13,13 +13,11 @@
  *   the result is accepted. Malformed responses are rejected outright.
  * - rpcWarnings from evidence are injected into the prompt so the LLM
  *   explicitly knows which fields could not be verified.
- * - IMPORTANT: the `score` field returned here is advisory only. LLMs
- *   reliably round to "clean" integers (85, 65, 45...) regardless of how
- *   granular the evidence actually is, which causes unrelated tokens to
- *   collide on identical scores. The authoritative, decimal-precision score
- *   shown to users is computed deterministically in scoring.ts from the raw
- *   evidence — see computeScore(). Callers should use flags/verdict/summary
- *   from this module but NOT this module's `score` for display.
+ * - IMPORTANT: score, verdict, flags, and summary returned here are advisory.
+ *   LLMs round to clean integers and can narrate evidence they didn't actually
+ *   read. runRugCheckLLM replaces all four with computeScore() / breakdown
+ *   helpers so the displayed report is internally consistent. The exception is
+ *   verdict === "INSUFFICIENT", which must be preserved.
  */
 
 import type { TokenEvidence } from "../evidence.js";

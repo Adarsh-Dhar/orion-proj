@@ -16,10 +16,9 @@ import {
   UNISWAP_V4_POOL_MANAGER,
   POOL_CREATED_ABI,
   V4_INITIALIZE_ABI,
-  KNOWN_QUOTE_ASSETS,
-  QUOTE_ASSET_LABELS,
   type Venue,
 } from "./utils/constants.js";
+import { isKnownQuoteAsset, getQuoteAssetLabel } from "./quote-assets.js";
 import { fetchTokenMetadata } from "./erc20.js";
 import { runRugCheckLLM, formatRugReport } from "./rugcheck.js";
 import { reVerifyEvidence } from "./evidence.js";
@@ -50,14 +49,14 @@ export function formatFee(fee: number): string {
 export function identifyTokens(token0: Address, token1: Address): TokenIdentity {
   const t0 = token0.toLowerCase();
   const t1 = token1.toLowerCase();
-  const t0known = KNOWN_QUOTE_ASSETS.has(t0);
-  const t1known = KNOWN_QUOTE_ASSETS.has(t1);
+  const t0known = isKnownQuoteAsset(t0);
+  const t1known = isKnownQuoteAsset(t1);
 
   if (t0known && !t1known) {
-    return { newToken: token1, pairedWith: token0, pairedLabel: QUOTE_ASSET_LABELS[t0] ?? shortAddr(token0) };
+    return { newToken: token1, pairedWith: token0, pairedLabel: getQuoteAssetLabel(t0, shortAddr(token0)) };
   }
   if (t1known && !t0known) {
-    return { newToken: token0, pairedWith: token1, pairedLabel: QUOTE_ASSET_LABELS[t1] ?? shortAddr(token1) };
+    return { newToken: token0, pairedWith: token1, pairedLabel: getQuoteAssetLabel(t1, shortAddr(token1)) };
   }
   if (!t0known && !t1known) {
     return { newToken: token0, pairedWith: token1, pairedLabel: "unknown" };
@@ -222,7 +221,7 @@ export async function resolveTokenPool(
             if (c0 !== t && c1 !== t) continue;
             const pairedAddr  = c0 === t ? currency1 : currency0;
             const pairedLower = pairedAddr.toLowerCase();
-            const pairedLabel = QUOTE_ASSET_LABELS[pairedLower] ?? shortAddr(pairedAddr);
+            const pairedLabel = getQuoteAssetLabel(pairedLower, shortAddr(pairedAddr));
             return { poolAddress: id as Address, pairedLabel, pairedAsset: pairedAddr, venue: "v4" };
           }
         } catch {

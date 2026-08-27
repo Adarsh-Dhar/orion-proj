@@ -24,6 +24,7 @@ import { formatAlertCard } from "./lib/rugcheck.js";
 import { loadState, saveState, alreadyPosted, markPosted, addToWatchlist, getWatchlistTokens, recordLiquiditySnapshot } from "./lib/state.js";
 import { checkLiquidityDelta } from "./lib/evidence.js";
 import { UNISWAP_V3_FACTORY, UNISWAP_V4_POOL_MANAGER } from "./lib/utils/constants.js";
+import { initQuoteAssets } from "./lib/quote-assets.js";
 
 // ─── Env validation ───────────────────────────────────────────────────────────
 
@@ -251,6 +252,11 @@ async function loop(fn: () => Promise<void>, intervalMs: number): Promise<void> 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
+  // Load the live quote-asset list before any scanning starts — near-instant
+  // if a disk cache exists, otherwise does one blocking fetch so the first
+  // scan still has full coverage. Falls back to the static list on failure.
+  await initQuoteAssets();
+
   // Check if stored block is too old or ahead of current block
   const currentBlock = await getBlockNumberWithRetry();
   if (currentBlock > 0n && lastScannedBlock !== null) {

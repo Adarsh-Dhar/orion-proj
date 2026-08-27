@@ -18,6 +18,10 @@ export const UNISWAP_V4_STATE_VIEW =
 /** Well-known "quote asset" addresses on Base (all lowercase for easy comparison).
  *  A newly created pool almost always pairs the new token against one of these.
  *  Note: V4 uses address(0) for native ETH instead of WETH.
+ *
+ * @deprecated Use `isKnownQuoteAsset()` from `./quote-assets.js` instead.
+ *  This set is kept for backward-compatibility with any external consumers
+ *  but is no longer used by scan-engine.ts.
  */
 export const KNOWN_QUOTE_ASSETS = new Set<string>([
   "0x0000000000000000000000000000000000000000", // ETH   (native, V4 only)
@@ -27,7 +31,12 @@ export const KNOWN_QUOTE_ASSETS = new Set<string>([
   "0x50c5725949a6f0c72e6c4a641f24049a917db0cb", // DAI   (Base)
 ]);
 
-/** Human-readable labels for known quote assets (used in log output) */
+/** Human-readable labels for known quote assets (used in log output)
+ *
+ * @deprecated Use `getQuoteAssetLabel()` from `./quote-assets.js` instead.
+ *  This record is kept for backward-compatibility with any external consumers
+ *  but is no longer used by scan-engine.ts.
+ */
 export const QUOTE_ASSET_LABELS: Record<string, string> = {
   "0x0000000000000000000000000000000000000000": "ETH",
   "0x4200000000000000000000000000000000000006": "WETH",

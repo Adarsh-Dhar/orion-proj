@@ -107,3 +107,4 @@ export { computeScore, attachComputedScore } from "./scoring.js";
 export { storeAnalysis, getAnalysis, getLatestAnalysis, getAllAnalysisIds, getMultipleAnalyses, updateAnalysis } from "./analysis-store.js";
 export { runAgentLoop } from "./agents/agent-loop.js";
 export { AGENT_TOOLS, dispatchTool } from "./agents/agent-tools.js";
+export { initQuoteAssets, isKnownQuoteAsset, getQuoteAssetLabel } from "./quote-assets.js";

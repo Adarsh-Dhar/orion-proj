@@ -18,7 +18,7 @@ import {
   V4_INITIALIZE_ABI,
   type Venue,
 } from "./utils/constants.js";
-import { isKnownQuoteAsset, getQuoteAssetLabel } from "./quote-assets.js";
+import { isKnownQuoteAsset, getQuoteAssetLabel, CORE_QUOTE_ASSETS } from "./quote-assets.js";
 import { fetchTokenMetadata } from "./erc20.js";
 import { runRugCheckLLM, formatRugReport } from "./rugcheck.js";
 import { reVerifyEvidence } from "./evidence.js";
@@ -59,9 +59,16 @@ export function identifyTokens(token0: Address, token1: Address): TokenIdentity 
     return { newToken: token0, pairedWith: token1, pairedLabel: getQuoteAssetLabel(t1, shortAddr(token1)) };
   }
   if (!t0known && !t1known) {
-    return { newToken: token0, pairedWith: token1, pairedLabel: "unknown" };
+    // Neither side is a recognized base/quote pairing asset (WETH, USDC,
+    // etc.) — this is NOT a new-token-vs-base launch, it's a pool between
+    // two arbitrary tokens (e.g. two existing tokens, or two unrelated new
+    // ones). Previously this branch guessed token0 was "the new token" and
+    // sent it through the full evidence + LLM rug-check pipeline anyway,
+    // which is what caused the scanner to pick up pools outside its
+    // intended scope. Skip it instead.
+    return { newToken: null, pairedWith: null, pairedLabel: "no-known-quote-asset" };
   }
-  // both known quote assets — ambiguous
+  // both known quote assets — genuinely ambiguous (e.g. a WETH/USDC pool)
   return { newToken: null, pairedWith: null, pairedLabel: "ambiguous" };
 }
 
@@ -141,13 +148,6 @@ const GET_POOL_ABI = [
   },
 ] as const;
 
-const QUOTE_ASSETS_LIST = [
-  { address: "0x4200000000000000000000000000000000000006" as Address, label: "WETH"  },
-  { address: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" as Address, label: "USDC"  },
-  { address: "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca" as Address, label: "USDbC" },
-  { address: "0x50c5725949a6f0c72e6c4a641f24049a917db0cb" as Address, label: "DAI"   },
-] as const;
-
 const FEE_TIERS = [100, 500, 3_000, 10_000] as const;
 
 const NULL_POOL = "0x0000000000000000000000000000000000000000";
@@ -164,7 +164,7 @@ export async function resolveTokenPool(
   tokenAddress: Address
 ): Promise<ResolvedPool | null> {
   // ── V3 path ──────────────────────────────────────────────────────────────
-  for (const quote of QUOTE_ASSETS_LIST) {
+  for (const quote of CORE_QUOTE_ASSETS) {
     for (const fee of FEE_TIERS) {
       try {
         const pool = await client.readContract({
@@ -395,7 +395,11 @@ export async function scanBlockRange(
     const { newToken, pairedLabel } = identifyTokens(token0, token1);
 
     if (!newToken) {
-      console.log(`  ⚠️  Ambiguous pair — both tokens are known quote assets. Skipping.\n`);
+      if (pairedLabel === "ambiguous") {
+        console.log(`  ⚠️  Ambiguous pair — both tokens are known base assets (e.g. WETH/USDC). Skipping.\n`);
+      } else {
+        console.log(`  ⚠️  Neither token is a known base asset — not a new-token launch. Skipping.\n`);
+      }
       console.log(`${"─".repeat(66)}\n`);
       skipped++;
       continue;

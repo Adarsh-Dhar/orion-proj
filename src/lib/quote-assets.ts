@@ -1,19 +1,59 @@
 /**
- * quote-assets.ts — live quote-asset list for the Uniswap pool scanner.
+ * quote-assets.ts — quote-asset detection for the Uniswap pool scanner.
  *
- * Fetches Coingecko's Base token list at startup and keeps it fresh with a
- * background refresh every 6 hours.  Throws on fetch failure — the bot should
- * not start with a stale or missing list.
+ * Two separate concerns, kept deliberately separate:
  *
- * Sync API (safe to call from the hot scan path):
- *   isKnownQuoteAsset(address)          → boolean
- *   getQuoteAssetLabel(address, fallback) → string
+ * 1. GATE (isKnownQuoteAsset): is this address a legitimate base/quote
+ *    pairing asset? Backed by the small curated CORE_QUOTE_ASSETS list only.
+ *    This decides whether a pool looks like a genuine new-token launch.
+ *
+ * 2. LABEL (getQuoteAssetLabel): what should we call this address when
+ *    displaying it? Backed by CORE_QUOTE_ASSETS first, then a much broader
+ *    list fetched from Coingecko's Base token list (refreshed every 6h) as a
+ *    cosmetic fallback, then the caller's own fallback (e.g. shortAddr()).
+ *
+ * The broad Coingecko list must never be used for (1) — it indexes
+ * thousands of tokens (including low-quality/scam ones), so using it as the
+ * "is this a real base asset" gate caused the scanner to misclassify pools
+ * between two unrelated tokens as new-token-vs-base launches.
  *
  * Async init (call once at startup, before any scanning):
  *   initQuoteAssets()                   → Promise<void>  (throws on failure)
  */
 
 import { readFileSync, writeFileSync, existsSync } from "fs";
+import type { Address } from "viem";
+
+// ─── Curated core pairing assets ──────────────────────────────────────────────
+//
+// This is the actual gate for "is this pool a new-token-vs-base-asset launch".
+// It is intentionally small and hand-picked — these are the only assets a
+// legitimate new token is normally launched against on Base. It must NOT be
+// replaced with the full Coingecko list: that list indexes thousands of
+// tokens (including plenty of low-quality/scam ones), so using it as the
+// gate caused two problems:
+//   1. Pools between two unrelated/junk tokens were misclassified as
+//      "new token vs. known base" launches whenever either side happened to
+//      already be indexed by Coingecko for unrelated reasons.
+//   2. identifyTokens() had to guess when neither side matched, and it
+//      guessed wrong (see scan-engine.ts fix) — so effectively almost any
+//      pool could end up being scanned as a "new token" launch.
+export const CORE_QUOTE_ASSETS: ReadonlyArray<{ address: Address; label: string }> = [
+  { address: "0x4200000000000000000000000000000000000006", label: "WETH"   },
+  { address: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", label: "USDC"   },
+  { address: "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca", label: "USDbC"  },
+  { address: "0x50c5725949a6f0c72e6c4a641f24049a917db0cb", label: "DAI"    },
+  { address: "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22", label: "cbETH"  },
+  { address: "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf", label: "cbBTC"  },
+  { address: "0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452", label: "wstETH" },
+  { address: "0x04c0599ae5a44757c0af6f9ec3b93da8976c150a", label: "weETH"  },
+  { address: "0x940181a94a35a4569e4529a3cdfb74e38fd98631", label: "AERO"   },
+  { address: "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42", label: "EURC"   },
+] as const;
+
+const CORE_QUOTE_MAP = new Map<string, string>(
+  CORE_QUOTE_ASSETS.map((t) => [t.address.toLowerCase(), t.label])
+);
 
 // ─── Coingecko endpoint ───────────────────────────────────────────────────────
 
@@ -27,17 +67,35 @@ const CACHE_PATH = "./quote-assets-cache.json";
 
 // ─── In-memory state ──────────────────────────────────────────────────────────
 
-/** Lower-cased address → ticker symbol. Empty until initQuoteAssets() resolves. */
+/**
+ * Lower-cased address → ticker symbol, from the broad Coingecko list.
+ * This is ONLY used for display labels (e.g. showing a friendly symbol for
+ * whatever token a new token happened to pair against) — it is never used
+ * to decide whether something counts as a legitimate quote/base asset.
+ * Empty until initQuoteAssets() resolves.
+ */
 const quoteAssetMap = new Map<string, string>();
 
 // ─── Sync public API ──────────────────────────────────────────────────────────
 
+/**
+ * Is this address a legitimate base/quote pairing asset (WETH, USDC, etc.)?
+ * This is the gate used by identifyTokens() to decide whether a pool looks
+ * like a genuine new-token launch. Deliberately checks ONLY the small
+ * curated CORE_QUOTE_ASSETS list — never the broad Coingecko list.
+ */
 export function isKnownQuoteAsset(address: string): boolean {
-  return quoteAssetMap.has(address.toLowerCase());
+  return CORE_QUOTE_MAP.has(address.toLowerCase());
 }
 
+/**
+ * Best-effort display label for an address. Checks the curated core list
+ * first, then falls back to the broad Coingecko-derived list (cosmetic
+ * only), then the caller-supplied fallback (e.g. a shortened address).
+ */
 export function getQuoteAssetLabel(address: string, fallback: string): string {
-  return quoteAssetMap.get(address.toLowerCase()) ?? fallback;
+  const lower = address.toLowerCase();
+  return CORE_QUOTE_MAP.get(lower) ?? quoteAssetMap.get(lower) ?? fallback;
 }
 
 // ─── Cache helpers ────────────────────────────────────────────────────────────

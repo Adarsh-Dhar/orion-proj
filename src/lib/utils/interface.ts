@@ -134,7 +134,7 @@ export interface ScanOptions {
 }
 
 export interface TokenIdentity {
-  newToken: Address | null;   // null = both are known quote assets (ambiguous)
+  newToken: Address | null;   // null = skip this pool (see pairedLabel: "ambiguous" or "no-known-quote-asset")
   pairedWith: Address | null;
   pairedLabel: string;
 }

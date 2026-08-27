@@ -51,12 +51,19 @@ if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN
 const SNIPER_INTERVAL_MS = 5 * 60_000; // 5 min
 const WATCHLIST_MAX_AGE_MINUTES = 120; // 2 hours
 /**
- * Block lookback per tick — mirrors scan-historical.ts's default range.
- * 50,048,826 - 50,045,225 = 3,601 blocks ≈ 2 hours of Base history.
- * Using a large window means each tick catches everything even if pools
- * are sparse, and the watermark prevents double-processing.
+ * Safety ceiling only — NOT the normal per-tick window.
+ *
+ * Normal operation: sniperTick() always scans lastScannedBlock → currentBlock,
+ * i.e. every block produced since the previous tick. On Base (~2s/block) a
+ * healthy 5-min cadence means that's naturally ~150 blocks — there is no
+ * fixed "5-minute window" constant needed for the happy path.
+ *
+ * This constant only kicks in for the pathological case where fromBlock is
+ * somehow ahead of currentBlock (clock skew / bad state) and we need to pick
+ * a fallback lookback. Kept small on purpose — this bot intentionally does
+ * NOT backfill large historical ranges (see main()'s startup reset).
  */
-const BLOCKS_PER_INTERVAL = 3_600n;
+const BLOCKS_PER_INTERVAL = 200n; // ~150 blocks/5min on Base + buffer
 
 /** Post every token regardless of verdict. */
 const POST_VERDICTS = new Set(["LOW", "MEDIUM", "HIGH", "CRITICAL"]);
@@ -111,9 +118,9 @@ async function sniperTick(): Promise<void> {
 
   // Get current block to ensure we don't scan ahead of the chain
   const currentBlock = await getBlockNumberWithRetry();
-  
+
   // Ensure we don't scan ahead of the current block
-  let fromBlock = lastScannedBlock ?? 0n;
+  let fromBlock = lastScannedBlock ?? currentBlock;
   if (fromBlock > currentBlock) {
     console.log(`[bot] Warning: fromBlock ${fromBlock} is ahead of current block ${currentBlock}, resetting`);
     fromBlock = currentBlock - BLOCKS_PER_INTERVAL;
@@ -123,12 +130,12 @@ async function sniperTick(): Promise<void> {
     saveState(state);
   }
 
-  // Scan in 5-minute intervals (3600 blocks on Base), but don't exceed current block
-  let toBlock = fromBlock + BLOCKS_PER_INTERVAL;
-  if (toBlock > currentBlock) {
-    toBlock = currentBlock;
-  }
-  
+  // Always scan every block produced since the last tick — no artificial cap.
+  // In steady state (bot ticking every ~5 min) this naturally covers "the
+  // past 5 minutes"; if a tick runs long, it still catches up fully instead
+  // of silently dropping blocks.
+  const toBlock = currentBlock;
+
   // If fromBlock == toBlock, no new blocks to scan
   if (fromBlock >= currentBlock) {
     console.log(`\n${"═".repeat(66)}`);
@@ -235,18 +242,25 @@ async function sniperTick(): Promise<void> {
     console.log(`  [watchlist] No tokens to monitor (watchlist empty or all entries expired)`);
   }
 
-  console.log(`  Sniper ${runLabel} complete. Next in 5 min.\n`);
+  console.log(`  Sniper ${runLabel} complete.\n`);
 }
 
 // ─── Recursive loop ───────────────────────────────────────────────────────────
 
 async function loop(fn: () => Promise<void>, intervalMs: number): Promise<void> {
+  const startedAt = Date.now();
   try {
     await fn();
   } catch (err) {
     console.error(`[sniper] Unhandled error: ${err}`);
   }
-  setTimeout(() => loop(fn, intervalMs), intervalMs);
+  const elapsed = Date.now() - startedAt;
+  // Fire the next tick on a fixed cadence: intervalMs after the *start* of
+  // this tick, not intervalMs after it finished. If a tick somehow runs
+  // longer than intervalMs, fire again immediately rather than waiting
+  // another full interval on top of the overrun.
+  const nextDelay = Math.max(0, intervalMs - elapsed);
+  setTimeout(() => loop(fn, intervalMs), nextDelay);
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -257,34 +271,15 @@ async function main(): Promise<void> {
   // scan still has full coverage. Falls back to the static list on failure.
   await initQuoteAssets();
 
-  // Check if stored block is too old or ahead of current block
+  // Always start from the current block at boot — never resume a historical
+  // backlog from disk. This bot is only meant to watch new pools going
+  // forward; any stored watermark from a previous run is discarded so a
+  // restart never triggers a multi-thousand-block backfill scan.
   const currentBlock = await getBlockNumberWithRetry();
-  if (currentBlock > 0n && lastScannedBlock !== null) {
-    // Reset if too old (before Base mainnet was active)
-    if (lastScannedBlock < 50000000n) {
-      console.log(`[bot] Stored block ${lastScannedBlock} is too old, resetting to current block ${currentBlock}`);
-      lastScannedBlock = currentBlock; // Start from current block, not current - 3600
-      state.lastScannedBlock = lastScannedBlock.toString();
-      state.postedTokens = []; // Clear posted tokens when resetting block
-      saveState(state);
-    }
-    // Reset if ahead of current block (scanning future blocks)
-    else if (lastScannedBlock > currentBlock) {
-      console.log(`[bot] Stored block ${lastScannedBlock} is ahead of current block ${currentBlock}, resetting`);
-      lastScannedBlock = currentBlock; // Start from current block
-      state.lastScannedBlock = lastScannedBlock.toString();
-      state.postedTokens = []; // Clear posted tokens when resetting block
-      saveState(state);
-    }
-    // Reset if more than 10,000 blocks behind current (too much historical data)
-    else if (currentBlock - lastScannedBlock > 10000n) {
-      console.log(`[bot] Stored block ${lastScannedBlock} is too far behind current block ${currentBlock}, resetting`);
-      lastScannedBlock = currentBlock;
-      state.lastScannedBlock = lastScannedBlock.toString();
-      state.postedTokens = []; // Clear posted tokens when resetting block
-      saveState(state);
-    }
-  }
+  console.log(`[bot] Starting fresh from current block ${currentBlock} (no historical backfill)`);
+  lastScannedBlock = currentBlock;
+  state.lastScannedBlock = lastScannedBlock.toString();
+  saveState(state);
 
   console.log(`${"═".repeat(66)}`);
   console.log(`  RugHound Telegram Bot`);
@@ -293,7 +288,7 @@ async function main(): Promise<void> {
   console.log(`  V3 Factory: ${UNISWAP_V3_FACTORY}`);
   console.log(`  V4 PoolMgr: ${UNISWAP_V4_POOL_MANAGER}`);
   console.log(`  Scoring  : Gemini LLM (${process.env.GEMINI_MODEL ?? "gemini-2.0-flash-lite"})`);
-  console.log(`  Interval : 5 min after each scan completes`);
+  console.log(`  Interval : every 5 min (fixed cadence, drift-corrected)`);
   console.log(`  Filter   : posting ALL verdicts (LOW, MEDIUM, HIGH, CRITICAL)`);
   console.log(`  Notify   : ${process.env.TELEGRAM_NOTIFY_CHAT_ID}`);
   console.log(`  Started  : ${new Date().toISOString()}`);
@@ -315,11 +310,13 @@ async function main(): Promise<void> {
   });
   console.log("[bot] Telegram polling started");
 
-  // Kick off the sniper in the background — do NOT await so bot.start()
-  // can begin receiving messages right away.
-  sniperTick()
-    .catch((err) => console.error(`[sniper] Fatal on first run: ${err}`))
-    .then(() => setTimeout(() => loop(sniperTick, SNIPER_INTERVAL_MS), SNIPER_INTERVAL_MS));
+  // Kick off the recurring sniper loop in the background — do NOT await so
+  // bot.start() can begin receiving messages right away. loop() itself runs
+  // the first tick immediately and then schedules every subsequent tick on
+  // a fixed ~5-min cadence (see loop()'s drift-correction above).
+  loop(sniperTick, SNIPER_INTERVAL_MS).catch((err) =>
+    console.error(`[sniper] Fatal loop error: ${err}`)
+  );
 
   process.on("SIGINT", () => {
     console.log("\n[bot] Shutting down — saving state…");

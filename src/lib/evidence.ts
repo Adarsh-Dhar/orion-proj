@@ -123,6 +123,189 @@ async function safeReadNullable<T>(
   catch (err) { warn(warnings, tag, "read failed", err); return null; }
 }
 
+// ─── Etherscan deployer tx history helper ────────────────────────────────────
+
+/**
+ * Fetch a page of transactions for `deployerAddress` from Etherscan's txlist
+ * endpoint.  Returns [] on any failure (network error, bad JSON, API error).
+ *
+ * @param sort    "asc" | "desc"
+ * @param offset  Number of records to skip (Etherscan page offset)
+ * @param count   Max records to return (Etherscan `limit` param)
+ */
+async function fetchDeployerTxHistory(
+  deployerAddress: string,
+  apiKey: string,
+  opts: { sort: "asc" | "desc"; offset?: number; count?: number },
+  warnings: string[]
+): Promise<Array<{ hash: string; to: string; timeStamp: string; contractAddress: string }>> {
+  const { sort, offset = 0, count = 200 } = opts;
+  try {
+    const url =
+      `${ETHERSCAN_API_BASE}?chainid=${BASE_CHAIN_ID}` +
+      `&module=account&action=txlist` +
+      `&address=${deployerAddress}` +
+      `&startblock=0&endblock=99999999` +
+      `&page=1&offset=${count}&sort=${sort}` +
+      (offset > 0 ? `&startindex=${offset}` : "") +
+      `&apikey=${apiKey}`;
+    const res  = await fetch(url);
+    const json = await res.json() as { status: string; result: unknown };
+    if (json.status !== "1" || !Array.isArray(json.result)) return [];
+    return json.result as Array<{ hash: string; to: string; timeStamp: string; contractAddress: string }>;
+  } catch (err) {
+    warn(warnings, "etherscan.txlist", `fetch failed for ${deployerAddress}`, err);
+    return [];
+  }
+}
+
+// ─── New signal: deployer velocity ───────────────────────────────────────────
+
+/**
+ * How many contracts did this deployer create in the 15 min / 1 h / 24 h
+ * window immediately before (and including) `deployBlockTimestamp`?
+ *
+ * Uses Etherscan txlist (direct creates only; factory-pattern deploys via an
+ * intermediate launcher won't appear here — those require txlistinternal).
+ */
+export async function checkDeployerVelocity(
+  deployerAddress: string,
+  deployBlockTimestamp: number,
+  apiKey: string,
+  warnings: string[]
+): Promise<{ deploysLast15Min: number; deploysLastHour: number; deploysLast24h: number; recentContracts: string[] }> {
+  const txs = await fetchDeployerTxHistory(deployerAddress, apiKey, { sort: "desc", count: 200 }, warnings);
+
+  const T15  = deployBlockTimestamp - 15 * 60;
+  const T1h  = deployBlockTimestamp - 60 * 60;
+  const T24h = deployBlockTimestamp - 24 * 60 * 60;
+
+  let last15  = 0;
+  let lastHr  = 0;
+  let last24h = 0;
+  const recentContracts: string[] = [];
+
+  for (const tx of txs) {
+    // Direct contract creation: `to` field is empty string
+    if (tx.to !== "") continue;
+    const ts = parseInt(tx.timeStamp, 10);
+    if (ts > deployBlockTimestamp) continue; // shouldn't happen but guard it
+    if (ts < T24h) break; // txs are desc-sorted; once we pass 24h window, stop
+
+    last24h++;
+    if (tx.contractAddress) recentContracts.push(tx.contractAddress.toLowerCase());
+    if (ts >= T1h)  lastHr++;
+    if (ts >= T15)  last15++;
+  }
+
+  return { deploysLast15Min: last15, deploysLastHour: lastHr, deploysLast24h: last24h, recentContracts };
+}
+
+// ─── New signal: deployer wallet age ─────────────────────────────────────────
+
+/**
+ * How old was the deployer wallet when it deployed this token, and how
+ * recently was it funded before the deploy?
+ *
+ * - `walletAgeAtDeploySeconds`: time from the wallet's very first tx to the
+ *   deploy block.  A wallet < 10 min old is almost certainly disposable.
+ * - `fundingGapSeconds`: seconds between the last inbound-value tx to the
+ *   wallet and the deploy block.  < 2 min suggests purpose-built funding.
+ * - `fundingSourceAddress`: the sender of that last inbound tx.
+ */
+export async function checkDeployerWalletAge(
+  deployerAddress: string,
+  deployBlockTimestamp: number,
+  apiKey: string,
+  warnings: string[]
+): Promise<{ walletAgeAtDeploySeconds: number | null; fundingGapSeconds: number | null; fundingSourceAddress: string | null }> {
+  // First-ever tx (asc, limit 1) → wallet creation timestamp
+  const firstTxs = await fetchDeployerTxHistory(
+    deployerAddress, apiKey, { sort: "asc", count: 1 }, warnings
+  );
+  let walletAgeAtDeploySeconds: number | null = null;
+  if (firstTxs.length > 0) {
+    const firstTs = parseInt(firstTxs[0].timeStamp, 10);
+    walletAgeAtDeploySeconds = deployBlockTimestamp - firstTs;
+  }
+
+  // Most recent 20 txs (desc) → find last inbound-value tx before deploy
+  const recentTxs = await fetchDeployerTxHistory(
+    deployerAddress, apiKey, { sort: "desc", count: 20 }, warnings
+  ) as Array<{ hash: string; to: string; from: string; timeStamp: string; contractAddress: string; value: string }>;
+
+  let fundingGapSeconds: number | null = null;
+  let fundingSourceAddress: string | null = null;
+
+  for (const tx of recentTxs) {
+    const ts  = parseInt(tx.timeStamp, 10);
+    if (ts > deployBlockTimestamp) continue; // skip anything after deploy
+    // Inbound tx: `to` is the deployer address and value > 0
+    if (
+      tx.to.toLowerCase() === deployerAddress.toLowerCase() &&
+      tx.value && BigInt(tx.value) > 0n
+    ) {
+      fundingGapSeconds    = deployBlockTimestamp - ts;
+      fundingSourceAddress = tx.from?.toLowerCase() ?? null;
+      break;
+    }
+  }
+
+  return { walletAgeAtDeploySeconds, fundingGapSeconds, fundingSourceAddress };
+}
+
+// ─── New signal: pre-liquidity distribution ───────────────────────────────────
+
+/**
+ * Walk Transfer events from `mintBlock` to `scanToBlock` and collect every
+ * recipient that is not the deployer, the pool, or the null address.
+ * These wallets were seeded with tokens before any public trading was possible.
+ *
+ * `preSeededPct` is left as null here; the caller fills it in once it has
+ * the full holder-balance map available (avoids a redundant on-chain read).
+ */
+export async function checkPreLiquidityDistribution(
+  client: AnyClient,
+  tokenAddress: Address,
+  mintBlock: bigint,
+  scanToBlock: bigint,
+  deployerAddress: string,
+  poolAddress: string,
+  warnings: string[]
+): Promise<{ preSeededWallets: string[]; preSeededPct: null }> {
+  const recipients = new Set<string>();
+  const deployerLower = deployerAddress.toLowerCase();
+  const poolLower     = poolAddress.toLowerCase();
+
+  for (let chunkStart = mintBlock; chunkStart <= scanToBlock; chunkStart += SCAN_CHUNK) {
+    const chunkEnd = chunkStart + SCAN_CHUNK - 1n < scanToBlock
+      ? chunkStart + SCAN_CHUNK - 1n
+      : scanToBlock;
+    try {
+      const logs = await client.getLogs({
+        address: tokenAddress,
+        event: TRANSFER_EVENT_ABI[0],
+        fromBlock: chunkStart,
+        toBlock:   chunkEnd,
+      });
+      for (const log of logs) {
+        const args = log.args as { from: string; to: string; value?: bigint };
+        const to   = args.to?.toLowerCase();
+        if (!to) continue;
+        if (to === deployerLower) continue;
+        if (to === poolLower)     continue;
+        if (to === NULL_ADDRESS.toLowerCase()) continue;
+        recipients.add(to);
+      }
+    } catch (err) {
+      warn(warnings, "preSeed", `chunk [${chunkStart}, ${chunkEnd}] failed`, err);
+      break;
+    }
+  }
+
+  return { preSeededWallets: [...recipients], preSeededPct: null };
+}
+
 // ─── Deployer finder ─────────────────────────────────────────────────────────
 
 
@@ -1204,6 +1387,30 @@ export async function collectEvidence(
   // ── 4. Deployer (mint event scan) ─────────────────────────────────────────
   const deployer = await findDeployer(client, tokenAddress, deployBlock, warnings);
 
+  // ── 4b. Deployer velocity + wallet age (liquidity-independent) ────────────
+  // These signals work identically whether or not the pool has liquidity, so
+  // they are never gated on hasLiquidity — only on quickMode.
+  let deployerVelocity = { deploysLast15Min: 0, deploysLastHour: 0, deploysLast24h: 0, recentContracts: [] as string[] };
+  let deployerWalletAge = { walletAgeAtDeploySeconds: null as number | null, fundingGapSeconds: null as number | null, fundingSourceAddress: null as string | null };
+
+  if (!quickMode && deployer.address) {
+    const etherscanApiKey = process.env.ETHERSCAN_API_KEY;
+    if (etherscanApiKey && deployer.mintBlock !== null) {
+      try {
+        const deployBlockData = await client.getBlock({ blockNumber: deployer.mintBlock });
+        const deployBlockTimestamp = Number(deployBlockData.timestamp);
+        const [vel, age] = await Promise.all([
+          checkDeployerVelocity(deployer.address, deployBlockTimestamp, etherscanApiKey, warnings),
+          checkDeployerWalletAge(deployer.address, deployBlockTimestamp, etherscanApiKey, warnings),
+        ]);
+        deployerVelocity  = vel;
+        deployerWalletAge = age;
+      } catch (err) {
+        warn(warnings, "deployerSignals", "block timestamp fetch failed — skipping velocity/age checks", err);
+      }
+    }
+  }
+
   // ── 5. Holder balances ─────────────────────────────────────────────────────
   let holderScan: HolderScanResult;
   let holderScanFrom: bigint;
@@ -1253,6 +1460,24 @@ export async function collectEvidence(
     .filter(([addr]) => addr.toLowerCase() !== poolAddress.toLowerCase())
     .sort((a, b) => (b[1] > a[1] ? 1 : -1));
 
+  // ── 5b. Pre-liquidity distribution (liquidity-independent) ────────────────
+  // Walk Transfer events from mint block to the holder-scan's chain-head.
+  // Reuses the same block range the holder scan already resolved — no extra
+  // getBlockNumber() call needed, and the scan stays bounded to new-token ranges.
+  let preSeed = { preSeededWallets: [] as string[], preSeededPct: null as number | null };
+  if (!quickMode && deployer.address && deployer.mintBlock !== null) {
+    const rawPreSeed = await checkPreLiquidityDistribution(
+      client,
+      tokenAddress,
+      deployer.mintBlock,
+      holderScan.scanTo,
+      deployer.address,
+      poolAddress,
+      warnings
+    );
+    preSeed = rawPreSeed;
+  }
+
   // Rebase / elastic-supply detection: if any reconstructed balance implies
   // a share > 100% of the current totalSupply(), our Transfer-delta accounting
   // is stale (supply shrank without emitting Transfer events).  Cap at 100 and
@@ -1289,6 +1514,20 @@ export async function collectEvidence(
       "[holderScan] reconstructed holder balances exceed totalSupply() — likely a rebase/" +
       "elastic-supply token whose supply contractions do not emit Transfer events. " +
       "Holder percentages are unreliable and have been capped at 100%."
+    );
+  }
+
+  // Compute preSeededPct using the balances already resolved by holderScan —
+  // no extra on-chain reads needed.  Sum the current balances of every pre-seeded
+  // wallet, divide by totalSupply, cap at 100%.
+  if (preSeed.preSeededWallets.length > 0 && totalSupply > 0n && !holderScan.failed) {
+    let preSeededSum = 0n;
+    for (const addr of preSeed.preSeededWallets) {
+      preSeededSum += holderScan.balances.get(addr) ?? 0n;
+    }
+    preSeed.preSeededPct = Math.min(
+      Number((preSeededSum * 10_000n) / totalSupply) / 100,
+      100
     );
   }
 
@@ -1534,6 +1773,18 @@ export async function collectEvidence(
 
     deployerSeenBefore:  deployerHistoryData.deployerSeenBefore,
     deployerPriorTokens: deployerHistoryData.deployerPriorTokens,
+
+    deploysLast15Min:         deployerVelocity.deploysLast15Min,
+    deploysLastHour:          deployerVelocity.deploysLastHour,
+    deploysLast24h:           deployerVelocity.deploysLast24h,
+    recentContracts:          deployerVelocity.recentContracts,
+
+    walletAgeAtDeploySeconds: deployerWalletAge.walletAgeAtDeploySeconds,
+    fundingGapSeconds:        deployerWalletAge.fundingGapSeconds,
+    fundingSourceAddress:     deployerWalletAge.fundingSourceAddress,
+
+    preSeededWallets: preSeed.preSeededWallets,
+    preSeededPct:     preSeed.preSeededPct,
 
     totalSwaps:           tradeActivity.totalSwaps,
     uniqueTraders:        tradeActivity.uniqueTraders,

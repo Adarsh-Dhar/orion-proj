@@ -236,6 +236,41 @@ export interface TokenEvidence {
   deployerSeenBefore: boolean;
   deployerPriorTokens: string[];
 
+  // ── Deployer velocity (liquidity-independent) ────────────────────────────
+  /** Number of direct contract-creation txs from the deployer in the 15 min
+   *  before this token's deploy block. Factory-pattern deploys (via a launcher
+   *  contract) are NOT counted — those require txlistinternal. */
+  deploysLast15Min: number;
+  deploysLastHour: number;
+  deploysLast24h: number;
+  /** On-chain-verified contract addresses deployed in the last 24 h window
+   *  (from Etherscan txlist, to === "" txs). Used to augment bot-state history
+   *  so a serial deployer is caught even the first time the bot sees them. */
+  recentContracts: string[];
+
+  // ── Deployer wallet age (liquidity-independent) ───────────────────────────
+  /** Age of the deployer wallet in seconds at the moment this token was
+   *  deployed (first-ever tx timestamp vs. deploy block timestamp).
+   *  null = Etherscan call failed or ETHERSCAN_API_KEY not set. */
+  walletAgeAtDeploySeconds: number | null;
+  /** Seconds between the last inbound-value tx to the deployer wallet and the
+   *  deploy block. A very short gap (<2 min) suggests the wallet was freshly
+   *  funded specifically to deploy this token.
+   *  null = could not determine (no prior incoming tx found, or API failure). */
+  fundingGapSeconds: number | null;
+  /** Address that sent the last inbound-value tx before the deploy, if found. */
+  fundingSourceAddress: string | null;
+
+  // ── Pre-liquidity distribution (liquidity-independent) ───────────────────
+  /** Recipient addresses (excluding deployer, pool, null address) that received
+   *  tokens via Transfer events between the mint block and the end of the
+   *  holder scan window — i.e. before (or during) liquidity being added.
+   *  These wallets were seeded before public trading was possible. */
+  preSeededWallets: string[];
+  /** Fraction of total supply currently held by preSeededWallets, 0–100.
+   *  null = could not compute (holder scan failed or totalSupply = 0). */
+  preSeededPct: number | null;
+
   // ── Trade activity (wash trading detection) ────────────────────────────
   totalSwaps: number;
   uniqueTraders: number;

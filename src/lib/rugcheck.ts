@@ -137,11 +137,21 @@ export async function runRugCheckLLM(
   );
 
   // ── 3. Update deployer history from persistent state ──────────────────────
+  // Merge bot-state memory with on-chain recentContracts (from Etherscan) so a
+  // serial deployer is caught even the very first time this bot sees them —
+  // recentContracts is ground-truth from the chain rather than dependent on the
+  // bot's own local history.
   if (opts?.state && evidence.deployerAddress) {
     const priorTokens = getDeployerHistory(opts.state, evidence.deployerAddress);
-    evidence.deployerSeenBefore = priorTokens.length > 0;
-    evidence.deployerPriorTokens = priorTokens;
-    // Record this new token for the deployer
+    const combined = new Set([
+      ...priorTokens.map((t) => t.toLowerCase()),
+      ...evidence.recentContracts.map((t) => t.toLowerCase()),
+    ]);
+    // Remove the current token itself — it's not a "prior" token
+    combined.delete(tokenAddress.toLowerCase());
+    evidence.deployerPriorTokens = [...combined];
+    evidence.deployerSeenBefore  = evidence.deployerPriorTokens.length > 0;
+    // Record this new token for future bot-state lookups
     recordDeployerToken(opts.state, evidence.deployerAddress, tokenAddress);
   }
 

@@ -353,6 +353,78 @@ export default function AnalysisPage({ params }: { params: Promise<{ id: string 
             </Panel>
           )}
 
+          {/* Deployer & Distribution */}
+          {evidence && (
+            <Panel title="Deployer & Distribution" icon="🧬" className="lg:col-span-2">
+              <div className="space-y-4">
+                {/* Velocity + pre-seeded count */}
+                <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+                  <StatCard
+                    label="Deploys / hr"
+                    value={String(evidence.deploysLastHour)}
+                    tone={evidence.deploysLastHour >= 5 ? 'bad' : 'neutral'}
+                  />
+                  <StatCard
+                    label="Deploys / 24 h"
+                    value={String(evidence.deploysLast24h)}
+                    tone={evidence.deploysLast24h >= 3 ? 'warn' : 'neutral'}
+                  />
+                  <StatCard
+                    label="Pre-seeded Wallets"
+                    value={String(evidence.preSeededWallets.length)}
+                    tone={evidence.preSeededWallets.length > 0 ? 'warn' : 'neutral'}
+                  />
+                </div>
+
+                {/* Wallet age */}
+                <div className="flex justify-between text-sm">
+                  <span className="text-muted-foreground">Wallet Age at Deploy</span>
+                  <span className="font-mono text-foreground">
+                    {evidence.walletAgeAtDeploySeconds === null
+                      ? 'unverified'
+                      : evidence.walletAgeAtDeploySeconds < 60
+                      ? `${evidence.walletAgeAtDeploySeconds}s`
+                      : evidence.walletAgeAtDeploySeconds < 3600
+                      ? `${Math.floor(evidence.walletAgeAtDeploySeconds / 60)}m ${evidence.walletAgeAtDeploySeconds % 60}s`
+                      : `${(evidence.walletAgeAtDeploySeconds / 3600).toFixed(1)}h`}
+                  </span>
+                </div>
+
+                {/* Funding gap */}
+                <div className="flex justify-between text-sm">
+                  <span className="text-muted-foreground">Funding Gap Before Deploy</span>
+                  <span className="font-mono text-foreground">
+                    {evidence.fundingGapSeconds === null
+                      ? 'unverified'
+                      : evidence.fundingGapSeconds < 60
+                      ? `${evidence.fundingGapSeconds}s`
+                      : evidence.fundingGapSeconds < 3600
+                      ? `${Math.floor(evidence.fundingGapSeconds / 60)}m ${evidence.fundingGapSeconds % 60}s`
+                      : `${(evidence.fundingGapSeconds / 3600).toFixed(1)}h`}
+                  </span>
+                </div>
+
+                {/* Pre-seeded pct — only shown when relevant */}
+                {evidence.preSeededWallets.length > 0 && evidence.preSeededPct !== null && (
+                  <div className="flex justify-between text-sm">
+                    <span className="text-muted-foreground">Pre-seeded Wallet Supply Share</span>
+                    <span className="font-mono text-foreground">{fmtPct(evidence.preSeededPct)}</span>
+                  </div>
+                )}
+
+                {/* Deployer seen before */}
+                <div className="flex justify-between text-sm">
+                  <span className="text-muted-foreground">Deployer Seen Before</span>
+                  <VerifiedPill
+                    state={
+                      evidence.deployerSeenBefore ? 'flagged' : 'verified'
+                    }
+                  />
+                </div>
+              </div>
+            </Panel>
+          )}
+
           {/* Agent trace */}
           {analysis.toolCallTranscript && analysis.toolCallTranscript.length > 0 && (
             <Panel title="Agent Investigation Trace" icon="🕵️" className="lg:col-span-2">

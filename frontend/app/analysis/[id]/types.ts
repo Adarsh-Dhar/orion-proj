@@ -92,6 +92,22 @@ export interface TokenEvidence {
   deployerSeenBefore: boolean;
   deployerPriorTokens: string[];
 
+  /** Deployer velocity — liquidity-independent */
+  deploysLast15Min: number;
+  deploysLastHour: number;
+  deploysLast24h: number;
+  /** On-chain-verified contract addresses deployed in the last 24 h window. */
+  recentContracts: string[];
+
+  /** Deployer wallet age — liquidity-independent */
+  walletAgeAtDeploySeconds: number | null;
+  fundingGapSeconds: number | null;
+  fundingSourceAddress: string | null;
+
+  /** Pre-liquidity token distribution — liquidity-independent */
+  preSeededWallets: string[];
+  preSeededPct: number | null;
+
   totalSwaps: number;
   uniqueTraders: number;
   buyCount: number;

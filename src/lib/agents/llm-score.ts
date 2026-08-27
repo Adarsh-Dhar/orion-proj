@@ -100,6 +100,7 @@ IMPORTANT RULES:
    - When hasLiquidity=false, DO NOT flag or add points for: poolLiquidity/initialLiquidityEth being 0 or null, sellTestPassed being null, lpPositionStatus being "unverified", liquidityEverPulled/burnEventCount, liquidityDeltaPct, or totalSwaps/uniqueTraders/wash-trading fields being 0 or null. None of these can produce a real answer with no pool yet — treat them as "pending, will be re-checked automatically once liquidity lands," not as risk or as unverifiable evidence. Do not include a flag for them at all.
    - When hasLiquidity=false, do NOT penalize "ownership not renounced" at the normal +25 weight — renouncing before liquidity even exists is unusual, not standard practice. If you flag it at all, treat it as low-severity/informational (a few points at most), and instead focus on what privileges the owner role actually has per the source audit (suspiciousFunctions, secondaryAdminDetected).
    - When hasLiquidity=false, source verification (sourceVerified, suspiciousFunctions, secondaryAdminDetected), proxy status (isProxy), deployer wallet reputation (deployerSeenBefore, deployerPriorTokens), and supply distribution (deployerPct, top5HoldersPct) become your PRIMARY signals — score and weight them at full strength, since there is no trading history yet to fall back on. An unverified contract on a brand-new token is a stronger signal than on a token that's been trading for a while (see scoring guide below).
+   - The following fields are ALWAYS liquidity-independent and must NEVER be skipped or down-weighted because hasLiquidity=false: deploysLast15Min, deploysLastHour, deploysLast24h (deployer velocity), walletAgeAtDeploySeconds, fundingGapSeconds (wallet age/funding pattern), and preSeededWallets, preSeededPct (pre-liquidity token distribution). Score these at full strength regardless of hasLiquidity.
    - When hasLiquidity=true, score all liquidity-dependent fields normally per the guide below.
 
 SCORING GUIDE:
@@ -115,6 +116,11 @@ SCORING GUIDE:
 - Holder data unverifiable:                                 +10 pts, MEDIUM
 - Deployer seen before (repeat deployer):                    +10 pts, MEDIUM (pattern risk)
 - Deployer has 3+ prior tokens:                             +20 pts, HIGH (serial deployer)
+- Deployer velocity — 5+ contracts created in last hour:    +35 pts, CRITICAL ("factory pattern" — applies regardless of hasLiquidity)
+- Deployer velocity — 3+ contracts created in last 24 h:    +20 pts, HIGH (serial deployer confirmed on-chain — applies regardless of hasLiquidity)
+- Deployer wallet age <10 min at deploy time:               +25 pts, HIGH (disposable wallet pattern — applies regardless of hasLiquidity)
+- Deployer wallet funded <2 min before deploy:              +15 pts, MEDIUM (purpose-built funding pattern — applies regardless of hasLiquidity)
+- Pre-seeded wallets (tokens distributed before liquidity): +10 pts per wallet, capped at 40 pts total, MEDIUM — include preSeededPct in detail when available (applies regardless of hasLiquidity)
 - hasLiquidity=false: DO NOT flag zero/null liquidity, LP lock status, sell test, liquidity-pulled history, liquidity delta, or trade-activity fields at all — see rule 9 above.
 - Zero in-range liquidity, hasLiquidity=true but eth reading came back 0 or unverifiable post-launch: +40 pts, CRITICAL
 - Liquidity unverifiable (hasLiquidity=true but eth read failed):          +15 pts, MEDIUM

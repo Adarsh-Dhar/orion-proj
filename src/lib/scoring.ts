@@ -161,6 +161,42 @@ function scoreSourceVerification(
   return null;
 }
 
+function scoreDeployerVelocity(deploysLastHour: number, deploysLast24h: number): { points: number; note: string } | null {
+  if (deploysLastHour >= 5) {
+    return { points: 35, note: `Deployer created ${deploysLastHour} contracts in the last hour (factory/serial pattern)` };
+  }
+  if (deploysLast24h >= 3) {
+    return { points: 20, note: `Deployer created ${deploysLast24h} contracts in the last 24 h (serial deployer)` };
+  }
+  return null;
+}
+
+function scoreWalletAge(
+  walletAgeAtDeploySeconds: number | null,
+  fundingGapSeconds: number | null
+): { points: number; note: string } | null {
+  if (walletAgeAtDeploySeconds !== null && walletAgeAtDeploySeconds < 600) {
+    return { points: 25, note: `Deployer wallet was only ${walletAgeAtDeploySeconds}s old at deploy time (disposable wallet pattern)` };
+  }
+  if (fundingGapSeconds !== null && fundingGapSeconds < 120) {
+    return { points: 15, note: `Deployer wallet was funded only ${fundingGapSeconds}s before deploy (purpose-built funding pattern)` };
+  }
+  return null;
+}
+
+function scorePreSeededWallets(
+  preSeededWallets: string[],
+  preSeededPct: number | null
+): { points: number; note: string } | null {
+  if (preSeededWallets.length === 0) return null;
+  const points = clamp(10 * preSeededWallets.length, 0, 40);
+  const pctPart = preSeededPct !== null ? ` (currently hold ${preSeededPct.toFixed(2)}% of supply)` : "";
+  return {
+    points,
+    note: `${preSeededWallets.length} wallet${preSeededWallets.length === 1 ? "" : "s"} received tokens before liquidity was added${pctPart}`,
+  };
+}
+
 function scoreProxyImplementationAudit(evidence: TokenEvidence): { points: number; note: string } | null {
   if (!evidence.isProxy) return null;
   if (evidence.sourceVerified && !evidence.proxyImplementationAudited) {
@@ -286,6 +322,9 @@ export function computeScore(evidence: TokenEvidence): ComputedScore {
   add("liquidity", scoreLiquidity(hasLiquidity, evidence.initialLiquidityEth));
   add("liquidity_delta", scoreLiquidityDelta(hasLiquidity, evidence.liquidityDeltaPct));
   add("serial_deployer", scoreSerialDeployer(evidence.deployerSeenBefore, evidence.deployerPriorTokens));
+  add("deployer_velocity", scoreDeployerVelocity(evidence.deploysLastHour, evidence.deploysLast24h));
+  add("wallet_age", scoreWalletAge(evidence.walletAgeAtDeploySeconds, evidence.fundingGapSeconds));
+  add("pre_seeded_wallets", scorePreSeededWallets(evidence.preSeededWallets, evidence.preSeededPct));
   add("ownership", scoreOwnership(evidence.ownershipRenounced, hasLiquidity));
   add("proxy", scoreProxy(evidence.isProxy));
   add("proxy_implementation", scoreProxyImplementationAudit(evidence));

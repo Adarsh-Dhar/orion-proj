@@ -411,12 +411,20 @@ async function callGeminiWithTools(
   messages: Array<{ role: string; parts: Array<Record<string, unknown>> }>,
   tools: readonly unknown[]
 ): Promise<AgenticResponse> {
+  // Gemini's functionDeclarations schema only allows name, description, and
+  // parameters — any extra fields (e.g. our internal `tier` metadata) cause
+  // a 400 "Unknown name" error. Strip them before sending.
+  const functionDeclarations = tools.map((t) => {
+    const { tier: _tier, ...rest } = t as Record<string, unknown>;
+    return rest;
+  });
+
   const response = await fetch(GEMINI_ENDPOINT, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       contents: messages,
-      tools: [{ functionDeclarations: tools }],
+      tools: [{ functionDeclarations }],
     }),
   });
 
@@ -612,17 +620,29 @@ export async function scoreWithLLMAgentic(
         }
       }
 
-      // If only _reportDecision was called (stop signal or pre-final), ask the
-      // model for its verdict without any functionResponse (just continue loop).
+      // If only _reportDecision was called (stop signal or pre-final), we still
+      // MUST send functionResponse parts back for every _reportDecision call —
+      // Gemini rejects conversations that end on a model turn with unacknowledged
+      // function calls ("Requests ending with a model turn are not supported").
       if (realCalls.length === 0) {
-        // Append the model's turn verbatim so Gemini knows it was received.
-        // We don't send functionResponses for _reportDecision — it has no output.
-        messages = [...messages, response.modelContent];
+        // Acknowledge all _reportDecision calls with a minimal response.
+        // The content doesn't matter — this is just satisfying Gemini's turn
+        // ordering requirement. Then continue so the model can emit its verdict.
+        const ackResults = metaCalls.map(mc => ({
+          call: mc,
+          output: { ok: true },
+        }));
+        messages = appendFunctionResults(messages, response.modelContent, ackResults);
         continue;
       }
 
       // Execute all real tool calls and build transcript entries.
-      const results: Array<{ call: ToolCall; output: unknown }> = [];
+      // Also include ack responses for any _reportDecision calls in the same
+      // turn — every functionCall in a model turn needs a functionResponse.
+      const results: Array<{ call: ToolCall; output: unknown }> = [
+        // Acknowledge meta calls first (order matches the model turn's part order)
+        ...metaCalls.map(mc => ({ call: mc, output: { ok: true } })),
+      ];
       for (const call of realCalls) {
         // Use the model-provided decision; fall back to a minimal sentinel if
         // the model omitted _reportDecision for this call.

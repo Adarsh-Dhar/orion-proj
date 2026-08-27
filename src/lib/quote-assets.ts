@@ -170,10 +170,13 @@ async function refresh(): Promise<void> {
     applyTokenList(tokens);
     saveDiskCache(tokens);
     console.log(`[quote-assets] Refreshed — ${quoteAssetMap.size} quote assets known`);
+    setTimeout(() => refresh(), CACHE_TTL_MS);
   } catch (err) {
     console.error(`[quote-assets] Background refresh failed: ${err instanceof Error ? err.message : err}`);
+    // Retry in 15 min instead of the full 6-hour TTL so a temporary network
+    // blip doesn't leave the label cache stale for hours.
+    setTimeout(() => refresh(), 15 * 60_000);
   }
-  setTimeout(() => refresh(), CACHE_TTL_MS);
 }
 
 // ─── Public initialiser ───────────────────────────────────────────────────────
@@ -182,8 +185,10 @@ async function refresh(): Promise<void> {
  * Must be called once before any scan loop starts.
  *
  * - Fresh disk cache (< 6 h): applies it instantly, no network call.
- * - Stale / missing cache: fetches from Coingecko. Throws on failure so the
- *   bot never starts with an empty or outdated quote-asset list.
+ * - Stale / missing cache: attempts a live fetch from Coingecko. If the
+ *   fetch fails (network timeout, blocked, etc.), logs a warning and
+ *   continues — the bot works fine with only CORE_QUOTE_ASSETS; the broad
+ *   Coingecko list is cosmetic (display labels only, never used for gating).
  *
  * Either way, schedules a background refresh for when the cache next expires.
  */
@@ -199,11 +204,15 @@ export async function initQuoteAssets(): Promise<void> {
     return;
   }
 
-  // Cache missing or stale — must fetch live. Throws if it fails.
+  // Cache missing or stale — attempt a live fetch, but never block startup on it.
   console.log("[quote-assets] Cache missing or stale — fetching from Coingecko…");
-  const tokens = await fetchFromCoingecko();
-  applyTokenList(tokens);
-  saveDiskCache(tokens);
-  console.log(`[quote-assets] Fetched ${quoteAssetMap.size} quote assets from Coingecko`);
+  try {
+    const tokens = await fetchFromCoingecko();
+    applyTokenList(tokens);
+    saveDiskCache(tokens);
+    console.log(`[quote-assets] Fetched ${quoteAssetMap.size} quote assets from Coingecko`);
+  } catch (err) {
+    console.warn(`[quote-assets] Coingecko fetch failed — continuing with ${CORE_QUOTE_ASSETS.length} core assets only. Labels for non-core quote assets will fall back to short address. Error: ${err instanceof Error ? err.message : err}`);
+  }
   setTimeout(() => refresh(), CACHE_TTL_MS);
 }

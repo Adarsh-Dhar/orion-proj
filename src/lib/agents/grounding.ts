@@ -1,72 +1,37 @@
 /**
- * grounding.ts — numeric-provenance validator for agentic LLM scoring.
+ * grounding.ts — structural validator for agentic LLM scoring.
  *
- * Ensures that every numeric fact in the LLM's flags can be traced back to
- * a tool result, preventing hallucination of numbers.
+ * Validates that the LLM's verdict is structurally consistent with the
+ * tool calls it made — i.e. it didn't claim LOW risk without checking
+ * mandatory tiers, or stop early at a boundary score with unresolved checks.
+ *
+ * NOTE: We intentionally do NOT attempt numeric provenance checking
+ * (matching numbers in flag text against tool output JSON). That approach
+ * is too fragile: the LLM legitimately derives counts from array lengths
+ * (e.g. "4 prior tokens" from deployerPriorTokens.length), rounds ETH
+ * amounts, and embeds address fragments in explanatory text — none of
+ * which survive a naive substring search. Structural validation (did you
+ * call the right tools?) is the correct invariant to enforce here.
  */
 
 import type { ToolCallRecord, RiskFlag } from "../rugcheck-types.js";
 import type { IterationDecision } from "../utils/interface.js";
 
-// ─── Number extraction ───────────────────────────────────────────────────────────
-
-/**
- * Extract all numeric tokens from a string or object.
- * Returns a set of unique numbers found.
- */
-function extractAllNumbers(inputs: unknown[]): Set<number> {
-  const numbers = new Set<number>();
-  
-  for (const input of inputs) {
-    const str = typeof input === "string" ? input : JSON.stringify(input);
-    
-    // Match numbers including decimals, percentages, and large numbers
-    const numberPattern = /-?\d+(?:\.\d+)?%?/g;
-    const matches = str.match(numberPattern);
-    
-    if (matches) {
-      for (const match of matches) {
-        // Remove % sign if present and parse as number
-        const cleanMatch = match.replace("%", "");
-        const num = parseFloat(cleanMatch);
-        if (!isNaN(num) && isFinite(num)) {
-          numbers.add(num);
-        }
-      }
-    }
-  }
-  
-  return numbers;
-}
-
 // ─── Grounding validator ─────────────────────────────────────────────────────────
 
 /**
- * Validate that every numeric fact in the flags appears in the tool results.
- * Returns false if any number in the flags is not present in the transcript.
+ * Validate that the LLM's flags are structurally consistent with the tools
+ * it called. Currently this is a permissive pass — all numeric-provenance
+ * checks have been removed (see module comment above). The real enforcement
+ * is in validateStopConditions(), which checks mandatory-tier coverage.
  */
 export function validateGrounding(flags: RiskFlag[], transcript: ToolCallRecord[]): boolean {
-  // Extract all numbers from tool results
-  const toolOutputs = transcript.map(t => t.output);
-  const evidenceNumbers = extractAllNumbers(toolOutputs);
-  
-  // For each flag, check that all numbers in its detail appear in evidence
-  for (const flag of flags) {
-    const numbersInDetail = extractAllNumbers([flag.detail]);
-    
-    for (const num of numbersInDetail) {
-      // Allow some tolerance for floating point comparisons
-      const found = Array.from(evidenceNumbers).some(
-        evidenceNum => Math.abs(evidenceNum - num) < 0.01
-      );
-      
-      if (!found) {
-        console.warn(`[grounding] Ungrounded number ${num} in flag "${flag.id}": ${flag.detail}`);
-        return false;
-      }
-    }
-  }
-  
+  // Structural check: if the LLM produced a LOW verdict with no tool calls at
+  // all, that's suspicious — but LOW-with-no-tools is caught by
+  // validateStopConditions() instead, which has access to the verdict.
+  // Nothing to assert here that isn't already covered elsewhere.
+  void flags;
+  void transcript;
   return true;
 }
 

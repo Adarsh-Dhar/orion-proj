@@ -72,8 +72,9 @@ export async function answerTokenQuestion(
     console.log(`[rugcheck-handler] Contract validation passed in ${Date.now() - startTime}ms`);
     onProgress?.("validated", "Contract validated successfully");
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
     console.error(`[rugcheck-handler] Contract validation failed:`, err);
-    return { error: `Contract validation failed: ${err}` };
+    return { error: `Contract validation failed: ${msg}` };
   }
 
   // ── 1. Resolve pool ─────────────────────────────────────────────────────
@@ -85,8 +86,9 @@ export async function answerTokenQuestion(
     console.log(`[rugcheck-handler] Step 1/4: Pool resolved in ${Date.now() - startTime}ms`);
     onProgress?.("pool_done", "Pool found successfully");
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
     console.error(`[rugcheck-handler] Step 1/4 failed:`, err);
-    return { error: `Pool resolution failed: ${err}` };
+    return { error: `Pool resolution failed: ${msg}` };
   }
   if (!resolved) {
     console.log(`[rugcheck-handler] Step 1/4: No pool found`);
@@ -102,8 +104,9 @@ export async function answerTokenQuestion(
     console.log(`[rugcheck-handler] Step 2/4: Metadata fetched in ${Date.now() - startTime}ms`);
     onProgress?.("metadata_done", "Metadata fetched successfully");
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
     console.error(`[rugcheck-handler] Step 2/4 failed:`, err);
-    return { error: `Metadata fetch failed: ${err}` };
+    return { error: `Metadata fetch failed: ${msg}` };
   }
 
   // ── 3. Deploy block ─────────────────────────────────────────────────────
@@ -111,18 +114,32 @@ export async function answerTokenQuestion(
   onProgress?.("deploy", "Searching for token deployment block...");
   let deployBlock: bigint;
   try {
-    // In sniper mode, use current block instead of expensive binary search
     if (sniperMode) {
-      deployBlock = await client.getBlockNumber();
-      console.log(`[rugcheck-handler] Step 3/4: Using current block ${deployBlock} (sniper mode)`);
+      // In sniper mode, skip the expensive binary-search deploy block lookup.
+      // Use getBlockNumber() with a short independent timeout. If the RPC is
+      // temporarily overloaded, fall back to 0n — evidence collection handles
+      // that gracefully by scanning from the current block anyway.
+      try {
+        deployBlock = await Promise.race([
+          client.getBlockNumber(),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("getBlockNumber timeout")), 8_000)
+          ),
+        ]);
+        console.log(`[rugcheck-handler] Step 3/4: Using current block ${deployBlock} (sniper mode)`);
+      } catch {
+        deployBlock = 0n;
+        console.warn(`[rugcheck-handler] Step 3/4: getBlockNumber timed out — using block 0 (sniper mode)`);
+      }
     } else {
       deployBlock = await findContractDeployBlock(client, tokenAddress);
       console.log(`[rugcheck-handler] Step 3/4: Deploy block found in ${Date.now() - startTime}ms`);
     }
     onProgress?.("deploy_done", "Deploy block found successfully");
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
     console.error(`[rugcheck-handler] Step 3/4 failed:`, err);
-    return { error: `Deploy block search failed: ${err}` };
+    return { error: `Couldn't find deploy block — the RPC may be rate-limited. Try again in a moment. (${msg})` };
   }
 
   // ── 4. LLM rug check ────────────────────────────────────────────────────
@@ -143,7 +160,8 @@ export async function answerTokenQuestion(
     onProgress?.("llm_done", "Analysis completed successfully");
     return { result, meta };
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
     console.error(`[rugcheck-handler] Step 4/4 failed after ${Date.now() - startTime}ms:`, err);
-    return { error: `Rug check failed: ${err}` };
+    return { error: `Rug check failed: ${msg}` };
   }
 }

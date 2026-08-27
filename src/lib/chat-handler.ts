@@ -12,6 +12,7 @@ import { Bot, Context, InlineKeyboard } from "grammy";
 import { extractAddress, answerTokenQuestion, stripAddress } from "./rugcheck-handler.js";
 import { formatChatReply, formatRugReport } from "./rugcheck.js";
 import { sendReport, sendPlain } from "./telegram.js";
+import { getLatestAnalysis } from "./analysis-store.js";
 import type { PublicClient } from "viem";
 import type { BotState } from "./state.js";
 
@@ -32,7 +33,6 @@ async function sendFullReport(
 
   // Progress callback to send updates to user
   const onProgress = (step: string, message: string) => {
-    // Only send progress updates for main steps, not every sub-step
     if (["validating", "pool", "metadata", "deploy", "llm"].includes(step)) {
       ctx.api.sendMessage(chatId, `🔍 ${message}`).catch((err: unknown) => {
         console.warn(`[chat-handler] Failed to send progress update:`, err);
@@ -40,23 +40,24 @@ async function sendFullReport(
     }
   };
 
-  const TIMEOUT_MS = 3 * 60_000; // Reduced to 3 minutes due to sniper mode efficiency
+  const TIMEOUT_MS = 5 * 60_000;
   let outcome: Awaited<ReturnType<typeof answerTokenQuestion>>;
   try {
     outcome = await Promise.race([
-      answerTokenQuestion(client, address as `0x${string}`, undefined, "chat", state, onProgress, false, true),
+      // isSniperMode=false so we do a real deploy-block binary search instead
+      // of using the current block, which would be wrong for non-fresh tokens.
+      answerTokenQuestion(client, address as `0x${string}`, undefined, "chat", state, onProgress, false, false),
       new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("Analysis timed out after 3 minutes")), TIMEOUT_MS)
+        setTimeout(() => reject(new Error("Analysis timed out after 5 minutes")), TIMEOUT_MS)
       ),
     ]);
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     console.error(`[chat-handler] Analysis failed for ${address}:`, err);
 
-    // Provide more helpful error message
     let userMessage = `Couldn't check that token: ${errorMessage}`;
     if (errorMessage.includes("timed out")) {
-      userMessage = `⏱️ Analysis timed out after 3 minutes. This is likely due to RPC rate limiting. Try again in a few minutes or check your RPC endpoint configuration.`;
+      userMessage = `⏱️ Analysis timed out — the RPC may be under load. Try again in a minute.`;
     }
 
     await ctx.api.sendMessage(chatId, userMessage);
@@ -141,11 +142,40 @@ export function registerChatHandler(bot: Bot<any>, client: AnyClient, state?: Bo
     // Check if user wants quick mode (skip expensive checks)
     const isQuickMode = text.toLowerCase().includes("quick") || text.toLowerCase().includes("fast");
 
-    // Use sniper mode for all manual queries (efficient like the sniper)
-    const isSniperMode = true;
+    // Never use sniper mode for manual chat queries — sniper mode sets the
+    // deploy block to the current block, which is wrong for tokens that were
+    // deployed earlier. Chat queries need the real deploy block so evidence
+    // collection scans the right range. Quick mode is still available for
+    // users who want to skip the expensive binary-search deploy block lookup.
+    const isSniperMode = false;
 
     await ctx.api.sendMessage(chatId, "Running on-chain rug check…");
     console.log(`[chat-handler] Starting analysis for ${address}`);
+
+    // Check if a recent analysis exists — avoids re-running the full pipeline
+    // while the sniper is running a large concurrent batch.
+    const CACHE_MAX_AGE_MS = 30 * 60_000; // 30 minutes
+    try {
+      const cached = await getLatestAnalysis(address.toLowerCase());
+      if (cached && Date.now() - cached.timestamp < CACHE_MAX_AGE_MS) {
+        const ageMin = Math.round((Date.now() - cached.timestamp) / 60_000);
+        console.log(`[chat-handler] Cache hit for ${address} (${ageMin} min old)`);
+        const keyboard = new InlineKeyboard().text("📋 Full Report", `full:${address}`);
+        const VERDICT_EMOJI: Record<string, string> = { LOW: "🟢", MEDIUM: "🟡", HIGH: "🟠", CRITICAL: "🔴", INSUFFICIENT: "⚪", UNKNOWN: "❓" };
+        const v = VERDICT_EMOJI[cached.verdict] ?? "❓";
+        const topFlags = cached.flags.slice(0, 3).map(f => `• ${f.label}: ${f.detail}`).join("\n");
+        const cacheMsg = [
+          `${v} ${cached.verdict}  ·  ${cached.score.toFixed(2)}/100  ·  ${cached.tokenName} ($${cached.tokenSymbol})`,
+          cached.summary,
+          topFlags,
+          `\n_(Cached ${ageMin} min ago — use /full ${address} for a fresh analysis)_`,
+        ].filter(Boolean).join("\n");
+        await sendPlain(chatId, cacheMsg, keyboard);
+        return;
+      }
+    } catch {
+      // Cache lookup failure is non-fatal — fall through to full analysis
+    }
 
     // Progress callback to send updates to user
     const onProgress = (step: string, message: string) => {
@@ -157,9 +187,9 @@ export function registerChatHandler(bot: Bot<any>, client: AnyClient, state?: Bo
       }
     };
 
-    // Wrap the full pipeline in a 3-minute timeout so the user always gets
-    // a reply — without this, a hung RPC call silently swallows the response.
-    const TIMEOUT_MS = 3 * 60_000;
+    // Wrap the full pipeline in a 5-minute timeout so the user always gets
+    // a reply — deploy block binary search can be slow under RPC load.
+    const TIMEOUT_MS = 5 * 60_000;
     let outcome: Awaited<ReturnType<typeof answerTokenQuestion>>;
     try {
       outcome = await Promise.race([
@@ -174,17 +204,16 @@ export function registerChatHandler(bot: Bot<any>, client: AnyClient, state?: Bo
           isSniperMode
         ),
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("Analysis timed out after 3 minutes")), TIMEOUT_MS)
+          setTimeout(() => reject(new Error("Analysis timed out after 5 minutes")), TIMEOUT_MS)
         ),
       ]);
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       console.error(`[chat-handler] Analysis failed for ${address}:`, err);
 
-      // Provide more helpful error message
       let userMessage = `Couldn't check that token: ${errorMessage}`;
       if (errorMessage.includes("timed out")) {
-        userMessage = `⏱️ Analysis timed out after 3 minutes. This is likely due to RPC rate limiting. Try again in a few minutes or check your RPC endpoint configuration.`;
+        userMessage = `⏱️ Analysis timed out — the RPC may be under load. Try again in a minute.`;
       }
 
       await ctx.api.sendMessage(chatId, userMessage);

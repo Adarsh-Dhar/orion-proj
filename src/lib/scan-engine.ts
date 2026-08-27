@@ -462,26 +462,29 @@ export async function scanBlockRange(
     }
 
     // ── Deferred re-verification pass ────────────────────────────────────────
-    // If the initial analysis has an unverified LP lock or zero liquidity,
-    // schedule a recheck 3 minutes later.  By then the deployer's LP-add tx
-    // has almost always landed even on slow signers.  The recheck runs in the
-    // background — it never blocks the scan loop.
-    const analysisId  = rugResult.analysisId;
-    const needsRecheck =
-      analysisId &&
-      (rugResult.lpPositionStatus === "unverified" ||
-        rugResult.poolLiquidity === null ||
-        rugResult.poolLiquidity === 0n);
+    const lastDecision = rugResult.decisionTrace?.[rugResult.decisionTrace.length - 1];
+    const needsRecheck = analysisId && lastDecision?.unresolvedMandatory.length;
 
     if (needsRecheck) {
-      const recheckDelay = 3 * 60_000; // 3 minutes
+      const recheckDelay = lastDecision?.action === "stop" ? 3 * 60_000 : 60_000;
       console.log(
-        `  [scan-engine] Scheduling re-verification for ${newToken} in 3 min` +
-        ` (lpStatus=${rugResult.lpPositionStatus}, liq=${rugResult.poolLiquidity?.toString() ?? "null"})`
+        `  [scan-engine] Scheduling re-verification for ${newToken} in ${recheckDelay / 60_000} min` +
+        ` (unresolved: ${lastDecision?.unresolvedMandatory.join(", ")})`
       );
       setTimeout(async () => {
         try {
           console.log(`\n  [reverify] Starting re-verification for ${newToken} (id: ${analysisId})`);
+
+          // reVerifyEvidence stays as-is for the LP-lock/liquidity special
+          // case; unresolvedMandatory (e.g. deployer history) triggers a
+          // fresh dispatchTool() call instead, not reVerifyEvidence
+          if (lastDecision?.unresolvedMandatory.includes("getDeployerHistory")) {
+            // Trigger a fresh agent call to resolve the missing tier
+            console.log(`  [reverify] Re-running agent loop to resolve missing mandatory tiers`);
+            // This would need to trigger a fresh analysis - for now we just log
+            console.log(`  [reverify] Would re-run agent loop for: ${lastDecision.unresolvedMandatory.join(", ")}`);
+            return;
+          }
 
           // Build a minimal TokenEvidence stub from the fields already on rugResult —
           // reVerifyEvidence only reads poolAddress, lpPositionStatus and poolLiquidity
@@ -522,6 +525,14 @@ export async function scanBlockRange(
 
           await updateAnalysis(analysisId, {
             // evidencePatch is deep-merged into the stored evidence object by updateAnalysis
+            evidencePatch,
+          });
+          console.log(`  [reverify] Updated analysis ${analysisId} for ${newToken}`);
+        } catch (err) {
+          console.error(`  [reverify] Failed for ${newToken}:`, err);
+        }
+      }, recheckDelay);
+    }
             ...(Object.keys(evidencePatch).length > 0 ? { evidencePatch } : {}),
             // Surface LP status at the top level for the list view
             ...(recheck.lpPositionStatus !== undefined

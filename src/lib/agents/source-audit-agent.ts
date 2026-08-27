@@ -19,13 +19,18 @@
  *      (benign vs malicious versions of the same surface pattern) are
  *      included so the model learns to discriminate on substance, not shape.
  *   3. Strictly validates the structured JSON response, per item. A
- *      malformed individual item is dropped (not trusted); if the WHOLE
- *      response fails to parse/validate, the caller falls back to the old
- *      keyword grep for that token rather than silently reporting "clean".
+ *      malformed individual item is dropped (not trusted); if EVERY item
+ *      fails validation, or the call/response fails at any earlier stage
+ *      (missing API key, network error, non-2xx, unparseable JSON, empty
+ *      'functions' array), this throws rather than degrading to a heuristic.
  *
  * Design principles (matching agents/llm-score.ts):
- * - Never silently treat an LLM failure as "no risk found". A failure
- *   either falls back to the keyword heuristic or is recorded as a warning.
+ * - Never silently treat an LLM failure as "no risk found". There is no
+ *   keyword-heuristic fallback here on purpose — a caller that can't get a
+ *   trustworthy audit should see a visible failure, not a token that quietly
+ *   gets reported "clean" off a much weaker grep. Only genuinely non-fatal
+ *   conditions (some items dropped, some findings low-confidence) are
+ *   recorded as warnings; everything else propagates as a thrown error.
  * - Every finding is confidence-scored; callers should threshold on it
  *   rather than trusting every emitted flag equally.
  * - The prompt asks for reasoning BEFORE the verdict fields, because
@@ -34,7 +39,6 @@
  */
 
 import { createHash } from "node:crypto";
-import { SUSPICIOUS_SOURCE_KEYWORDS, PRIVILEGE_KEYWORDS } from "../utils/constants.js";
 import type { FunctionAudit, SourceAuditMethod } from "./types.js";
 
 // ─── Env ─────────────────────────────────────────────────────────────────────
@@ -256,44 +260,16 @@ function validateFunctionVerdict(
   };
 }
 
-// ─── Step 4: keyword-grep fallback (only used when the LLM path fails) ───────
-
-function keywordFallback(candidates: CandidateBlock[]): {
-  suspiciousFunctions: { name: string; snippet: string }[];
-  secondaryAdminDetected: boolean;
-  secondaryAdminSnippet: string | null;
-} {
-  const suspiciousFunctions: { name: string; snippet: string }[] = [];
-  for (const block of candidates) {
-    for (const kw of SUSPICIOUS_SOURCE_KEYWORDS) {
-      if (block.body.includes(kw)) {
-        suspiciousFunctions.push({ name: block.name, snippet: block.body });
-        break;
-      }
-    }
-  }
-
-  // Lightweight secondary-admin fallback: a function that is privilege-gated
-  // (PRIVILEGE_KEYWORDS) and references an address-typed identifier that
-  // isn't "owner"/"pending" anywhere in its body — same heuristic spirit as
-  // the original detectSecondaryAdmin, without needing evidence.ts's helpers.
-  let secondaryAdminDetected = false;
-  let secondaryAdminSnippet: string | null = null;
-  for (const block of candidates) {
-    const isPrivileged = PRIVILEGE_KEYWORDS.some((kw: string) => new RegExp(kw, "gi").test(block.body));
-    if (!isPrivileged) continue;
-    const addressRefMatch = block.body.match(/\b(?!owner\b|pendingOwner\b)([a-zA-Z_]\w*)\s*==\s*msg\.sender|msg\.sender\s*==\s*([a-zA-Z_]\w*)/);
-    if (addressRefMatch) {
-      secondaryAdminDetected = true;
-      secondaryAdminSnippet = block.body.split("\n").slice(0, 8).join("\n").trim();
-      break;
-    }
-  }
-
-  return { suspiciousFunctions, secondaryAdminDetected, secondaryAdminSnippet };
-}
-
 // ─── Main entry point ─────────────────────────────────────────────────────────
+//
+// NOTE: there is intentionally no keyword-grep fallback. If the LLM audit
+// cannot produce a trustworthy verdict — missing API key, network failure,
+// non-2xx response, unparseable JSON, or a response that fails validation —
+// this throws rather than silently downgrading to a much weaker heuristic.
+// A caller that swallows this error and treats a token as "clean" is a worse
+// outcome than a visible failure; callers should let this propagate (or
+// explicitly decide how to handle "source audit unavailable" themselves)
+// rather than have that decision made silently in here.
 
 export async function analyzeSourceWithLLM(
   source: string,
@@ -317,9 +293,7 @@ export async function analyzeSourceWithLLM(
   }
 
   if (!GEMINI_API_KEY) {
-    warnings.push("[sourceAudit] GEMINI_API_KEY not set — falling back to keyword heuristic");
-    const fb = keywordFallback(candidates);
-    return { ...fb, method: "keyword_fallback", functionAudits: [] };
+    throw new Error("[sourceAudit] GEMINI_API_KEY not set — cannot run source audit");
   }
 
   const snippetByName = new Map(candidates.map((c) => [c.name, c.body]));
@@ -350,27 +324,20 @@ export async function analyzeSourceWithLLM(
     };
 
     if (data.error) {
-      warnings.push(`[sourceAudit] Gemini API error ${data.error.code}: ${data.error.message} — falling back to keyword heuristic`);
-      const fb = keywordFallback(candidates);
-      return { ...fb, method: "keyword_fallback", functionAudits: [] };
+      throw new Error(`[sourceAudit] Gemini API error ${data.error.code}: ${data.error.message}`);
     }
     if (!response.ok) {
-      warnings.push(`[sourceAudit] HTTP ${response.status} from Gemini — falling back to keyword heuristic`);
-      const fb = keywordFallback(candidates);
-      return { ...fb, method: "keyword_fallback", functionAudits: [] };
+      throw new Error(`[sourceAudit] HTTP ${response.status} from Gemini`);
     }
 
     rawModelText = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
     if (!rawModelText) {
-      warnings.push("[sourceAudit] Gemini returned an empty response — falling back to keyword heuristic");
-      const fb = keywordFallback(candidates);
-      return { ...fb, method: "keyword_fallback", functionAudits: [] };
+      throw new Error("[sourceAudit] Gemini returned an empty response");
     }
   } catch (err) {
+    if (err instanceof Error && err.message.startsWith("[sourceAudit]")) throw err;
     const msg = err instanceof Error ? err.message : String(err);
-    warnings.push(`[sourceAudit] Network error calling Gemini: ${msg} — falling back to keyword heuristic`);
-    const fb = keywordFallback(candidates);
-    return { ...fb, method: "keyword_fallback", functionAudits: [] };
+    throw new Error(`[sourceAudit] Network error calling Gemini: ${msg}`);
   }
 
   const cleaned = rawModelText
@@ -382,16 +349,12 @@ export async function analyzeSourceWithLLM(
   try {
     parsed = JSON.parse(cleaned);
   } catch {
-    warnings.push(`[sourceAudit] Model returned non-JSON response — falling back to keyword heuristic: ${cleaned.slice(0, 200)}`);
-    const fb = keywordFallback(candidates);
-    return { ...fb, method: "keyword_fallback", functionAudits: [] };
+    throw new Error(`[sourceAudit] Model returned non-JSON response: ${cleaned.slice(0, 200)}`);
   }
 
   const parsedFunctions = (parsed as Record<string, unknown>)?.functions;
   if (!Array.isArray(parsedFunctions) || parsedFunctions.length === 0) {
-    warnings.push("[sourceAudit] Model response missing/empty 'functions' array — falling back to keyword heuristic");
-    const fb = keywordFallback(candidates);
-    return { ...fb, method: "keyword_fallback", functionAudits: [] };
+    throw new Error("[sourceAudit] Model response missing/empty 'functions' array");
   }
 
   // Validate each item independently — drop malformed items rather than
@@ -408,11 +371,9 @@ export async function analyzeSourceWithLLM(
     warnings.push(`[sourceAudit] ${droppedCount} of ${parsedFunctions.length} function verdicts failed validation and were dropped`);
   }
 
-  // If EVERYTHING was dropped, that's effectively a total failure — fall back.
+  // If EVERYTHING was dropped, that's effectively a total failure.
   if (functionAudits.length === 0) {
-    warnings.push("[sourceAudit] All function verdicts failed validation — falling back to keyword heuristic");
-    const fb = keywordFallback(candidates);
-    return { ...fb, method: "keyword_fallback", functionAudits: [] };
+    throw new Error("[sourceAudit] All function verdicts failed validation");
   }
 
   const confident = functionAudits.filter((f) => f.confidence >= CONFIDENCE_THRESHOLD);

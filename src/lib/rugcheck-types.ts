@@ -21,8 +21,11 @@
 export type RiskLevel = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
 
 /** Same buckets as RiskLevel, plus "UNKNOWN" for when scoring itself failed
- *  (score is set to -1 in that case — see RugCheckResult.score). */
-export type VerdictLevel = RiskLevel | "UNKNOWN";
+ *  (score is set to -1 in that case — see RugCheckResult.score).
+ *  INSUFFICIENT means the LLM call succeeded but mandatory-tier evidence was
+ *  still unresolved when the iteration budget ran out — a real audit outcome,
+ *  not a technical failure. */
+export type VerdictLevel = RiskLevel | "UNKNOWN" | "INSUFFICIENT";
 
 /** Which Uniswap architecture the pool being analyzed lives on. */
 export type Venue = "v3" | "v4";
@@ -34,4 +37,5 @@ export type {
   LLMScoreResult,
   LLMScoreSuccess,
   LLMScoreFailure,
+  IterationDecision,
 } from "./utils/interface.js";

@@ -8,10 +8,10 @@
 import type { TokenEvidence } from "../evidence.js";
 import type { LLMScoreResult } from "./llm-score.js";
 import type { ToolCallRecord } from "../rugcheck-types.js";
-import type { ToolContext } from "./agent-tools.js";
+import type { ToolContext, IterationDecision } from "../utils/interface.js";
 import { scoreWithLLMAgentic } from "./llm-score.js";
 import { AGENT_TOOLS, dispatchTool } from "./agent-tools.js";
-import { validateGrounding } from "./grounding.js";
+import { validateGrounding, validateStopConditions } from "./grounding.js";
 
 // ─── Main loop controller ───────────────────────────────────────────────────────
 
@@ -26,21 +26,40 @@ export async function runAgentLoop(
   opts: { maxIterations?: number }
 ): Promise<AgentLoopResult> {
   const maxIter = opts.maxIterations ?? 12;
+  const decisions: IterationDecision[] = [];
+  let runningScore = 0;
+  const MANDATORY_TIERS = ["getSourceCode", "checkLpLock", "getDeployerHistory"];
+  let resolvedTiers = new Set<string>();
 
-  // Create a tool dispatcher that has access to the context
   const toolDispatcher = async (name: string, args: Record<string, unknown>) => {
-    return dispatchTool(name, args, ctx);
+    const result = await dispatchTool(name, args, ctx);
+    resolvedTiers.add(name);
+    // The dispatcher now returns { output, decision }, extract accordingly
+    if ('decision' in result && 'output' in result) {
+      decisions.push((result as { output: unknown; decision: IterationDecision }).decision);
+      return (result as { output: unknown; decision: IterationDecision }).output;
+    }
+    // Fallback for compatibility during transition
+    return result as unknown;
   };
 
-  // Run the agentic LLM scoring
   const llmResult = await scoreWithLLMAgentic(
     evidence,
     toolDispatcher,
     AGENT_TOOLS,
-    { maxIterations: maxIter }
+    { maxIterations: maxIter, decisions, mandatoryTiers: MANDATORY_TIERS }
   );
 
-  // Extract transcript from the result
+  // Budget exhausted with mandatory coverage incomplete → INSUFFICIENT,
+  // never force a LOW/MEDIUM score on incomplete evidence
+  const unresolved = MANDATORY_TIERS.filter(t => !resolvedTiers.has(t));
+  if (llmResult.ok && unresolved.length > 0 && decisions.length >= maxIter) {
+    return {
+      result: { ...llmResult, verdict: "INSUFFICIENT" },
+      transcript: llmResult.toolCallTranscript ?? [],
+    };
+  }
+
   const transcript = llmResult.ok ? (llmResult.toolCallTranscript ?? []) : [];
 
   // If LLM failed, return the failure with the transcript
@@ -53,12 +72,10 @@ export async function runAgentLoop(
 
   // Validate grounding for successful results
   const groundingOk = validateGrounding(llmResult.flags, transcript);
-  if (!groundingOk) {
+  const stopConditionsOk = validateStopConditions(decisions, llmResult.ok ? llmResult.verdict : "UNKNOWN");
+  if (!groundingOk || !stopConditionsOk) {
     return {
-      result: {
-        ok: false,
-        reason: "LLM returned flags with ungrounded numeric facts",
-      },
+      result: { ok: false, reason: groundingOk ? "Unjustified stop/continue decision" : "LLM returned flags with ungrounded numeric facts" },
       transcript,
     };
   }

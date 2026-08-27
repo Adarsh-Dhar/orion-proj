@@ -65,6 +65,9 @@ import type { FunctionAudit, SourceAuditMethod } from "./agents/types.js";
 // Re-export types that are used by other modules
 export type { TokenEvidence, DeployerResult, HolderScanResult, TradeActivity, ReVerifyResult };
 
+// Export both collection functions
+export { collectMinimalEvidence };
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = PublicClient<any>;
 
@@ -1300,6 +1303,281 @@ export async function checkSourceVerification(
 
 
 // ─── Main collection function ─────────────────────────────────────────────────
+
+/** Identification only: pool/token resolution, deploy block, hasLiquidity.
+ *  Everything else (holder scan, source check, sell test, LP lock, deployer
+ *  forensics, trade activity) is now called on-demand via agent-tools.ts,
+ *  not bundled here. */
+export async function collectMinimalEvidence(
+  client: AnyClient,
+  tokenAddress: Address,
+  /** V3: pool contract address. V4: bytes32 PoolId hex-encoded as Address. */
+  poolAddress: Address,
+  pairedAsset: string,
+  deployBlock: bigint,
+  meta: { name: string; symbol: string; decimals: number; totalSupply: bigint; totalSupplyFormatted: string },
+  venue?: Venue,
+  /** V4 only: the hook contract address from the Initialize event. */
+  hookAddress?: string | null,
+  /** V4 only: PoolKey parameters needed for the sell-simulation Quoter call. */
+  v4PoolParams?: {
+    currency0: Address;
+    currency1: Address;
+    fee: number;
+    tickSpacing: number;
+    hooks: Address;
+  }
+): Promise<TokenEvidence> {
+  const warnings: string[] = [];
+  const resolvedVenue: Venue = venue ?? "v3";
+
+  // ── 1. ERC-20 supply / decimals ────────────────────────────────────────────
+  const { name, symbol, decimals, totalSupply, totalSupplyFormatted } = meta;
+
+  // ── 2. Ownership ───────────────────────────────────────────────────────────
+  let ownerAddress: string | null = null;
+  let ownershipRenounced: boolean | null = null;
+  try {
+    // First check if the contract has bytecode (not an EOA)
+    const code = await client.getBytecode({ address: tokenAddress });
+    if (!code || code === "0x") {
+      // This is an EOA, not a contract - no owner() function
+      ownerAddress = tokenAddress; // EOAs "own" themselves
+      ownershipRenounced = false;
+    } else {
+      // Try to call owner() - not all contracts have this function
+      // Use a silent approach first to avoid noisy warnings
+      try {
+        ownerAddress = await client.readContract({
+          address: tokenAddress,
+          abi:     OWNER_ABI,
+          functionName: "owner",
+        }) as string;
+        ownershipRenounced = ownerAddress === NULL_ADDRESS;
+      } catch (ownerErr) {
+        // Check if this is a revert vs other error
+        const errorMsg = ownerErr instanceof Error ? ownerErr.message : String(ownerErr);
+        if (errorMsg.includes("revert") || errorMsg.includes("owner") || errorMsg.includes("function")) {
+          // Token likely doesn't use Ownable pattern - this is normal for many tokens
+          // Don't log as warning, just set to null and continue
+          ownerAddress = null;
+          ownershipRenounced = null;
+        } else {
+          // Other unexpected error - log as warning
+          warn(warnings, "owner", "owner() call failed with unexpected error", ownerErr);
+          ownerAddress = null;
+          ownershipRenounced = null;
+        }
+      }
+    }
+  } catch (err) {
+    // Bytecode check failed - treat as non-ownable
+    ownerAddress = null;
+    ownershipRenounced = null;
+  }
+
+  // ── 3. Proxy check ─────────────────────────────────────────────────────────
+  let isProxy: boolean | null = null;
+  try {
+    const slot = await client.getStorageAt({ address: tokenAddress, slot: EIP1967_IMPL_SLOT });
+    isProxy = slot !== undefined ? slot !== ZERO_SLOT : null;
+  } catch (err) {
+    warn(warnings, "proxy", "EIP-1967 slot read failed", err);
+  }
+
+  // ── 4. Deployer (mint event scan) ─────────────────────────────────────────
+  const deployer = await findDeployer(client, tokenAddress, deployBlock, warnings);
+
+  // ── 5. Pool liquidity + initial ETH value ─────────────────────────────────
+  let poolLiquidityRaw: bigint | null = null;
+  let liquidityLocked: boolean | null = null;
+  let initialLiquidityEth: number | null = null;
+
+  if (resolvedVenue === "v4") {
+    // V4: read from StateView using the poolId as bytes32
+    poolLiquidityRaw = await safeReadNullable<bigint>(
+      () => client.readContract({
+        address: UNISWAP_V4_STATE_VIEW as Address,
+        abi:     V4_STATE_VIEW_LIQUIDITY_ABI,
+        functionName: "getLiquidity",
+        args: [poolAddress],
+      }) as Promise<bigint>,
+      "pool.liquidity.v4",
+      warnings
+    );
+    liquidityLocked = poolLiquidityRaw === null ? null : poolLiquidityRaw > 0n;
+
+    if (poolLiquidityRaw !== null && poolLiquidityRaw > 0n) {
+      try {
+        const slot0 = await client.readContract({
+          address: UNISWAP_V4_STATE_VIEW as Address,
+          abi:     V4_STATE_VIEW_SLOT0_ABI,
+          functionName: "getSlot0",
+          args: [poolAddress],
+        }) as readonly [bigint, ...unknown[]];
+        const sqrtPriceX96 = slot0[0];
+        if (sqrtPriceX96 > 0n) {
+          const Q96 = 2n ** 96n;
+          const raw = Number(formatEther((poolLiquidityRaw * Q96) / sqrtPriceX96));
+          // No real Base pool holds more than ~100k ETH; anything above that
+          // is a sqrtPriceX96 overflow artifact — null it out server-side.
+          const ETH_SUPPLY_MAX = 100_000;
+          if (raw > ETH_SUPPLY_MAX) {
+            warnings.push(
+              `[pool.slot0.v4] initialLiquidityEth=${raw.toFixed(0)} ETH exceeds 100k ETH ceiling — overflow artifact, nulled`
+            );
+            initialLiquidityEth = null;
+          } else {
+            initialLiquidityEth = raw;
+          }
+        }
+      } catch (err) {
+        warn(warnings, "pool.slot0.v4", "StateView.getSlot0 failed", err);
+      }
+    }
+  } else {
+    // V3: read directly from the pool contract
+    poolLiquidityRaw = await safeReadNullable<bigint>(
+      () => client.readContract({
+        address: poolAddress,
+        abi:     POOL_LIQUIDITY_ABI,
+        functionName: "liquidity",
+      }) as Promise<bigint>,
+      "pool.liquidity",
+      warnings
+    );
+    liquidityLocked = poolLiquidityRaw === null ? null : poolLiquidityRaw > 0n;
+
+    if (poolLiquidityRaw !== null && poolLiquidityRaw > 0n) {
+      try {
+        const slot0 = await client.readContract({
+          address: poolAddress,
+          abi:     POOL_SLOT0_ABI,
+          functionName: "slot0",
+        }) as readonly [bigint, ...unknown[]];
+        const sqrtPriceX96 = slot0[0];
+        if (sqrtPriceX96 > 0n) {
+          const Q96 = 2n ** 96n;
+          const raw = Number(formatEther((poolLiquidityRaw * Q96) / sqrtPriceX96));
+          // No real Base pool holds more than ~100k ETH; anything above that
+          // is a sqrtPriceX96 overflow artifact — null it out server-side.
+          const ETH_SUPPLY_MAX = 100_000;
+          if (raw > ETH_SUPPLY_MAX) {
+            warnings.push(
+              `[pool.slot0] initialLiquidityEth=${raw.toFixed(0)} ETH exceeds 100k ETH ceiling — overflow artifact, nulled`
+            );
+            initialLiquidityEth = null;
+          } else {
+            initialLiquidityEth = raw;
+          }
+        }
+      } catch (err) {
+        warn(warnings, "pool.slot0", "slot0 read failed", err);
+      }
+    }
+  }
+
+  // hasLiquidity is TRUE only on a confirmed >0 on-chain read. It is FALSE
+  // both when the read failed (poolLiquidityRaw === null) and when it
+  // succeeded with 0 — either way there is no real pool to test against yet,
+  // so every liquidity-dependent check downstream should be treated as
+  // "pending" rather than "failed"/"risky". scoring.ts uses this single flag
+  // to gate the whole liquidity-dependent branch instead of penalizing each
+  // individual null field.
+  const hasLiquidity = poolLiquidityRaw !== null && poolLiquidityRaw > 0n;
+
+  // ── 6. Assemble minimal evidence ────────────────────────────────────────────
+  return {
+    tokenAddress,
+    poolAddress,
+    pairedAsset,
+    venue: resolvedVenue,
+    deployBlock: deployBlock.toString(),
+
+    hookAddress: resolvedVenue === "v4" ? (hookAddress ?? null) : null,
+
+    name,
+    symbol,
+    decimals,
+    totalSupply: totalSupply.toString(),
+    totalSupplyFormatted,
+
+    ownerAddress,
+    ownershipRenounced,
+    isProxy,
+
+    deployerAddress:        deployer.address,
+    deployerMintBlock:      deployer.mintBlock?.toString() ?? null,
+    deployerMintAmount:     deployer.mintAmount?.toString() ?? null,
+    deployerCurrentBalance: null,
+    deployerPct: null,
+
+    holderScanFrom:    deployBlock.toString(),
+    holderScanTo:      deployBlock.toString(),
+    holderScanPartial: false,
+    holderScanFailed:  false,
+    top5Holders:       [],
+    top5HoldersPct:    null,
+
+    hasLiquidity,
+    poolLiquidity:       poolLiquidityRaw?.toString() ?? null,
+    liquidityLocked,
+    initialLiquidityEth,
+
+    liquidityDeltaPct:        null,
+    liquidityPreviousReading: null,
+    snapshotAgeMinutes:       null,
+
+    sellTestPassed:     null,
+    sellTestAmountSent: null,
+    sellTestError:      null,
+
+    lpTokenId:        null,
+    lpPositionOwner:  null,
+    lpPositionStatus: "unverified",
+
+    liquidityEverPulled: false,
+    burnEventCount:      0,
+
+    sourceVerified:          null,
+    suspiciousFunctions:     [],
+    secondaryAdminDetected:  false,
+    secondaryAdminSnippet:   null,
+    sourceAuditMethod:       null,
+    sourceFunctionAudits:    [],
+    proxyImplementationAudited: false,
+    proxyImplementationAddress: null,
+
+    deployerSeenBefore:  false,
+    deployerPriorTokens: [],
+
+    deploysLast15Min:         0,
+    deploysLastHour:          0,
+    deploysLast24h:           0,
+    recentContracts:          [],
+
+    walletAgeAtDeploySeconds: null,
+    fundingGapSeconds:        null,
+    fundingSourceAddress:     null,
+
+    preSeededWallets: [],
+    preSeededPct:     null,
+
+    totalSwaps:           0,
+    uniqueTraders:        0,
+    buyCount:             0,
+    sellCount:            0,
+    buySellRatio:         null,
+    roundTripTraderCount: 0,
+    roundTripTraderPct:   null,
+    topTraderSwapSharePct: 0,
+    tradeScanPartial:     false,
+
+    rpcWarnings: warnings,
+  };
+}
+
+// ─── Full collection function (kept for backwards compatibility) ─────────────────
 
 export async function collectEvidence(
   client: AnyClient,

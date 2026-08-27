@@ -6,6 +6,7 @@
  */
 
 import type { ToolCallRecord, RiskFlag } from "../rugcheck-types.js";
+import type { IterationDecision } from "../utils/interface.js";
 
 // ─── Number extraction ───────────────────────────────────────────────────────────
 
@@ -66,5 +67,27 @@ export function validateGrounding(flags: RiskFlag[], transcript: ToolCallRecord[
     }
   }
   
+  return true;
+}
+
+// ─── Stop conditions validator ─────────────────────────────────────────────────
+
+/** Mirrors validateGrounding()'s number-provenance check, but applied to
+ *  the stop/continue decision itself instead of the final flags. */
+export function validateStopConditions(
+  decisions: IterationDecision[],
+  verdict: string
+): boolean {
+  if (decisions.length === 0) return true; // nothing to validate yet
+  const last = decisions[decisions.length - 1];
+
+  if (verdict === "LOW" && last.unresolvedMandatory.length > 0) {
+    console.warn(`[grounding] LOW verdict with unresolved mandatory tiers: ${last.unresolvedMandatory.join(", ")}`);
+    return false;
+  }
+  if (last.action === "stop" && last.bandProximity === "boundary" && last.unresolvedMandatory.length > 0) {
+    console.warn(`[grounding] Stopped at a boundary score with unresolved mandatory checks`);
+    return false;
+  }
   return true;
 }

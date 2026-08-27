@@ -5,6 +5,15 @@ import type { RiskLevel, VerdictLevel, Venue } from "../rugcheck-types.js";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = PublicClient<any>;
 
+export interface IterationDecision {
+  runningScore: number;
+  bandProximity: "deep" | "boundary";
+  unresolvedMandatory: string[];
+  reason: string;
+  action: "continue" | "stop";
+  nextTool?: string;
+}
+
 export interface AgentLoopResult {
   result: LLMScoreResult;
   transcript: ToolCallRecord[];
@@ -39,6 +48,7 @@ export interface StoredAnalysis {
   summary: string;
   evidence: TokenEvidence;
   toolCallTranscript?: ToolCallRecord[];
+  decisionTrace?: IterationDecision[];
   flags: RiskFlag[];
   scoringMethod: string;
   /** Per-factor breakdown of how the deterministic score (scoring.ts) was built,
@@ -222,8 +232,9 @@ export interface TokenEvidence {
   suspiciousFunctions: {name: string, snippet: string}[];
   secondaryAdminDetected: boolean;
   secondaryAdminSnippet: string | null;
-  /** "llm" | "keyword_fallback" | null (source unverified, no audit ran). */
-  sourceAuditMethod: "llm" | "keyword_fallback" | null;
+  /** "llm" | null (source unverified, no audit ran). No fallback method exists —
+   *  a failed audit throws rather than ever producing a weaker-provenance result. */
+  sourceAuditMethod: "llm" | null;
   /** Full rubric detail per function, including low-confidence/benign findings — for logging/debugging only. */
   sourceFunctionAudits: import("../agents/types.js").FunctionAudit[];
   /** True when isProxy=true AND the audit above ran against the real
@@ -407,12 +418,13 @@ export interface ToolCallRecord {
   args: Record<string, unknown>;
   output: unknown;
   ts: number;
+  decision: IterationDecision;
 }
 
 export interface LLMScoreSuccess {
   ok: true;
   score: number;
-  verdict: RiskLevel;
+  verdict: RiskLevel | "INSUFFICIENT";
   flags: RiskFlag[];
   summary: string;
   rawModelText: string;
@@ -420,6 +432,9 @@ export interface LLMScoreSuccess {
   answer?: string;
   /** Only present in agentic mode: transcript of tool calls made */
   toolCallTranscript?: ToolCallRecord[];
+  /** Final decision trace — mirrors toolCallTranscript but isolates the
+   *  reasoning for auditability/rendering separately from raw tool I/O. */
+  decisionTrace?: IterationDecision[];
 }
 
 export interface LLMScoreFailure {
@@ -475,7 +490,7 @@ export interface RugCheckResult {
   suspiciousFunctions: {name: string, snippet: string}[];
   secondaryAdminDetected: boolean;
   secondaryAdminSnippet: string | null;
-  sourceAuditMethod?: "llm" | "keyword_fallback" | null;
+  sourceAuditMethod?: "llm" | null;
   sourceFunctionAudits?: import("../agents/types.js").FunctionAudit[];
   deployerSeenBefore: boolean;
   deployerPriorTokens: string[];
@@ -495,6 +510,8 @@ export interface RugCheckResult {
   answer?: string;
   /** Transcript of tool calls made during agentic scoring */
   toolCallTranscript?: ToolCallRecord[];
+  /** Decision trace for stop/continue reasoning during agentic scoring */
+  decisionTrace?: IterationDecision[];
   /** Analysis ID for retrieving full trace from Upstash */
   analysisId?: string;
 }

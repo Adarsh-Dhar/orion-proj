@@ -18,7 +18,7 @@ import {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = PublicClient<any>;
 
-import { collectEvidence }   from "./evidence.js";
+import { collectMinimalEvidence }   from "./evidence.js";
 import { scoreWithLLM }      from "./agents/llm-score.js";
 import { computeScore }      from "./scoring.js";
 import type { TokenEvidence } from "./evidence.js";
@@ -123,34 +123,20 @@ export async function runRugCheckLLM(
   }
 ): Promise<RugCheckResult> {
 
-  // ── 1. Check deployer history from persistent state (before evidence collection) ─────────────────────
-  let deployerHistoryData = { deployerSeenBefore: false, deployerPriorTokens: [] };
-  if (opts?.state) {
-    // We'll get the deployer address after evidence collection, so we use a placeholder
-    // This will be updated after we know the deployer address
-  }
-
-  // ── 2. Collect evidence ───────────────────────────────────────────────────
-  const evidence: TokenEvidence = await collectEvidence(
+  // ── 2. Collect minimal evidence ───────────────────────────────────────────────
+  const evidence: TokenEvidence = await collectMinimalEvidence(
     client, tokenAddress, poolAddress, pairedAsset, deployBlock, meta,
-    deployerHistoryData, opts?.state, opts?.venue, opts?.hookAddress, opts?.v4PoolParams, opts?.quickMode, opts?.sniperMode
+    opts?.venue, opts?.hookAddress, opts?.v4PoolParams
   );
 
   // ── 3. Update deployer history from persistent state ──────────────────────
-  // Merge bot-state memory with on-chain recentContracts (from Etherscan) so a
-  // serial deployer is caught even the very first time this bot sees them —
-  // recentContracts is ground-truth from the chain rather than dependent on the
-  // bot's own local history.
+  // Since collectMinimalEvidence no longer populates deployer history,
+  // we'll handle this via the agent loop's getDeployerHistory tool instead.
+  // For now, set defaults that will be updated if the agent runs.
   if (opts?.state && evidence.deployerAddress) {
     const priorTokens = getDeployerHistory(opts.state, evidence.deployerAddress);
-    const combined = new Set([
-      ...priorTokens.map((t) => t.toLowerCase()),
-      ...evidence.recentContracts.map((t) => t.toLowerCase()),
-    ]);
-    // Remove the current token itself — it's not a "prior" token
-    combined.delete(tokenAddress.toLowerCase());
-    evidence.deployerPriorTokens = [...combined];
-    evidence.deployerSeenBefore  = evidence.deployerPriorTokens.length > 0;
+    evidence.deployerPriorTokens = priorTokens;
+    evidence.deployerSeenBefore = priorTokens.length > 0;
     // Record this new token for future bot-state lookups
     recordDeployerToken(opts.state, evidence.deployerAddress, tokenAddress);
   }
@@ -185,6 +171,7 @@ export async function runRugCheckLLM(
   
   let llmResult;
   let toolCallTranscript: import("./rugcheck-types.js").ToolCallRecord[] | undefined;
+  let decisionTrace: import("./utils/interface.js").IterationDecision[] | undefined;
 
   if (isAmbiguous(evidence)) {
     console.log("  Evidence is ambiguous — entering agentic investigation mode...");
@@ -203,6 +190,7 @@ export async function runRugCheckLLM(
     const { result, transcript } = await runAgentLoop(evidence, toolContext, { maxIterations: 12 });
     llmResult = result;
     toolCallTranscript = transcript;
+    decisionTrace = result.ok ? result.decisionTrace : undefined;
 
     console.log(`  Agentic investigation complete: ${llmResult.ok ? "SUCCESS" : "FAILED"}`);
     if (transcript.length > 0) {
@@ -272,6 +260,7 @@ export async function runRugCheckLLM(
       scoringMethod: "failed",
       scoringError:  llmResult.reason,
       toolCallTranscript,
+      decisionTrace,
       analysisId: undefined,
     };
   }
@@ -316,6 +305,7 @@ export async function runRugCheckLLM(
         summary: llmResult.summary,
         evidence,
         toolCallTranscript, // undefined for single-shot runs — storage handles that gracefully
+        decisionTrace, // undefined for single-shot runs — storage handles that gracefully
         flags: llmResult.flags,
         scoringMethod: toolCallTranscript ? "llm-agentic" : "llm",
         scoreBreakdown: computed.breakdown,
@@ -362,13 +352,14 @@ export async function runRugCheckLLM(
     scoringMethod: toolCallTranscript ? "llm-agentic" : "llm",
     answer:  llmResult.answer,
     toolCallTranscript,
+    decisionTrace,
     analysisId,
   };
 }
 
 // ─── Report formatter ─────────────────────────────────────────────────────────
 
-const VERDICT_EMOJI:  Record<VerdictLevel, string> = { LOW: "🟢", MEDIUM: "🟡", HIGH: "🟠", CRITICAL: "🔴", UNKNOWN: "⚪" };
+const VERDICT_EMOJI:  Record<VerdictLevel, string> = { LOW: "🟢", MEDIUM: "🟡", HIGH: "🟠", CRITICAL: "🔴", UNKNOWN: "⚪", INSUFFICIENT: "⚪" };
 const SEVERITY_EMOJI: Record<RiskLevel, string> = { LOW: "🟢", MEDIUM: "🟡", HIGH: "🟠", CRITICAL: "🔴" };
 
 export function formatRugReport(
@@ -465,6 +456,14 @@ export function formatRugReport(
   lines.push(`║  Score    : ${r.score.toFixed(2)}/100`);
   lines.push(`║  Verdict  : ${v} ${r.verdict}`);
   lines.push(`║  Summary  : ${r.summary}`);
+  
+  const last = r.decisionTrace?.[r.decisionTrace.length - 1];
+  if (last) {
+    lines.push(`║  ${r.verdict === "INSUFFICIENT"
+      ? `⚪ Insufficient data — still missing: ${last.unresolvedMandatory.join(", ")}`
+      : `📊 ${last.reason}`}`);
+  }
+  
   lines.push(`║  BaseScan : https://basescan.org/address/${r.tokenAddress}`);
   if (r.answer) {
     lines.push(`║`);
@@ -488,6 +487,11 @@ export function formatAlertCard(
   const venueTag = r.venue === "v4" ? " · V4" : " · V3";
   lines.push(`${v} ${r.verdict} — ${meta.name} ($${meta.symbol})  ·  ${r.score.toFixed(2)}/100${venueTag}`);
   lines.push(r.summary);
+
+  const last = r.decisionTrace?.[r.decisionTrace.length - 1];
+  if (last && r.verdict === "INSUFFICIENT") {
+    lines.push(`⚪ Still missing: ${last.unresolvedMandatory.join(", ")}`);
+  }
 
   const topFlags = [...r.flags].sort((a, b) => b.points - a.points).slice(0, 2);
   for (const f of topFlags) {

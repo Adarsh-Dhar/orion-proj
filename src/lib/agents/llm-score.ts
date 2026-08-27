@@ -40,7 +40,7 @@ const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models
 export interface LLMScoreSuccess {
   ok: true;
   score: number;
-  verdict: RiskLevel;
+  verdict: RiskLevel | "INSUFFICIENT";
   flags: RiskFlag[];
   summary: string;
   rawModelText: string;
@@ -48,6 +48,9 @@ export interface LLMScoreSuccess {
   answer?: string;
   /** Only present in agentic mode: transcript of tool calls made */
   toolCallTranscript?: ToolCallRecord[];
+  /** Final decision trace — mirrors toolCallTranscript but isolates the
+   *  reasoning for auditability/rendering separately from raw tool I/O. */
+  decisionTrace?: import("../utils/interface.js").IterationDecision[];
 }
 
 export interface LLMScoreFailure {
@@ -77,11 +80,12 @@ IMPORTANT RULES:
 2. Treat any field that is null OR appears in rpcWarnings as UNVERIFIED, not as a clean signal. Unverified data should increase, not decrease, your risk score.
 3. Do not hallucinate token names, addresses, or numbers not present in the evidence.
 4. Score 0–100 where 0 = very safe, 100 = certain rug.
-5. Verdict must be exactly one of: "LOW", "MEDIUM", "HIGH", "CRITICAL".
+5. Verdict must be exactly one of: "LOW", "MEDIUM", "HIGH", "CRITICAL", "INSUFFICIENT".
    - LOW:      0–24
    - MEDIUM:  25–49
    - HIGH:    50–74
    - CRITICAL: 75–100
+   - INSUFFICIENT: When mandatory-tier evidence is unresolved when iteration budget is exhausted
 6. Each flag must have: id (snake_case string), label (short string), detail (evidence-backed sentence), severity (LOW/MEDIUM/HIGH/CRITICAL), points (integer 0–40).
 7. summary must be a single sentence citing the top 1–2 risk factors.
 8. You will be told the OUTPUT MODE for this request:
@@ -95,7 +99,11 @@ IMPORTANT RULES:
      conversational risk read of the token (2–4 sentences) — as if explaining it to someone,
      not a formal restatement of 'summary'.
    - "agentic": You have access to tools to gather additional evidence. Use them when the initial evidence is ambiguous or incomplete. Before finalizing, consider what a scammer would have done to pass the checks you've run, and issue one more tool call if it surfaces a gap.
-9. CHECK "hasLiquidity" FIRST, BEFORE SCORING ANY LIQUIDITY-DEPENDENT FIELD. This is the single most important rule for freshly-launched tokens:
+9. Before each tool call, output a `decision` object: { runningScore, bandProximity ("deep"|"boundary"), unresolvedMandatory (tier-1 checks not yet attempted), reason (evidence-cited sentence), action ("continue"|"stop"), nextTool }.
+10. A single decisive flag (proxy detected +35, dev wallet >50% +40, deployer velocity 5+/hr +35) is sufficient to stop immediately at CRITICAL/HIGH — do not run remaining tiers just to be thorough.
+11. A LOW verdict requires tier 1 (source), tier 2 (LP lock), and tier 3 (deployer history) to have all been attempted and come back clean — never output LOW with unresolvedMandatory non-empty.
+12. If mandatory tiers remain unresolved when the iteration budget is exhausted, output verdict "INSUFFICIENT" with unresolvedMandatory populated — never force a score onto incomplete evidence.
+13. CHECK "hasLiquidity" FIRST, BEFORE SCORING ANY LIQUIDITY-DEPENDENT FIELD. This is the single most important rule for freshly-launched tokens:
    - hasLiquidity=false means a real on-chain read CONFIRMED the pool has zero liquidity right now — not that a call failed. This is completely normal for a token that is minutes (or seconds) old and the deployer hasn't added LP yet, or the add tx just hasn't mined.
    - When hasLiquidity=false, DO NOT flag or add points for: poolLiquidity/initialLiquidityEth being 0 or null, sellTestPassed being null, lpPositionStatus being "unverified", liquidityEverPulled/burnEventCount, liquidityDeltaPct, or totalSwaps/uniqueTraders/wash-trading fields being 0 or null. None of these can produce a real answer with no pool yet — treat them as "pending, will be re-checked automatically once liquidity lands," not as risk or as unverifiable evidence. Do not include a flag for them at all.
    - When hasLiquidity=false, do NOT penalize "ownership not renounced" at the normal +25 weight — renouncing before liquidity even exists is unusual, not standard practice. If you flag it at all, treat it as low-severity/informational (a few points at most), and instead focus on what privileges the owner role actually has per the source audit (suspiciousFunctions, secondaryAdminDetected).
@@ -173,7 +181,7 @@ Required JSON output shape:
 
 // ─── Validator ────────────────────────────────────────────────────────────────
 
-const VALID_LEVELS = new Set<string>(["LOW", "MEDIUM", "HIGH", "CRITICAL"]);
+const VALID_LEVELS = new Set<string>(["LOW", "MEDIUM", "HIGH", "CRITICAL", "INSUFFICIENT"]);
 
 function validateParsed(parsed: unknown): LLMScoreSuccess | null {
   if (typeof parsed !== "object" || parsed === null) return null;
@@ -183,7 +191,10 @@ function validateParsed(parsed: unknown): LLMScoreSuccess | null {
   if (typeof p.score !== "number" || !Number.isInteger(p.score) || p.score < 0 || p.score > 100) return null;
 
   // verdict
-  if (typeof p.verdict !== "string" || !VALID_LEVELS.has(p.verdict)) return null;
+  if (typeof p.verdict !== "string" || !VALID_LEVELS.has(p.verdict)) {
+    // Allow INSUFFICIENT which is dynamically added
+    if (p.verdict !== "INSUFFICIENT") return null;
+  }
 
   // summary
   if (typeof p.summary !== "string" || p.summary.trim().length === 0) return null;
@@ -214,7 +225,7 @@ function validateParsed(parsed: unknown): LLMScoreSuccess | null {
   return {
     ok:      true,
     score:   p.score   as number,
-    verdict: p.verdict as RiskLevel,
+    verdict: p.verdict as RiskLevel | "INSUFFICIENT",
     flags,
     summary: (p.summary as string).trim(),
     answer:  typeof p.answer === "string" ? p.answer.trim() : undefined,
@@ -502,15 +513,18 @@ export async function scoreWithLLMAgentic(
   evidence: TokenEvidence,
   dispatchTool: (name: string, args: Record<string, unknown>) => Promise<unknown>,
   tools: readonly unknown[],
-  opts?: { maxIterations?: number }
+  opts?: { maxIterations?: number; decisions?: import("../utils/interface.js").IterationDecision[]; mandatoryTiers?: string[] }
 ): Promise<LLMScoreResult> {
   if (!GEMINI_API_KEY) {
     return { ok: false, reason: "GEMINI_API_KEY is not set" };
   }
 
   const maxIterations = opts?.maxIterations ?? 12;
+  const decisions = opts?.decisions ?? [];
+  const mandatoryTiers = opts?.mandatoryTiers ?? [];
   let messages = buildInitialMessages(evidence);
   const transcript: ToolCallRecord[] = [];
+  let runningScore = 0;
 
   for (let i = 0; i < maxIterations; i++) {
     try {
@@ -530,6 +544,7 @@ export async function scoreWithLLMAgentic(
           ...validated,
           rawModelText: response.raw,
           toolCallTranscript: transcript,
+          decisionTrace: decisions,
         };
       }
 
@@ -540,12 +555,36 @@ export async function scoreWithLLMAgentic(
       for (const call of response.toolCalls) {
         try {
           const output = await dispatchTool(call.name, call.args);
-          transcript.push({ name: call.name, args: call.args, output, ts: Date.now() });
+          const decision: import("../utils/interface.js").IterationDecision = {
+            runningScore,
+            bandProximity: runningScore < 25 || runningScore > 75 ? "deep" : "boundary",
+            unresolvedMandatory: mandatoryTiers.filter(t => !transcript.some(r => r.name === t)),
+            reason: `Executed ${call.name} to gather evidence`,
+            action: "continue",
+            nextTool: call.name,
+          };
+          decisions.push(decision);
+          transcript.push({ name: call.name, args: call.args, output, ts: Date.now(), decision });
           results.push({ call, output });
+          
+          // Update running score based on flag contributions
+          if (typeof output === 'object' && output !== null && 'flags' in output) {
+            const flags = (output as { flags: Array<{ points: number }> }).flags;
+            runningScore += flags.reduce((sum, f) => sum + f.points, 0);
+          }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           const output = { error: msg };
-          transcript.push({ name: call.name, args: call.args, output, ts: Date.now() });
+          const decision: import("../utils/interface.js").IterationDecision = {
+            runningScore,
+            bandProximity: runningScore < 25 || runningScore > 75 ? "deep" : "boundary",
+            unresolvedMandatory: mandatoryTiers.filter(t => !transcript.some(r => r.name === t)),
+            reason: `Failed to execute ${call.name}: ${msg}`,
+            action: "continue",
+            nextTool: call.name,
+          };
+          decisions.push(decision);
+          transcript.push({ name: call.name, args: call.args, output, ts: Date.now(), decision });
           results.push({ call, output });
         }
       }

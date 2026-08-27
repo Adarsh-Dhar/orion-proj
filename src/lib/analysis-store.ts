@@ -190,6 +190,9 @@ export async function getMultipleAnalyses(ids: string[]): Promise<StoredAnalysis
  * replacing it wholesale.  This lets callers update individual evidence fields
  * without fetching the full evidence object first.
  *
+ * Note: decisionTrace is persisted alongside toolCallTranscript so /analysis/:id
+ * can render the stop/continue reasoning, not just tool I/O.
+ *
  * Returns true if the record was found and updated, false otherwise.
  */
 export async function updateAnalysis(

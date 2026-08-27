@@ -36,5 +36,7 @@ export interface FunctionAudit {
   secondaryAdminCandidate: boolean;
 }
 
-/** Which path produced a given source-audit result — used for logging/debugging. */
-export type SourceAuditMethod = "llm" | "keyword_fallback";
+/** Which path produced a given source-audit result — used for logging/debugging.
+ *  There is no keyword-fallback path: analyzeSourceWithLLM throws on failure
+ *  rather than ever returning a result with a weaker provenance. */
+export type SourceAuditMethod = "llm";

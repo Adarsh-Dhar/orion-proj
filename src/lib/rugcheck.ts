@@ -185,12 +185,10 @@ export async function runRugCheckLLM(
   
   let llmResult;
   let toolCallTranscript: import("./rugcheck-types.js").ToolCallRecord[] | undefined;
-  
-  // Temporarily disable agentic mode due to Gemini API compatibility issues
-  // TODO: Fix Gemini function calling format to use correct API structure
-  if (false && isAmbiguous(evidence)) {
+
+  if (isAmbiguous(evidence)) {
     console.log("  Evidence is ambiguous — entering agentic investigation mode...");
-    
+
     const toolContext: ToolContext = {
       client,
       tokenAddress,
@@ -201,11 +199,11 @@ export async function runRugCheckLLM(
       ownerAddress: evidence.ownerAddress,
       isProxy: evidence.isProxy,
     };
-    
+
     const { result, transcript } = await runAgentLoop(evidence, toolContext, { maxIterations: 12 });
     llmResult = result;
     toolCallTranscript = transcript;
-    
+
     console.log(`  Agentic investigation complete: ${llmResult.ok ? "SUCCESS" : "FAILED"}`);
     if (transcript.length > 0) {
       console.log(`  Tool calls made: ${transcript.length}`);
@@ -213,11 +211,19 @@ export async function runRugCheckLLM(
         console.log(`    - ${call.name} at ${new Date(call.ts).toISOString()}`);
       }
     }
-  } 
-  
-  // Always use single-shot mode for now (agentic mode disabled due to Gemini API compatibility)
-  console.log("  Evidence is clear — using single-shot LLM scoring...");
-  llmResult = await scoreWithLLM(evidence, opts);
+
+    // If agentic mode failed outright (not just an ungrounded-flags rejection),
+    // fall back to single-shot scoring rather than surfacing a hard failure —
+    // a working single-shot score beats no score at all.
+    if (!llmResult.ok) {
+      console.warn(`  [Agentic] Falling back to single-shot scoring: ${llmResult.reason}`);
+      llmResult = await scoreWithLLM(evidence, opts);
+      toolCallTranscript = undefined;
+    }
+  } else {
+    console.log("  Evidence is clear — using single-shot LLM scoring...");
+    llmResult = await scoreWithLLM(evidence, opts);
+  }
 
   if (!llmResult.ok) {
     console.error(`  [LLM] Scoring failed: ${llmResult.reason}`);

@@ -342,6 +342,8 @@ interface ToolCallResponse {
   type: "tool_calls";
   toolCalls: ToolCall[];
   raw: string;
+  /** The model's own turn, echoed back verbatim on the next request. */
+  modelContent: Message;
 }
 
 interface FinalResponse {
@@ -366,7 +368,8 @@ interface Message {
 
 /**
  * Call Gemini with function calling support.
- * Returns either tool calls to execute or a final JSON response.
+ * Returns either tool calls to execute (plus the exact model content that
+ * requested them, so it can be echoed back verbatim) or a final JSON response.
  */
 async function callGeminiWithTools(
   messages: Array<{ role: string; parts: Array<Record<string, unknown>> }>,
@@ -382,7 +385,7 @@ async function callGeminiWithTools(
   });
 
   const data = await response.json() as {
-    candidates?: Array<{ content?: { parts?: Array<{ text?: string; functionCall?: { name: string; args: Record<string, unknown> } }> } }>;
+    candidates?: Array<{ content?: { role?: string; parts?: MessagePart[] } }>;
     error?: { code: number; message: string };
   };
 
@@ -398,16 +401,23 @@ async function callGeminiWithTools(
     throw new Error("Gemini returned empty response");
   }
 
-  const parts = candidate.content.parts as MessagePart[];
+  const parts = candidate.content.parts;
   const rawText = parts.map(p => p.text ?? "").join("");
-  
-  // Check for function calls
+
+  // Check for function calls. Gemini's own turn — role "model" — must be
+  // echoed back verbatim (all parts, including any function calls) so the
+  // subsequent functionResponse turn lines up with it.
   const functionCalls = parts
-    .filter(p => p.functionCall)
-    .map(p => ({ name: p.functionCall!.name, args: p.functionCall!.args }));
+    .filter((p): p is MessagePart & { functionCall: { name: string; args: Record<string, unknown> } } => !!p.functionCall)
+    .map(p => ({ name: p.functionCall.name, args: p.functionCall.args }));
 
   if (functionCalls.length > 0) {
-    return { type: "tool_calls", toolCalls: functionCalls, raw: rawText };
+    return {
+      type: "tool_calls",
+      toolCalls: functionCalls,
+      raw: rawText,
+      modelContent: { role: "model", parts },
+    };
   }
 
   // Parse as final JSON response
@@ -455,34 +465,34 @@ IMPORTANT: Every numeric fact in your final flags must be traceable to a tool re
 }
 
 /**
- * Append a function result to the message history.
- * Gemini uses a different format: function responses are added as user messages with functionResponse parts.
+ * Append a completed round of tool calls to the message history.
+ *
+ * Gemini requires:
+ *   1. The model's own turn that requested the call(s) — role "model" —
+ *      echoed back exactly as returned (not reconstructed as role "user").
+ *   2. A single immediately-following "user" turn carrying ALL of that
+ *      turn's functionResponse parts together. When a model turn issues
+ *      several function calls at once, splitting them into separate
+ *      call/response turn pairs violates Gemini's strict turn ordering
+ *      ("a functionResponse part must appear in a user turn that comes
+ *      immediately after the model turn containing the matching
+ *      functionCall") and the API rejects the request with a 400.
  */
-function appendFunctionResult(
+function appendFunctionResults(
   messages: Message[],
-  call: ToolCall,
-  result: unknown
+  modelContent: Message,
+  results: Array<{ call: ToolCall; output: unknown }>
 ): Message[] {
-  const newMessages = [...messages];
-  
-  // Add the function call
-  newMessages.push({
-    role: "user",
-    parts: [{ functionCall: { name: call.name, args: call.args } }],
-  });
-  
-  // Add the function response (Gemini uses user role with functionResponse)
-  newMessages.push({
-    role: "user",
-    parts: [{
-      functionResponse: {
-        name: call.name,
-        response: result
-      }
-    }],
-  });
-  
-  return newMessages;
+  return [
+    ...messages,
+    modelContent,
+    {
+      role: "user",
+      parts: results.map(({ call, output }) => ({
+        functionResponse: { name: call.name, response: output },
+      })),
+    },
+  ];
 }
 
 /**
@@ -523,28 +533,23 @@ export async function scoreWithLLMAgentic(
         };
       }
 
-      // Execute tool calls
+      // Execute all tool calls from this turn, then append them as a single
+      // model-turn / user-turn pair (see appendFunctionResults for why they
+      // must be batched rather than appended one at a time).
+      const results: Array<{ call: ToolCall; output: unknown }> = [];
       for (const call of response.toolCalls) {
         try {
           const output = await dispatchTool(call.name, call.args);
-          transcript.push({
-            name: call.name,
-            args: call.args,
-            output,
-            ts: Date.now(),
-          });
-          messages = appendFunctionResult(messages, call, output);
+          transcript.push({ name: call.name, args: call.args, output, ts: Date.now() });
+          results.push({ call, output });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          transcript.push({
-            name: call.name,
-            args: call.args,
-            output: { error: msg },
-            ts: Date.now(),
-          });
-          messages = appendFunctionResult(messages, call, { error: msg });
+          const output = { error: msg };
+          transcript.push({ name: call.name, args: call.args, output, ts: Date.now() });
+          results.push({ call, output });
         }
       }
+      messages = appendFunctionResults(messages, response.modelContent, results);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return { ok: false, reason: `Agentic loop failed: ${msg}` };

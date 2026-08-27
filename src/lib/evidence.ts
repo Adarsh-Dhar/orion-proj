@@ -966,11 +966,79 @@ function buildTradeActivity(
 // This function now only does the Etherscan fetch; all judgment (suspicious
 // function detection, secondary-admin detection) happens in the agent, which
 // falls back to a keyword heuristic internally if the LLM call fails.
+/**
+ * Etherscan returns SourceCode in one of three shapes:
+ *   1. Flat Solidity text (single-file verification) — most common.
+ *   2. `{{...}}` — a JSON object double-wrapped in braces (Standard-JSON-Input
+ *      verification). The outer braces must be stripped before JSON.parse.
+ *   3. `{...}` — same JSON shape but only single-wrapped (some proxies/older
+ *      compiler UIs). Handle both defensively.
+ * In both (2) and (3) the parsed object's `sources` map holds one entry per
+ * file, each with a `.content` string — those need to be concatenated so the
+ * LLM audit sees every imported file (e.g. OpenZeppelin bases with the real
+ * mint/blacklist logic) instead of just whatever the naive raw string was.
+ */
+function unwrapMultiFileSource(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith("{")) return raw;
+
+  // Strip one layer of doubled braces: "{{ ... }}" -> "{ ... }"
+  const candidate = trimmed.startsWith("{{") && trimmed.endsWith("}}")
+    ? trimmed.slice(1, -1)
+    : trimmed;
+
+  try {
+    const parsed = JSON.parse(candidate);
+    const sources = parsed?.sources ?? parsed; // some payloads skip the "sources" wrapper
+    if (sources && typeof sources === "object") {
+      const files = Object.entries(sources)
+        .map(([path, val]) => {
+          const content = (val as { content?: string })?.content;
+          return content ? `// ── ${path} ──\n${content}` : null;
+        })
+        .filter((x): x is string => x !== null);
+      if (files.length > 0) return files.join("\n\n");
+    }
+  } catch {
+    // Not valid JSON despite looking like it — fall through and audit the
+    // raw string as-is rather than silently dropping it.
+  }
+  return raw;
+}
+
+/** Reads the EIP-1967 implementation slot and returns the address portion
+ *  (last 20 bytes) of the 32-byte storage word, or null if it's empty/unset. */
+function implementationAddressFromSlot(slot: `0x${string}` | undefined): Address | null {
+  if (!slot || slot === ZERO_SLOT) return null;
+  const addr = `0x${slot.slice(-40)}`;
+  return addr.toLowerCase() === NULL_ADDRESS.toLowerCase() ? null : (addr as Address);
+}
+
+async function fetchVerifiedSource(
+  address: Address,
+  apiKey: string,
+  warnings: string[],
+  tag: string
+): Promise<string> {
+  try {
+    const url  = `${ETHERSCAN_API_BASE}?chainid=${BASE_CHAIN_ID}&module=contract&action=getsourcecode&address=${address}&apikey=${apiKey}`;
+    const res  = await fetch(url);
+    const json = await res.json();
+    const raw: string = json?.result?.[0]?.SourceCode ?? "";
+    return raw ? unwrapMultiFileSource(raw) : "";
+  } catch (err) {
+    warn(warnings, tag, "Etherscan API call failed", err);
+    return "";
+  }
+}
+
 export async function checkSourceVerification(
+  client: AnyClient,
   tokenAddress: Address,
   warnings: string[],
   ownershipRenounced: boolean | null,
-  ownerAddress: string | null
+  ownerAddress: string | null,
+  isProxy: boolean | null
 ): Promise<{
   sourceVerified: boolean | null;
   suspiciousFunctions: { name: string; snippet: string }[];
@@ -978,35 +1046,60 @@ export async function checkSourceVerification(
   secondaryAdminSnippet: string | null;
   sourceAuditMethod: SourceAuditMethod | null;
   functionAudits: FunctionAudit[];
+  /** True when isProxy was true AND we successfully pulled the *implementation*
+   *  contract's source (rather than just the thin proxy shim) for the audit. */
+  proxyImplementationAudited: boolean;
+  /** The implementation address that was actually audited, if any. */
+  proxyImplementationAddress: string | null;
 }> {
+  const empty = {
+    sourceVerified: null as boolean | null, suspiciousFunctions: [] as { name: string; snippet: string }[],
+    secondaryAdminDetected: false, secondaryAdminSnippet: null as string | null,
+    sourceAuditMethod: null as SourceAuditMethod | null, functionAudits: [] as FunctionAudit[],
+    proxyImplementationAudited: false, proxyImplementationAddress: null as string | null,
+  };
+
   const apiKey = process.env.ETHERSCAN_API_KEY;
   if (!apiKey) {
     warn(warnings, "sourceCheck", "ETHERSCAN_API_KEY not set — skipping", "missing env var");
-    return {
-      sourceVerified: null, suspiciousFunctions: [], secondaryAdminDetected: false,
-      secondaryAdminSnippet: null, sourceAuditMethod: null, functionAudits: [],
-    };
+    return empty;
   }
 
-  let source = "";
-  try {
-    const url  = `${ETHERSCAN_API_BASE}?chainid=${BASE_CHAIN_ID}&module=contract&action=getsourcecode&address=${tokenAddress}&apikey=${apiKey}`;
-    const res  = await fetch(url);
-    const json = await res.json();
-    source = json?.result?.[0]?.SourceCode ?? "";
-  } catch (err) {
-    warn(warnings, "sourceCheck", "Etherscan API call failed", err);
-    return {
-      sourceVerified: null, suspiciousFunctions: [], secondaryAdminDetected: false,
-      secondaryAdminSnippet: null, sourceAuditMethod: null, functionAudits: [],
-    };
+  let source = await fetchVerifiedSource(tokenAddress, apiKey, warnings, "sourceCheck");
+
+  // Proxy follow-up: getsourcecode on the token address returns the proxy
+  // shim's source (usually a boring EIP-1967 delegate), not the real logic.
+  // Read the implementation slot directly and audit *that* contract instead
+  // — this matters most pre-launch, since a clean-looking implementation
+  // today says nothing about what the owner swaps it to tomorrow, which is
+  // why proxy status is flagged independently in scoring.ts regardless of
+  // what this audit finds.
+  let proxyImplementationAudited = false;
+  let proxyImplementationAddress: string | null = null;
+
+  if (isProxy) {
+    try {
+      const slot = await client.getStorageAt({ address: tokenAddress, slot: EIP1967_IMPL_SLOT });
+      const implAddress = implementationAddressFromSlot(slot as `0x${string}` | undefined);
+      if (implAddress) {
+        proxyImplementationAddress = implAddress;
+        const implSource = await fetchVerifiedSource(implAddress, apiKey, warnings, "sourceCheck:proxyImpl");
+        if (implSource) {
+          source = implSource;
+          proxyImplementationAudited = true;
+        } else {
+          warn(warnings, "sourceCheck:proxyImpl", `implementation ${implAddress} not verified`, "no source returned");
+        }
+      } else {
+        warn(warnings, "sourceCheck:proxyImpl", "isProxy=true but implementation slot is empty", "unresolved implementation");
+      }
+    } catch (err) {
+      warn(warnings, "sourceCheck:proxyImpl", "implementation slot read failed", err);
+    }
   }
 
   if (!source) {
-    return {
-      sourceVerified: false, suspiciousFunctions: [], secondaryAdminDetected: false,
-      secondaryAdminSnippet: null, sourceAuditMethod: null, functionAudits: [],
-    };
+    return { ...empty, sourceVerified: false, proxyImplementationAudited, proxyImplementationAddress };
   }
 
   const audit = await analyzeSourceWithLLM(source, ownershipRenounced, ownerAddress, warnings);
@@ -1017,6 +1110,8 @@ export async function checkSourceVerification(
     secondaryAdminSnippet: audit.secondaryAdminSnippet,
     sourceAuditMethod: audit.method,
     functionAudits: audit.functionAudits,
+    proxyImplementationAudited,
+    proxyImplementationAddress,
   };
 }
 
@@ -1286,6 +1381,15 @@ export async function collectEvidence(
     }
   }
 
+  // hasLiquidity is TRUE only on a confirmed >0 on-chain read. It is FALSE
+  // both when the read failed (poolLiquidityRaw === null) and when it
+  // succeeded with 0 — either way there is no real pool to test against yet,
+  // so every liquidity-dependent check downstream should be treated as
+  // "pending" rather than "failed"/"risky". scoring.ts uses this single flag
+  // to gate the whole liquidity-dependent branch instead of penalizing each
+  // individual null field.
+  const hasLiquidity = poolLiquidityRaw !== null && poolLiquidityRaw > 0n;
+
   // ── 7. Sell test, LP lock, burn history ───────────────────────────────────
   const sellTest   = await testSellability(
     client, tokenAddress, poolAddress, top5, ownerAddress, deployer.address,
@@ -1298,7 +1402,7 @@ export async function collectEvidence(
     client, poolAddress, deployBlock, holderScan.scanTo, warnings, resolvedVenue
   );
   const sourceCheck = await checkSourceVerification(
-    tokenAddress, warnings, ownershipRenounced, ownerAddress
+    client, tokenAddress, warnings, ownershipRenounced, ownerAddress, isProxy
   );
   const deployerHistoryData = deployerHistory ?? { deployerSeenBefore: false, deployerPriorTokens: [] };
 
@@ -1399,6 +1503,7 @@ export async function collectEvidence(
     top5Holders:       top5,
     top5HoldersPct,
 
+    hasLiquidity,
     poolLiquidity:       poolLiquidityRaw?.toString() ?? null,
     liquidityLocked,
     initialLiquidityEth,
@@ -1424,6 +1529,8 @@ export async function collectEvidence(
     secondaryAdminSnippet:   sourceCheck.secondaryAdminSnippet,
     sourceAuditMethod:       sourceCheck.sourceAuditMethod,
     sourceFunctionAudits:    sourceCheck.functionAudits,
+    proxyImplementationAudited:  sourceCheck.proxyImplementationAudited,
+    proxyImplementationAddress:  sourceCheck.proxyImplementationAddress,
 
     deployerSeenBefore:  deployerHistoryData.deployerSeenBefore,
     deployerPriorTokens: deployerHistoryData.deployerPriorTokens,

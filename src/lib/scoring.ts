@@ -59,14 +59,19 @@ function scoreTop5Holders(pct: number | null): { points: number; note: string } 
   return { points, note: `Top-5 holders control ${pct.toFixed(2)}% of supply` };
 }
 
-function scoreLiquidity(eth: number | null, rpcWarnings: string[]): { points: number; note: string } {
+function scoreLiquidity(hasLiquidity: boolean, eth: number | null): { points: number; note: string } {
+  // A pool that genuinely has zero liquidity yet (brand-new token, LP add
+  // hasn't landed) is NOT the same thing as a pool that had liquidity and
+  // it's now unverifiable/zero — the former is expected and re-checked by
+  // reVerifyEvidence() as the pool matures, the latter is a real risk signal.
+  if (!hasLiquidity) return { points: 0, note: "Liquidity pending — no pool liquidity yet (new token, re-checked automatically)" };
   if (eth === null) return { points: 15, note: "Liquidity unverifiable (+15)" };
-  if (eth <= 0) return { points: 40, note: "Zero in-range liquidity (confirmed) (+40)" };
   const points = 40 * decay(eth, 0.3);
   return { points, note: `Initial liquidity ≈ ${eth.toFixed(4)} ETH` };
 }
 
-function scoreLiquidityDelta(deltaPct: number | null): { points: number; note: string } | null {
+function scoreLiquidityDelta(hasLiquidity: boolean, deltaPct: number | null): { points: number; note: string } | null {
+  if (!hasLiquidity) return null; // nothing to compare a delta against yet
   if (deltaPct === null) return null;
   if (deltaPct >= 0) return null;
   const drop = Math.abs(deltaPct);
@@ -87,9 +92,20 @@ function scoreSerialDeployer(seenBefore: boolean, priorTokens: string[]): { poin
   return { points, note: `Deployer has ${count} prior token${count === 1 ? "" : "s"} on record` };
 }
 
-function scoreOwnership(renounced: boolean | null): { points: number; note: string } {
+function scoreOwnership(renounced: boolean | null, hasLiquidity: boolean): { points: number; note: string } {
   if (renounced === null) return { points: 10, note: "Ownership status unverifiable (+10)" };
-  if (renounced === false) return { points: 25, note: "Ownership not renounced (active owner)" };
+  if (renounced === false) {
+    // Renouncing ownership before liquidity even exists is unusual, not
+    // standard practice — most legitimate deployers renounce (if at all)
+    // after launch. Don't score "not yet renounced" as risk on a token
+    // that's minutes old; the privileges the owner role actually has
+    // (mint, blacklist, fee-setting, etc.) are what matters, and that's
+    // captured by the source audit's suspicious-function flags instead.
+    if (!hasLiquidity) {
+      return { points: 3, note: "Ownership not renounced (expected pre-launch — owner privileges audited separately)" };
+    }
+    return { points: 25, note: "Ownership not renounced (active owner)" };
+  }
   return { points: 0, note: "Ownership renounced" };
 }
 
@@ -99,13 +115,17 @@ function scoreProxy(isProxy: boolean | null): { points: number; note: string } {
   return { points: 0, note: "Not a proxy contract" };
 }
 
-function scoreSellTest(passed: boolean | null): { points: number; note: string } {
+function scoreSellTest(hasLiquidity: boolean, passed: boolean | null): { points: number; note: string } {
+  if (!hasLiquidity) return { points: 0, note: "Sell test pending — no liquidity to simulate a swap against yet" };
   if (passed === null) return { points: 5, note: "Sell test inconclusive (no suitable holder) (+5)" };
   if (passed === false) return { points: 50, note: "Sell test FAILED — confirmed honeypot" };
   return { points: 0, note: "Sell test passed" };
 }
 
-function scoreLpPosition(status: TokenEvidence["lpPositionStatus"]): { points: number; note: string } {
+function scoreLpPosition(hasLiquidity: boolean, status: TokenEvidence["lpPositionStatus"]): { points: number; note: string } {
+  if (!hasLiquidity && status === "unverified") {
+    return { points: 0, note: "LP lock status pending — no Mint/ModifyLiquidity event yet (new token)" };
+  }
   switch (status) {
     case "burned":         return { points: 0,  note: "LP position burned (liquidity locked forever)" };
     case "locked_uncx":    return { points: 0,  note: "LP position locked via UNCX" };
@@ -116,16 +136,38 @@ function scoreLpPosition(status: TokenEvidence["lpPositionStatus"]): { points: n
   }
 }
 
-function scoreLiquidityPulled(everPulled: boolean, burnEvents: number): { points: number; note: string } | null {
+function scoreLiquidityPulled(hasLiquidity: boolean, everPulled: boolean, burnEvents: number): { points: number; note: string } | null {
+  if (!hasLiquidity) return null; // nothing to have pulled yet
   if (!everPulled) return null;
   const t = ramp(burnEvents, 1, 5);
   const points = 30 + 10 * t; // 30..40
   return { points, note: `Liquidity pulled at least once (${burnEvents} burn event${burnEvents === 1 ? "" : "s"})` };
 }
 
-function scoreSourceVerification(verified: boolean | null): { points: number; note: string } | null {
+function scoreSourceVerification(
+  verified: boolean | null,
+  hasLiquidity: boolean
+): { points: number; note: string } | null {
   if (verified === null) return { points: 5, note: "Source verification API call failed (+5, inconclusive)" };
-  if (verified === false) return { points: 15, note: "Source code not verified" };
+  if (verified === false) {
+    // Pre-liquidity, source verification is the single strongest signal
+    // available (no trading history exists yet to fall back on), and
+    // legitimate deployers overwhelmingly verify immediately — so weight
+    // an unverified contract more heavily on a token this fresh.
+    return hasLiquidity
+      ? { points: 15, note: "Source code not verified" }
+      : { points: 30, note: "Source code not verified (new token — no fallback trading-history signal either)" };
+  }
+  return null;
+}
+
+function scoreProxyImplementationAudit(evidence: TokenEvidence): { points: number; note: string } | null {
+  if (!evidence.isProxy) return null;
+  if (evidence.sourceVerified && !evidence.proxyImplementationAudited) {
+    // We audited the proxy shim, not the real logic contract — the clean
+    // result above is not meaningful on its own.
+    return { points: 15, note: "Proxy implementation contract not independently verified/audited" };
+  }
   return null;
 }
 
@@ -142,6 +184,9 @@ function scoreSecondaryAdmin(detected: boolean): { points: number; note: string 
 
 function scoreWashTrading(evidence: TokenEvidence): Array<{ points: number; note: string }> {
   const out: Array<{ points: number; note: string }> = [];
+  // No liquidity yet ⇒ no swaps are possible, so an empty/partial trade scan
+  // is expected rather than a real gap in evidence.
+  if (!evidence.hasLiquidity) return out;
 
   if (evidence.roundTripTraderPct !== null && evidence.roundTripTraderPct > 40) {
     const t = ramp(evidence.roundTripTraderPct, 40, 100);
@@ -193,8 +238,11 @@ function scoreSanity(evidence: TokenEvidence): Array<{ points: number; note: str
     evidence.isProxy === null,
     evidence.deployerPct === null,
     evidence.top5HoldersPct === null,
-    evidence.poolLiquidity === null,
-    evidence.sellTestPassed === null,
+    // Liquidity/sell-test being null is expected (not a gap) on a token
+    // that genuinely has no liquidity yet — only count it when liquidity
+    // exists and the read still failed.
+    evidence.hasLiquidity && evidence.poolLiquidity === null,
+    evidence.hasLiquidity && evidence.sellTestPassed === null,
     evidence.sourceVerified === null,
   ].filter(Boolean).length;
 
@@ -231,17 +279,20 @@ export function computeScore(evidence: TokenEvidence): ComputedScore {
     breakdown.push({ id, label: result.note, contribution: Number(result.points.toFixed(2)) });
   }
 
+  const hasLiquidity = evidence.hasLiquidity;
+
   add("dev_wallet", scoreDevWallet(evidence.deployerPct));
   add("top5_holders", scoreTop5Holders(evidence.top5HoldersPct));
-  add("liquidity", scoreLiquidity(evidence.initialLiquidityEth, evidence.rpcWarnings));
-  add("liquidity_delta", scoreLiquidityDelta(evidence.liquidityDeltaPct));
+  add("liquidity", scoreLiquidity(hasLiquidity, evidence.initialLiquidityEth));
+  add("liquidity_delta", scoreLiquidityDelta(hasLiquidity, evidence.liquidityDeltaPct));
   add("serial_deployer", scoreSerialDeployer(evidence.deployerSeenBefore, evidence.deployerPriorTokens));
-  add("ownership", scoreOwnership(evidence.ownershipRenounced));
+  add("ownership", scoreOwnership(evidence.ownershipRenounced, hasLiquidity));
   add("proxy", scoreProxy(evidence.isProxy));
-  add("sell_test", scoreSellTest(evidence.sellTestPassed));
-  add("lp_position", scoreLpPosition(evidence.lpPositionStatus));
-  add("liquidity_pulled", scoreLiquidityPulled(evidence.liquidityEverPulled, evidence.burnEventCount));
-  add("source_verification", scoreSourceVerification(evidence.sourceVerified));
+  add("proxy_implementation", scoreProxyImplementationAudit(evidence));
+  add("sell_test", scoreSellTest(hasLiquidity, evidence.sellTestPassed));
+  add("lp_position", scoreLpPosition(hasLiquidity, evidence.lpPositionStatus));
+  add("liquidity_pulled", scoreLiquidityPulled(hasLiquidity, evidence.liquidityEverPulled, evidence.burnEventCount));
+  add("source_verification", scoreSourceVerification(evidence.sourceVerified, hasLiquidity));
   add("suspicious_functions", scoreSuspiciousFunctions(evidence.suspiciousFunctions));
   add("secondary_admin", scoreSecondaryAdmin(evidence.secondaryAdminDetected));
 

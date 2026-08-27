@@ -109,16 +109,20 @@ async function tick(): Promise<void> {
   if (evidence.sourceVerified === null || evidence.sourceVerified === false) {
     try {
       const srcCheck = await checkSourceVerification(
+        client as AnyClient,
         analysis.tokenAddress as Address,
         [],
         evidence.ownershipRenounced,
-        evidence.ownerAddress
+        evidence.ownerAddress,
+        evidence.isProxy
       );
       if (srcCheck.sourceVerified !== null && srcCheck.sourceVerified !== evidence.sourceVerified) {
         evidencePatch.sourceVerified = srcCheck.sourceVerified;
         evidencePatch.suspiciousFunctions = srcCheck.suspiciousFunctions;
         evidencePatch.secondaryAdminDetected = srcCheck.secondaryAdminDetected;
         evidencePatch.secondaryAdminSnippet = srcCheck.secondaryAdminSnippet;
+        evidencePatch.proxyImplementationAudited = srcCheck.proxyImplementationAudited;
+        evidencePatch.proxyImplementationAddress = srcCheck.proxyImplementationAddress;
         changed = true;
         console.log(`  → source verification improved: ${evidence.sourceVerified} → ${srcCheck.sourceVerified}`);
       }

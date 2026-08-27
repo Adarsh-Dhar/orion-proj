@@ -64,6 +64,7 @@ export interface TokenEvidence {
   top5Holders: Array<{ address: string; balance: string; pct: number }>;
   top5HoldersPct: number | null;
 
+  hasLiquidity: boolean;
   poolLiquidity: string | null;
   liquidityLocked: boolean | null;
   initialLiquidityEth: number | null;

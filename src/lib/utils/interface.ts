@@ -19,6 +19,7 @@ export interface ToolContext {
   // Cached values from initial evidence collection
   ownershipRenounced: boolean | null;
   ownerAddress: string | null;
+  isProxy: boolean | null;
 }
 
 export interface StoredAnalysis {
@@ -186,6 +187,13 @@ export interface TokenEvidence {
   top5HoldersPct: number | null;
 
   // ── Liquidity ─────────────────────────────────────────────────────────────
+  /** True only when a real, confirmed pool.liquidity() / StateView.getLiquidity()
+   *  read came back > 0. False (not null) means "confirmed empty pool, this is
+   *  a genuinely brand-new token" — distinct from the individual fields below
+   *  being null due to an RPC failure. Every liquidity-dependent check
+   *  (sell test, LP lock, pull history, wash trading, liquidity delta) is
+   *  gated on this in scoring.ts rather than being scored as missing/risky. */
+  hasLiquidity: boolean;
   poolLiquidity: string | null;      // bigint as string; null = read failed
   liquidityLocked: boolean | null;   // null = unknown
   initialLiquidityEth: number | null;
@@ -218,6 +226,11 @@ export interface TokenEvidence {
   sourceAuditMethod: "llm" | "keyword_fallback" | null;
   /** Full rubric detail per function, including low-confidence/benign findings — for logging/debugging only. */
   sourceFunctionAudits: import("../agents/types.js").FunctionAudit[];
+  /** True when isProxy=true AND the audit above ran against the real
+   *  implementation contract's source rather than the thin proxy shim. */
+  proxyImplementationAudited: boolean;
+  /** Implementation address that was actually audited, when applicable. */
+  proxyImplementationAddress: string | null;
 
   // ── Deployer history (in-process memory, resets on bot restart) ────────
   deployerSeenBefore: boolean;

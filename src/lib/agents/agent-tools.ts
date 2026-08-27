@@ -105,6 +105,7 @@ export interface ToolContext {
   // Cached values from initial evidence collection
   ownershipRenounced: boolean | null;
   ownerAddress: string | null;
+  isProxy: boolean | null;
 }
 
 // ─── Dispatcher ───────────────────────────────────────────────────────────────
@@ -157,10 +158,12 @@ export async function dispatchTool(
 
     case "getSourceCode": {
       const result = await checkSourceVerification(
+        ctx.client,
         ctx.tokenAddress,
         warnings,
         args.ownershipRenounced as boolean | null,
-        args.ownerAddress as string | null
+        args.ownerAddress as string | null,
+        ctx.isProxy
       );
       return { ...result, warnings };
     }

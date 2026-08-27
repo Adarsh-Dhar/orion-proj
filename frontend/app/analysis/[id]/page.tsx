@@ -273,11 +273,18 @@ export default function AnalysisPage({ params }: { params: Promise<{ id: string 
           {evidence && (
             <Panel title="Liquidity" icon="💧">
               <div className="space-y-3">
+                {!evidence.hasLiquidity && (
+                  <p className="rounded-md bg-blue-50 border border-blue-200 px-3 py-2 text-xs text-blue-700">
+                    No liquidity yet — this looks like a brand-new token. These checks are re-run automatically as soon as a pool is funded.
+                  </p>
+                )}
                 <div>
                   <div className="flex justify-between text-xs mb-1">
                     <span className="text-muted-foreground">Initial Liquidity</span>
                     <span className="font-mono text-foreground">
-                      {evidence.initialLiquidityEth !== null
+                      {!evidence.hasLiquidity
+                        ? 'pending'
+                        : evidence.initialLiquidityEth !== null
                         ? evidence.initialLiquidityEth === 0
                           ? '0 ETH'
                           : evidence.initialLiquidityEth < 0.000001
@@ -290,12 +297,12 @@ export default function AnalysisPage({ params }: { params: Promise<{ id: string 
                   </div>
                   <MeterBar
                     pct={
-                      evidence.initialLiquidityEth !== null
+                      evidence.hasLiquidity && evidence.initialLiquidityEth !== null
                         ? Math.min(100, (evidence.initialLiquidityEth / 1) * 100)
                         : 0
                     }
                     tone={
-                      evidence.initialLiquidityEth !== null && evidence.initialLiquidityEth < 0.3
+                      evidence.hasLiquidity && evidence.initialLiquidityEth !== null && evidence.initialLiquidityEth < 0.3
                         ? 'red'
                         : 'sky'
                     }
@@ -305,8 +312,10 @@ export default function AnalysisPage({ params }: { params: Promise<{ id: string 
                   <span className="text-muted-foreground">LP Position Status</span>
                   <VerifiedPill
                     state={
-                      evidence.lpPositionStatus === 'burned' ||
-                      evidence.lpPositionStatus === 'locked_uncx'
+                      !evidence.hasLiquidity && evidence.lpPositionStatus === 'unverified'
+                        ? 'pending'
+                        : evidence.lpPositionStatus === 'burned' ||
+                          evidence.lpPositionStatus === 'locked_uncx'
                         ? 'verified'
                         : evidence.lpPositionStatus === 'held_by_eoa'
                         ? 'flagged'
@@ -318,7 +327,9 @@ export default function AnalysisPage({ params }: { params: Promise<{ id: string 
                   <span className="text-muted-foreground">Sell Test</span>
                   <VerifiedPill
                     state={
-                      evidence.sellTestPassed === true
+                      !evidence.hasLiquidity
+                        ? 'pending'
+                        : evidence.sellTestPassed === true
                         ? 'verified'
                         : evidence.sellTestPassed === false
                         ? 'flagged'
@@ -328,7 +339,15 @@ export default function AnalysisPage({ params }: { params: Promise<{ id: string 
                 </div>
                 <div className="flex justify-between text-sm">
                   <span className="text-muted-foreground">Liquidity Ever Pulled</span>
-                  <VerifiedPill state={evidence.liquidityEverPulled ? 'flagged' : 'verified'} />
+                  <VerifiedPill
+                    state={
+                      !evidence.hasLiquidity
+                        ? 'pending'
+                        : evidence.liquidityEverPulled
+                        ? 'flagged'
+                        : 'verified'
+                    }
+                  />
                 </div>
               </div>
             </Panel>

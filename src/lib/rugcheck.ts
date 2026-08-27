@@ -189,6 +189,7 @@ export async function runRugCheckLLM(
       state: opts?.state,
       ownershipRenounced: evidence.ownershipRenounced,
       ownerAddress: evidence.ownerAddress,
+      isProxy: evidence.isProxy,
     };
     
     const { result, transcript } = await runAgentLoop(evidence, toolContext, { maxIterations: 12 });

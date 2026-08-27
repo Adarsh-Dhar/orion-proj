@@ -95,11 +95,19 @@ IMPORTANT RULES:
      conversational risk read of the token (2–4 sentences) — as if explaining it to someone,
      not a formal restatement of 'summary'.
    - "agentic": You have access to tools to gather additional evidence. Use them when the initial evidence is ambiguous or incomplete. Before finalizing, consider what a scammer would have done to pass the checks you've run, and issue one more tool call if it surfaces a gap.
+9. CHECK "hasLiquidity" FIRST, BEFORE SCORING ANY LIQUIDITY-DEPENDENT FIELD. This is the single most important rule for freshly-launched tokens:
+   - hasLiquidity=false means a real on-chain read CONFIRMED the pool has zero liquidity right now — not that a call failed. This is completely normal for a token that is minutes (or seconds) old and the deployer hasn't added LP yet, or the add tx just hasn't mined.
+   - When hasLiquidity=false, DO NOT flag or add points for: poolLiquidity/initialLiquidityEth being 0 or null, sellTestPassed being null, lpPositionStatus being "unverified", liquidityEverPulled/burnEventCount, liquidityDeltaPct, or totalSwaps/uniqueTraders/wash-trading fields being 0 or null. None of these can produce a real answer with no pool yet — treat them as "pending, will be re-checked automatically once liquidity lands," not as risk or as unverifiable evidence. Do not include a flag for them at all.
+   - When hasLiquidity=false, do NOT penalize "ownership not renounced" at the normal +25 weight — renouncing before liquidity even exists is unusual, not standard practice. If you flag it at all, treat it as low-severity/informational (a few points at most), and instead focus on what privileges the owner role actually has per the source audit (suspiciousFunctions, secondaryAdminDetected).
+   - When hasLiquidity=false, source verification (sourceVerified, suspiciousFunctions, secondaryAdminDetected), proxy status (isProxy), deployer wallet reputation (deployerSeenBefore, deployerPriorTokens), and supply distribution (deployerPct, top5HoldersPct) become your PRIMARY signals — score and weight them at full strength, since there is no trading history yet to fall back on. An unverified contract on a brand-new token is a stronger signal than on a token that's been trading for a while (see scoring guide below).
+   - When hasLiquidity=true, score all liquidity-dependent fields normally per the guide below.
 
 SCORING GUIDE:
-- Ownership not renounced (confirmed active owner address):  +25 pts, HIGH
+- Ownership not renounced, hasLiquidity=true (confirmed active owner):  +25 pts, HIGH
+- Ownership not renounced, hasLiquidity=false (pre-launch, expected):   +0–5 pts, LOW at most — do not treat as a real risk signal on its own
 - Ownership unverifiable (owner() reverted):                +10 pts, MEDIUM
-- Upgradeable proxy detected:                               +35 pts, CRITICAL — detail MUST explicitly state the implementation-swap risk
+- Upgradeable proxy detected:                               +35 pts, CRITICAL — detail MUST explicitly state the implementation-swap risk, regardless of hasLiquidity
+- Proxy detected AND proxyImplementationAudited=false (only the proxy shim's source was checked, not the real logic contract): +15 pts, MEDIUM — detail must say the actual implementation could not be independently verified
 - Proxy status unverifiable:                                +10 pts, MEDIUM
 - Dev wallet >50% supply:                                   +40 pts, CRITICAL
 - Dev wallet 20–50% supply:                                 +20 pts, HIGH
@@ -107,29 +115,31 @@ SCORING GUIDE:
 - Holder data unverifiable:                                 +10 pts, MEDIUM
 - Deployer seen before (repeat deployer):                    +10 pts, MEDIUM (pattern risk)
 - Deployer has 3+ prior tokens:                             +20 pts, HIGH (serial deployer)
-- Zero in-range liquidity (confirmed):                      +40 pts, CRITICAL
-- Liquidity unverifiable:                                   +15 pts, MEDIUM
-- Very low liquidity (<0.5 ETH equivalent):                 +15 pts, MEDIUM
-- LP position burned (liquidity removed):                    +40 pts, CRITICAL
-- LP position held by EOA (not locked):                      +25 pts, HIGH
-- LP status unverifiable:                                    +10 pts, MEDIUM
-- Liquidity ever pulled (burn events detected):              +30 pts, HIGH
-- Liquidity dropped >30% since last snapshot:               +30 pts, HIGH
-- Liquidity dropped >70% since last snapshot:               +50 pts, CRITICAL
-- Sell test failed (confirmed honeypot):                     +50 pts, CRITICAL
-- Sell test unverifiable (no suitable holder):               +5 pts, LOW (inconclusive)
-- Source not verified (no source code):                      +15 pts, MEDIUM
-- Suspicious functions found: For each entry in suspiciousFunctions, read the provided snippet and write a detail sentence explaining WHAT the function lets the caller do and HOW it could be abused. +15 pts, MEDIUM per function type
-- Secondary admin detected (ownership renounced but privileged role found): +30 pts, HIGH — "ownership shows renounced but a second privileged role was found in source, renounce may be a decoy"
+- hasLiquidity=false: DO NOT flag zero/null liquidity, LP lock status, sell test, liquidity-pulled history, liquidity delta, or trade-activity fields at all — see rule 9 above.
+- Zero in-range liquidity, hasLiquidity=true but eth reading came back 0 or unverifiable post-launch: +40 pts, CRITICAL
+- Liquidity unverifiable (hasLiquidity=true but eth read failed):          +15 pts, MEDIUM
+- Very low liquidity (<0.5 ETH equivalent), hasLiquidity=true:             +15 pts, MEDIUM
+- LP position burned (liquidity removed), hasLiquidity=true:               +40 pts, CRITICAL
+- LP position held by EOA (not locked), hasLiquidity=true:                 +25 pts, HIGH
+- LP status unverifiable, hasLiquidity=true:                               +10 pts, MEDIUM
+- Liquidity ever pulled (burn events detected), hasLiquidity=true:         +30 pts, HIGH
+- Liquidity dropped >30% since last snapshot, hasLiquidity=true:           +30 pts, HIGH
+- Liquidity dropped >70% since last snapshot, hasLiquidity=true:           +50 pts, CRITICAL
+- Sell test failed (confirmed honeypot), hasLiquidity=true:                +50 pts, CRITICAL
+- Sell test unverifiable (no suitable holder), hasLiquidity=true:          +5 pts, LOW (inconclusive)
+- Source not verified (no source code), hasLiquidity=true:                 +15 pts, MEDIUM
+- Source not verified (no source code), hasLiquidity=false (new token — no trading-history fallback either): +30 pts, HIGH
+- Suspicious functions found: For each entry in suspiciousFunctions, read the provided snippet and write a detail sentence explaining WHAT the function lets the caller do and HOW it could be abused. +15 pts, MEDIUM per function type — applies regardless of hasLiquidity, and is one of your primary signals when hasLiquidity=false
+- Secondary admin detected (ownership renounced but privileged role found): +30 pts, HIGH — "ownership shows renounced but a second privileged role was found in source, renounce may be a decoy" — applies regardless of hasLiquidity
 - Source verification failed (API error):                   +5 pts, LOW (inconclusive)
 - Total supply = 0 (broken contract):                       +20 pts, HIGH
-- Multiple unverified fields together (3+):                 +10 pts, MEDIUM (compound uncertainty)
-- Round-trip traders >40% of unique traders:                +25 pts, HIGH (wash-trading pattern)
-- Single trader >50% of total swap volume:                  +30 pts, HIGH (fake volume / one wallet churning)
-- Fewer than 5 unique traders with >20 total swaps:        +20 pts, HIGH (thin organic interest, likely bot activity)
-- Buy/sell ratio wildly skewed toward sells early:          +15 pts, MEDIUM (possible dump in progress)
-- Trade scan data unverified (tradeScanPartial=true):       +10 pts, MEDIUM (incomplete wash-trading analysis)
-- V4 custom hook detected (non-zero hook address):          +20 pts, HIGH — custom hooks can implement hidden taxes or blacklists at the pool level
+- Multiple unverified fields together (3+): +10 pts, MEDIUM (compound uncertainty) — when hasLiquidity=false, do NOT count the liquidity-dependent pending fields toward this total; only count genuine RPC/API failures
+- Round-trip traders >40% of unique traders, hasLiquidity=true:            +25 pts, HIGH (wash-trading pattern)
+- Single trader >50% of total swap volume, hasLiquidity=true:              +30 pts, HIGH (fake volume / one wallet churning)
+- Fewer than 5 unique traders with >20 total swaps, hasLiquidity=true:    +20 pts, HIGH (thin organic interest, likely bot activity)
+- Buy/sell ratio wildly skewed toward sells early, hasLiquidity=true:      +15 pts, MEDIUM (possible dump in progress)
+- Trade scan data unverified (tradeScanPartial=true), hasLiquidity=true:   +10 pts, MEDIUM (incomplete wash-trading analysis)
+- V4 custom hook detected (non-zero hook address):          +20 pts, HIGH — custom hooks can implement hidden taxes or blacklists at the pool level, regardless of hasLiquidity
 - V4 hook source not verified:                              +15 pts, MEDIUM (cannot verify hook safety)
 
 SANITY CHECKS — apply these before scoring:
@@ -137,6 +147,7 @@ SANITY CHECKS — apply these before scoring:
 - If totalSupply is an astronomically large number inconsistent with a normal token launch (e.g. trillions with 18 decimals), flag it.
 - If any numeric field appears in rpcWarnings, that field could not be fetched and must be treated as unverified risk regardless of its value.
 - Never reward implausibly large numbers. If a value seems physically impossible, it almost certainly indicates a computation error or a non-standard token — both are risk signals.
+- Always read "hasLiquidity" before writing any flag that touches poolLiquidity, initialLiquidityEth, liquidityLocked, sellTestPassed, lpPositionStatus, liquidityEverPulled, burnEventCount, liquidityDeltaPct, or any trade-activity field (totalSwaps, uniqueTraders, buySellRatio, roundTripTraderPct, topTraderSwapSharePct, tradeScanPartial). See rule 9.
 
 Required JSON output shape:
 {

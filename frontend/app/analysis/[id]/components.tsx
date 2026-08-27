@@ -207,11 +207,12 @@ export function StatCard({
 
 // ─── VerifiedPill ─────────────────────────────────────────────────────────────
 
-export function VerifiedPill({ state }: { state: 'verified' | 'unverified' | 'flagged' }) {
+export function VerifiedPill({ state }: { state: 'verified' | 'unverified' | 'flagged' | 'pending' }) {
   const map = {
     verified:   { label: 'Verified',   cls: 'bg-green-50 text-green-700 border-green-200' },
     unverified: { label: 'Unverified', cls: 'bg-gray-50 text-gray-500 border-gray-200' },
     flagged:    { label: 'Flagged',    cls: 'bg-red-50 text-red-700 border-red-200' },
+    pending:    { label: 'Pending',    cls: 'bg-blue-50 text-blue-600 border-blue-200' },
   }[state];
   return (
     <span className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide ${map.cls}`}>

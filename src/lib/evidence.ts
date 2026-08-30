@@ -51,6 +51,7 @@ import {
   NPM_INCREASE_LIQUIDITY_EVENT_ABI,
   NPM_OWNER_OF_ABI,
   ERC20_TRANSFER_ABI,
+  ERC20_TRANSFER_TOPIC0,
   // V4-specific
   UNISWAP_V4_POOL_MANAGER,
   UNISWAP_V4_STATE_VIEW,
@@ -125,6 +126,123 @@ async function safeReadNullable<T>(
 ): Promise<T | null> {
   try { return await fn(); }
   catch (err) { warn(warnings, tag, "read failed", err); return null; }
+}
+
+// ─── Etherscan log-indexing helper (replaces raw eth_getLogs for wide ranges) ─
+
+/**
+ * Why this exists: raw `eth_getLogs` over a token's full history is capped by
+ * the RPC provider's block-range limit — on Alchemy's free tier that's just
+ * 10 blocks on Base, so a 100,000-block holder scan would need 10,000
+ * sequential RPC calls (and a 200,000-block deployer lookback, 20,000 calls).
+ * No amount of retry/backoff fixes this: it's a hard per-request validation
+ * limit, not throttling, so every over-limit call fails identically forever.
+ *
+ * Etherscan's log-indexing API (module=logs&action=getLogs) has no such
+ * per-request block-range limit — it's a pre-built index, not a live node —
+ * so the same scan becomes one paginated call instead of thousands of RPC
+ * round-trips. This is the same Etherscan v2 unified API (and the same
+ * ETHERSCAN_API_KEY) already used by fetchDeployerTxHistory and
+ * fetchVerifiedSource below.
+ */
+
+/** Etherscan caps getLogs results at 1000 rows per page. */
+const ETHERSCAN_LOGS_PAGE_SIZE = 1000;
+/** Hard ceiling on pages walked per call — bounds worst-case latency for a
+ *  token with an extreme transfer count instead of paginating unbounded. */
+const ETHERSCAN_LOGS_MAX_PAGES = 20;
+/** Free-tier Etherscan/Basescan allows 5 req/sec — pace page requests to stay under it. */
+const ETHERSCAN_LOGS_PAGE_DELAY_MS = 250;
+
+interface DecodedTransferLog {
+  blockNumber: bigint;
+  args: { from: string; to: string; value: bigint };
+}
+
+/**
+ * Fetch every ERC-20 Transfer log for `tokenAddress` in [fromBlock, toBlock]
+ * via Etherscan instead of eth_getLogs. When `fromAddressFilter` is given,
+ * restricts to Transfers *from* that address (used by findDeployer to
+ * isolate mint events from the zero address) via topic1 + AND.
+ *
+ * Returns `truncated: true` if ETHERSCAN_LOGS_MAX_PAGES was hit — there may
+ * be more logs in range than were returned.
+ */
+async function fetchTransferLogsFromEtherscan(
+  tokenAddress: Address,
+  fromBlock: bigint,
+  toBlock: bigint,
+  apiKey: string,
+  warnings: string[],
+  tag: string,
+  fromAddressFilter?: Address
+): Promise<{ logs: DecodedTransferLog[]; truncated: boolean; hadError: boolean }> {
+  const logs: DecodedTransferLog[] = [];
+  let truncated = false;
+  let hadError  = false;
+
+  for (let page = 1; page <= ETHERSCAN_LOGS_MAX_PAGES; page++) {
+    const params = new URLSearchParams({
+      chainid: String(BASE_CHAIN_ID),
+      module: "logs",
+      action: "getLogs",
+      address: tokenAddress,
+      fromBlock: fromBlock.toString(),
+      toBlock: toBlock.toString(),
+      topic0: ERC20_TRANSFER_TOPIC0,
+      page: String(page),
+      offset: String(ETHERSCAN_LOGS_PAGE_SIZE),
+      apikey: apiKey,
+    });
+    if (fromAddressFilter) {
+      // topic1 = "from" address, left-padded to 32 bytes, as Etherscan expects.
+      params.set("topic1", `0x${"0".repeat(24)}${fromAddressFilter.slice(2).toLowerCase()}`);
+      params.set("topic0_1_opr", "and");
+    }
+
+    let json: { status: string; message: string; result: unknown };
+    try {
+      const res = await fetch(`${ETHERSCAN_API_BASE}?${params.toString()}`);
+      json = await res.json() as typeof json;
+    } catch (err) {
+      warn(warnings, tag, `Etherscan getLogs page ${page} fetch failed`, err);
+      hadError = true;
+      break;
+    }
+
+    // Etherscan returns status "0" + message "No records found" for a
+    // genuinely empty (not erroring) result — treat that as success, not
+    // failure. For real errors, `message` is always the generic "NOTOK" —
+    // the actual reason (bad key, rate limit, bad param, etc.) is in `result`.
+    if (json.status !== "1") {
+      if (json.message && !/no records found/i.test(json.message)) {
+        const reason = typeof json.result === "string" ? json.result : JSON.stringify(json.result);
+        warn(warnings, tag, `Etherscan getLogs page ${page} error`, reason);
+        hadError = true;
+      }
+      break;
+    }
+    if (!Array.isArray(json.result)) { hadError = true; break; }
+
+    const rows = json.result as Array<{ topics: string[]; data: string; blockNumber: string }>;
+    for (const row of rows) {
+      try {
+        const from        = `0x${row.topics[1].slice(-40)}`;
+        const to          = `0x${row.topics[2].slice(-40)}`;
+        const value       = BigInt(row.data === "0x" ? "0x0" : row.data);
+        const blockNumber = BigInt(row.blockNumber);
+        logs.push({ blockNumber, args: { from, to, value } });
+      } catch {
+        // Malformed row — skip it rather than aborting the whole page.
+      }
+    }
+
+    if (rows.length < ETHERSCAN_LOGS_PAGE_SIZE) break; // last page reached
+    if (page === ETHERSCAN_LOGS_MAX_PAGES) { truncated = true; break; }
+    await new Promise(resolve => setTimeout(resolve, ETHERSCAN_LOGS_PAGE_DELAY_MS));
+  }
+
+  return { logs, truncated, hadError };
 }
 
 // ─── Etherscan deployer tx history helper ────────────────────────────────────
@@ -277,6 +395,46 @@ export async function checkPreLiquidityDistribution(
   poolAddress: string,
   warnings: string[]
 ): Promise<{ preSeededWallets: string[]; preSeededPct: null }> {
+  const apiKey = process.env.ETHERSCAN_API_KEY;
+  if (!apiKey) {
+    warn(warnings, "preSeed", "ETHERSCAN_API_KEY not set — falling back to slower RPC scan", "missing env var");
+    return checkPreLiquidityDistributionViaRpc(client, tokenAddress, mintBlock, scanToBlock, deployerAddress, poolAddress, warnings);
+  }
+
+  const deployerLower = deployerAddress.toLowerCase();
+  const poolLower     = poolAddress.toLowerCase();
+
+  const { logs, truncated } = await fetchTransferLogsFromEtherscan(
+    tokenAddress, mintBlock, scanToBlock, apiKey, warnings, "preSeed"
+  );
+  if (truncated) {
+    warn(warnings, "preSeed", `hit ${ETHERSCAN_LOGS_MAX_PAGES}-page cap — result may be incomplete`, "truncated");
+  }
+
+  const recipients = new Set<string>();
+  for (const log of logs) {
+    const to = log.args.to?.toLowerCase();
+    if (!to) continue;
+    if (to === deployerLower) continue;
+    if (to === poolLower)     continue;
+    if (to === NULL_ADDRESS.toLowerCase()) continue;
+    recipients.add(to);
+  }
+
+  return { preSeededWallets: [...recipients], preSeededPct: null };
+}
+
+/** Fallback used only when ETHERSCAN_API_KEY is not configured. Subject to
+ *  the RPC provider's eth_getLogs block-range cap — see SCAN_CHUNK comment. */
+async function checkPreLiquidityDistributionViaRpc(
+  client: AnyClient,
+  tokenAddress: Address,
+  mintBlock: bigint,
+  scanToBlock: bigint,
+  deployerAddress: string,
+  poolAddress: string,
+  warnings: string[]
+): Promise<{ preSeededWallets: string[]; preSeededPct: null }> {
   const recipients = new Set<string>();
   const deployerLower = deployerAddress.toLowerCase();
   const poolLower     = poolAddress.toLowerCase();
@@ -314,7 +472,51 @@ export async function checkPreLiquidityDistribution(
 
 
 
+/** Mint found within this many blocks of deployBlock is reported as "tight"
+ *  provenance rather than "wide" — same semantic the old SCAN_CHUNK-sized
+ *  first pass used, just no longer tied to the RPC chunk size. */
+const TIGHT_MINT_WINDOW_BLOCKS = 10_000n;
+
 export async function findDeployer(
+  client: AnyClient,
+  tokenAddress: Address,
+  deployBlock: bigint,
+  warnings: string[]
+): Promise<DeployerResult> {
+  const apiKey = process.env.ETHERSCAN_API_KEY;
+  if (!apiKey) {
+    warn(warnings, "findDeployer", "ETHERSCAN_API_KEY not set — falling back to slower RPC scan", "missing env var");
+    return findDeployerViaRpc(client, tokenAddress, deployBlock, warnings);
+  }
+
+  // Mint happens at or before the pool creation block. One paginated
+  // Etherscan call over the full lookback window replaces the old backward
+  // chunk-walk entirely — no RPC block-range limit to work around.
+  const hardFloor = deployBlock > MAX_LOOKBACK ? deployBlock - MAX_LOOKBACK : 0n;
+  const { logs, truncated } = await fetchTransferLogsFromEtherscan(
+    tokenAddress, hardFloor, deployBlock, apiKey, warnings, "findDeployer", NULL_ADDRESS as Address
+  );
+  if (truncated) {
+    warn(warnings, "findDeployer", `hit ${ETHERSCAN_LOGS_MAX_PAGES}-page cap — earliest mint may be missing`, "truncated");
+  }
+
+  if (logs.length === 0) {
+    return { address: null, mintBlock: null, mintAmount: null, source: "unknown" };
+  }
+
+  const sorted = [...logs].sort((a, b) => (a.blockNumber < b.blockNumber ? -1 : 1));
+  const first  = sorted[0];
+  return {
+    address: first.args.to,
+    mintBlock: first.blockNumber,
+    mintAmount: first.args.value,
+    source: deployBlock - first.blockNumber <= TIGHT_MINT_WINDOW_BLOCKS ? "tight" : "wide",
+  };
+}
+
+/** Fallback used only when ETHERSCAN_API_KEY is not configured. Subject to
+ *  the RPC provider's eth_getLogs block-range cap — see SCAN_CHUNK comment. */
+async function findDeployerViaRpc(
   client: AnyClient,
   tokenAddress: Address,
   deployBlock: bigint,
@@ -330,30 +532,56 @@ export async function findDeployer(
   while (chunkEnd >= hardFloor) {
     const chunkStart = chunkEnd >= SCAN_CHUNK ? chunkEnd - (SCAN_CHUNK - 1n) : 0n;
     const clampedStart = chunkStart > hardFloor ? chunkStart : hardFloor;
+    let logs;
     try {
-      const logs = await client.getLogs({
+      logs = await client.getLogs({
         address: tokenAddress,
         event: TRANSFER_EVENT_ABI[0],
         args: { from: NULL_ADDRESS as Address },
         fromBlock: clampedStart,
         toBlock: chunkEnd,
       });
-      if (logs.length > 0) {
-        const sorted = [...logs].sort((a, b) => (a.blockNumber! < b.blockNumber! ? -1 : 1));
-        const first  = sorted[0];
-        const to     = (first.args as { to: string }).to ?? null;
-        const value  = (first.args as { value?: bigint }).value ?? null;
-        return {
-          address: to,
-          mintBlock: first.blockNumber ?? null,
-          mintAmount: value,
-          source: chunkEnd === deployBlock ? "tight" : "wide",
-        };
-      }
     } catch (err) {
-      warn(warnings, "findDeployer", `chunk [${clampedStart}, ${chunkEnd}] failed`, err);
-      // Stop — don't burn requests on a connection that's already failing
-      return { address: null, mintBlock: null, mintAmount: null, source: "unknown" };
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      const isRateLimited =
+        errorMsg.includes("429") ||
+        errorMsg.toLowerCase().includes("rate limit") ||
+        errorMsg.includes("JSON is not a valid request object");
+
+      if (isRateLimited) {
+        // One retry after a real backoff — a throttled first call shouldn't
+        // sink the whole deployer lookup immediately.
+        warn(warnings, "findDeployer", `chunk [${clampedStart}, ${chunkEnd}] rate-limited, retrying after backoff`, err);
+        await new Promise(resolve => setTimeout(resolve, 3_000));
+        try {
+          logs = await client.getLogs({
+            address: tokenAddress,
+            event: TRANSFER_EVENT_ABI[0],
+            args: { from: NULL_ADDRESS as Address },
+            fromBlock: clampedStart,
+            toBlock: chunkEnd,
+          });
+        } catch (err2) {
+          warn(warnings, "findDeployer", `chunk [${clampedStart}, ${chunkEnd}] failed after retry`, err2);
+          return { address: null, mintBlock: null, mintAmount: null, source: "unknown" };
+        }
+      } else {
+        warn(warnings, "findDeployer", `chunk [${clampedStart}, ${chunkEnd}] failed`, err);
+        // Stop — don't burn requests on a connection that's already failing
+        return { address: null, mintBlock: null, mintAmount: null, source: "unknown" };
+      }
+    }
+    if (logs.length > 0) {
+      const sorted = [...logs].sort((a, b) => (a.blockNumber! < b.blockNumber! ? -1 : 1));
+      const first  = sorted[0];
+      const to     = (first.args as { to: string }).to ?? null;
+      const value  = (first.args as { value?: bigint }).value ?? null;
+      return {
+        address: to,
+        mintBlock: first.blockNumber ?? null,
+        mintAmount: value,
+        source: chunkEnd === deployBlock ? "tight" : "wide",
+      };
     }
     if (clampedStart <= hardFloor) break;
     chunkEnd = clampedStart - 1n;
@@ -366,11 +594,69 @@ export async function findDeployer(
 
 
 
+/** Never scan more than this many blocks total, regardless of provider —
+ *  bounds worst-case cost for very old tokens. */
+const MAX_HOLDER_SCAN_RANGE = 100_000n;
+
 /**
  * Fetch holder balances by scanning Transfer events from `fromBlock` to the
- * current chain head, walking forward in SCAN_CHUNK (10k) windows.
+ * current chain head (capped at MAX_HOLDER_SCAN_RANGE) via Etherscan's
+ * log-indexing API — one paginated call instead of a raw eth_getLogs chunk
+ * walk that would blow past the RPC provider's block-range limit.
  */
 export async function scanHolderBalances(
+  client: AnyClient,
+  tokenAddress: Address,
+  fromBlock: bigint,
+  warnings: string[]
+): Promise<HolderScanResult> {
+  const apiKey = process.env.ETHERSCAN_API_KEY;
+  if (!apiKey) {
+    warn(warnings, "holderScan", "ETHERSCAN_API_KEY not set — falling back to slower RPC scan", "missing env var");
+    return scanHolderBalancesViaRpc(client, tokenAddress, fromBlock, warnings);
+  }
+
+  const latestBlock = await client.getBlockNumber();
+  const toBlock = fromBlock + MAX_HOLDER_SCAN_RANGE < latestBlock
+    ? fromBlock + MAX_HOLDER_SCAN_RANGE
+    : latestBlock;
+
+  console.log(`  [evidence:holderScan] Scanning blocks ${fromBlock} to ${toBlock} via Etherscan`);
+
+  const { logs, truncated, hadError } = await fetchTransferLogsFromEtherscan(
+    tokenAddress, fromBlock, toBlock, apiKey, warnings, "holderScan"
+  );
+  if (truncated) {
+    warn(warnings, "holderScan", `hit ${ETHERSCAN_LOGS_MAX_PAGES}-page cap — holder balances may be incomplete`, "truncated");
+  }
+
+  const balances = new Map<string, bigint>();
+  for (const log of logs) {
+    const { from, to, value } = log.args;
+    if (!value) continue;
+    if (from !== NULL_ADDRESS) {
+      balances.set(from, (balances.get(from) ?? 0n) - value);
+    }
+    balances.set(to, (balances.get(to) ?? 0n) + value);
+  }
+
+  // Remove dust / burned balances
+  for (const [addr, bal] of balances) {
+    if (bal <= 0n) balances.delete(addr);
+  }
+
+  return {
+    balances,
+    partial: truncated,
+    failed:  hadError,
+    scanFrom: fromBlock,
+    scanTo:   toBlock,
+  };
+}
+
+/** Fallback used only when ETHERSCAN_API_KEY is not configured. Subject to
+ *  the RPC provider's eth_getLogs block-range cap — see SCAN_CHUNK comment. */
+async function scanHolderBalancesViaRpc(
   client: AnyClient,
   tokenAddress: Address,
   fromBlock: bigint,
@@ -381,11 +667,8 @@ export async function scanHolderBalances(
   let chunksFailed  = 0;
   let chunksTotal   = 0;
 
-  // Hard cap: never scan more than 100,000 blocks (10 chunks) total
-  // This prevents excessively long scans for old tokens
-  const MAX_SCAN_RANGE = 100_000n;
-  const toBlock = fromBlock + MAX_SCAN_RANGE < latestBlock
-    ? fromBlock + MAX_SCAN_RANGE
+  const toBlock = fromBlock + MAX_HOLDER_SCAN_RANGE < latestBlock
+    ? fromBlock + MAX_HOLDER_SCAN_RANGE
     : latestBlock;
 
   const totalChunks = Number((toBlock - fromBlock) / SCAN_CHUNK) + 1;
@@ -418,21 +701,29 @@ export async function scanHolderBalances(
         }
         chunkSucceeded = true;
       } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        const isRateLimited =
+          errorMsg.includes("429") ||
+          errorMsg.toLowerCase().includes("rate limit") ||
+          errorMsg.includes("JSON is not a valid request object");
+
         if (retry === 2) {
-          // Final retry failed
           chunksFailed++;
           warn(warnings, "holderScan", `chunk [${chunkStart}, ${chunkEnd}] failed after 3 retries`, err);
-          // Continue scanning other chunks instead of stopping completely
-        }
-        // Wait 100ms before retry to avoid overwhelming the RPC
-        if (retry < 2) {
-          await new Promise(resolve => setTimeout(resolve, 100));
+        } else if (isRateLimited) {
+          const backoffMs = retry === 0 ? 2_000 : 6_000;
+          console.log(`  [evidence:holderScan] chunk [${chunkStart}, ${chunkEnd}] rate-limited, backing off ${backoffMs}ms`);
+          await new Promise(resolve => setTimeout(resolve, backoffMs));
+        } else {
+          await new Promise(resolve => setTimeout(resolve, 300));
         }
       }
     }
+    if (chunkStart + SCAN_CHUNK <= toBlock) {
+      await new Promise(resolve => setTimeout(resolve, 150));
+    }
   }
 
-  // Remove dust / burned balances
   for (const [addr, bal] of balances) {
     if (bal <= 0n) balances.delete(addr);
   }
@@ -442,7 +733,7 @@ export async function scanHolderBalances(
     partial: chunksFailed > 0 && chunksFailed < chunksTotal,
     failed:  chunksFailed === chunksTotal && chunksTotal > 0,
     scanFrom: fromBlock,
-    scanTo:   latestBlock,
+    scanTo:   toBlock,
   };
 }
 

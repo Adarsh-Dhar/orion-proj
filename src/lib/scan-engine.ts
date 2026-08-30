@@ -85,6 +85,40 @@ export function identifyTokens(token0: Address, token1: Address): TokenIdentity 
  * Falls back to `currentBlock` if every call fails (e.g. RPC doesn't support
  * the blockNumber param on eth_getCode — rare but possible on some providers).
  */
+const GETCODE_TIMEOUT_MS = 8_000;
+const GETCODE_MAX_RETRIES = 2;
+
+/**
+ * getBytecode with a hard timeout + retry. Without this, a single Infura
+ * call that never resolves (silent stall / soft rate-limit) blocks the
+ * whole binary search forever with no error and no log line — exactly the
+ * "stuck after Starting V4 deploy block search" symptom.
+ */
+async function getBytecodeSafe(
+  client: AnyClient,
+  address: Address,
+  blockNumber?: bigint
+): Promise<string> {
+  for (let attempt = 0; attempt <= GETCODE_MAX_RETRIES; attempt++) {
+    try {
+      const result = await Promise.race([
+        client.getBytecode(blockNumber !== undefined ? { address, blockNumber } : { address }),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("getBytecode timed out")), GETCODE_TIMEOUT_MS)
+        ),
+      ]);
+      return result ?? "0x";
+    } catch (err) {
+      if (attempt === GETCODE_MAX_RETRIES) throw err;
+      console.log(
+        `[timing] getBytecode attempt ${attempt + 1} failed (${err instanceof Error ? err.message : String(err)}), retrying...`
+      );
+      await sleep(300 * (attempt + 1));
+    }
+  }
+  throw new Error("unreachable");
+}
+
 export async function findContractDeployBlock(
   client: AnyClient,
   address: Address
@@ -95,7 +129,7 @@ export async function findContractDeployBlock(
   // exist yet — return current block as a best-effort sentinel.
   let headCode: string;
   try {
-    headCode = await client.getBytecode({ address }) ?? "0x";
+    headCode = await getBytecodeSafe(client, address);
   } catch {
     return currentBlock;
   }
@@ -104,18 +138,25 @@ export async function findContractDeployBlock(
   // Binary search: find the lowest block where bytecode is non-empty.
   let lo = 0n;
   let hi = currentBlock;
+  let iteration = 0;
+  const totalIterations = currentBlock > 0n ? Math.ceil(Math.log2(Number(currentBlock))) : 1;
 
   while (lo < hi) {
+    iteration++;
     const mid = (lo + hi) / 2n;
     let code: string;
     try {
-      code = await client.getBytecode({ address, blockNumber: mid }) ?? "0x";
-    } catch {
-      // If this specific block query fails, bias toward the upper half
-      // (assume not yet deployed at mid) so we don't stall the search.
+      code = await getBytecodeSafe(client, address, mid);
+    } catch (err) {
+      // Call failed/timed out even after retries — bias toward the upper
+      // half (assume not yet deployed at mid) so we don't stall the search.
+      console.log(
+        `[timing] deploy-block search: block ${mid} lookup failed after retries (${err instanceof Error ? err.message : String(err)}), assuming not-yet-deployed`
+      );
       lo = mid + 1n;
       continue;
     }
+    console.log(`[timing] deploy-block search iter ${iteration}/${totalIterations}: block ${mid} -> ${code && code !== "0x" ? "has code" : "no code"}`);
     if (code && code !== "0x") {
       hi = mid; // code exists at mid — deploy could be here or earlier
     } else {

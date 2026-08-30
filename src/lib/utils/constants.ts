@@ -290,6 +290,13 @@ export const V4_QUOTER_EXACT_INPUT_SINGLE_ABI = [{
 
 export const ETHERSCAN_API_BASE = "https://api.etherscan.io/v2/api";
 
+/** keccak256("Transfer(address,address,uint256)") — topic0 for every ERC-20
+ *  Transfer log. Used to query Etherscan's log-indexing API directly instead
+ *  of raw eth_getLogs, which is subject to RPC-provider block-range caps
+ *  (e.g. Alchemy free tier: 10 blocks on Base). */
+export const ERC20_TRANSFER_TOPIC0 =
+  "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef" as const;
+
 export const POOL_MINT_EVENT_ABI = [{
   type: "event",
   name: "Mint",

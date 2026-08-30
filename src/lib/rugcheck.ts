@@ -278,14 +278,40 @@ export async function runRugCheckLLM(
   // Runs after the score/verdict/flags/summary above are fully finalized, so
   // the answer is guaranteed to describe the same numbers the report shows.
   const effectiveMode = opts?.mode ?? "chat";
-  if (effectiveMode === "chat" && toolCallTranscript !== undefined) {
-    const answer = await answerAboutToken(
-      evidence,
-      { score: llmResult.score, verdict: llmResult.verdict, flags: llmResult.flags, summary: llmResult.summary },
-      opts?.userQuestion
-    );
-    if (answer) {
-      llmResult = { ...llmResult, answer };
+  if (effectiveMode === "chat") {
+    if (llmResult.verdict === "INSUFFICIENT") {
+      // score is the -1 "no meaningful score" sentinel here. This branch
+      // applies regardless of which path produced the result:
+      //  - orchestrator path: llmResult.answer isn't set yet at all.
+      //  - single-shot fallback path (toolCallTranscript === undefined):
+      //    the model already generated its OWN answer as part of the same
+      //    JSON response that produced its score — using whatever real
+      //    number it picked *before* we normalized score to -1 above. That
+      //    stale number can still show up in that prose even though the
+      //    card now correctly shows N/A. Overwriting unconditionally here
+      //    closes that gap instead of only closing it for one of the two
+      //    paths that can reach INSUFFICIENT.
+      const last = decisionTrace?.[decisionTrace.length - 1];
+      const missing = last?.unresolvedMandatory?.length
+        ? ` (still missing: ${last.unresolvedMandatory.join(", ")})` 
+        : "";
+      llmResult = {
+        ...llmResult,
+        answer: `There isn't enough verified evidence yet to give this token a reliable risk score${missing}. The flags below reflect what's been checked so far, but treat this as incomplete, not clean.`,
+      };
+    } else if (toolCallTranscript !== undefined) {
+      // Only regenerate via a fresh call for the orchestrator path — the
+      // single-shot fallback already produced its own answer in the same
+      // call that produced its (non-INSUFFICIENT, so trustworthy) score,
+      // so re-running this here would be redundant.
+      const answer = await answerAboutToken(
+        evidence,
+        { score: llmResult.score, verdict: llmResult.verdict, flags: llmResult.flags, summary: llmResult.summary },
+        opts?.userQuestion
+      );
+      if (answer) {
+        llmResult = { ...llmResult, answer };
+      }
     }
   }
 

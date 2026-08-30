@@ -49,6 +49,50 @@ const MANDATORY_TOOL_OWNERS: Record<string, string> = {
   getDeployerHistory: "deployer-reputation-agent",
 };
 
+/** Flag ids/labels that specifically claim the *deployer's own* wallet holds
+ *  a large share of supply — the highest-severity holder-concentration
+ *  claim (+40 CRITICAL / +20 HIGH per the scoring guide). This is the exact
+ *  claim that misfired for a real token: a specialist labeled a top-5-holder
+ *  concentration finding as a dev-wallet finding, and the grounding critic
+ *  approved it anyway. Rather than trust LLM judgment alone for a check this
+ *  cheap to do deterministically, cross-verify any such flag against
+ *  evidence.deployerPct — the actual field the claim is supposed to describe
+ *  — before it ever reaches the user. */
+const DEV_WALLET_FLAG_PATTERN = /dev[_\s-]?wallet/i;
+
+/**
+ * Deterministic backstop on top of the LLM grounding critic: drop any flag
+ * that specifically claims the *deployer's* wallet holds a large share of
+ * supply when evidence.deployerPct doesn't actually support that (a
+ * top-5-holder concentration finding is a real, different, lower-severity
+ * claim — see holder-distribution-agent's scoring guide). The critic is
+ * supposed to catch this class of mislabeling and sometimes doesn't; this
+ * check can't be fooled by LLM reasoning because it never asks an LLM
+ * anything — it just reads the one evidence field the claim is about.
+ */
+function sanityCheckFlags(flags: RiskFlag[], evidence: TokenEvidence): { flags: RiskFlag[]; dropped: Array<{ id: string; reason: string }> } {
+  const kept: RiskFlag[] = [];
+  const dropped: Array<{ id: string; reason: string }> = [];
+
+  for (const flag of flags) {
+    const claimsDevWallet = DEV_WALLET_FLAG_PATTERN.test(flag.id) || DEV_WALLET_FLAG_PATTERN.test(flag.label);
+    if (claimsDevWallet) {
+      const pct = evidence.deployerPct;
+      const requiredPct = flag.severity === "CRITICAL" ? 50 : flag.severity === "HIGH" ? 20 : 0;
+      if (pct === null || pct < requiredPct) {
+        dropped.push({
+          id: flag.id,
+          reason: `claims dev wallet holds ${requiredPct}%+ but evidence.deployerPct is ${pct === null ? "null (unverified)" : `${pct}%`}`,
+        });
+        continue;
+      }
+    }
+    kept.push(flag);
+  }
+
+  return { flags: kept, dropped };
+}
+
 export interface AgentLoopResult {
   result: LLMScoreResult;
   transcript: ToolCallRecord[];
@@ -134,6 +178,18 @@ export async function runOrchestrator(
   // Replace flags with the filtered, grounded list
   flags.length = 0;
   flags.push(...groundingOutcome.groundedFlags);
+
+  // Deterministic backstop, independent of the LLM critic above — see
+  // sanityCheckFlags for why this class of error needs one.
+  const sanityOutcome = sanityCheckFlags(flags, evidence);
+  if (sanityOutcome.dropped.length > 0) {
+    console.warn(
+      `[orchestrator] sanity check dropped ${sanityOutcome.dropped.length} flag(s): ` +
+      sanityOutcome.dropped.map(d => `${d.id} (${d.reason})`).join(", ")
+    );
+  }
+  flags.length = 0;
+  flags.push(...sanityOutcome.flags);
 
   const calledTools = new Set(transcript.map((t) => t.name));
   const unresolvedMandatory = Object.entries(MANDATORY_TOOL_OWNERS)

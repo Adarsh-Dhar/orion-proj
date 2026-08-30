@@ -166,10 +166,9 @@ export async function dispatchHolderDistributionTool(
   switch (name) {
     case "getHolderLedger": {
       const warnings: string[] = [];
-      // Limit holder scan to max 50,000 blocks (5 chunks) to prevent excessively long scans
-      // This is sufficient to capture early distribution patterns without scanning millions of blocks
-      const MAX_SCAN_RANGE = 50_000n;
-      const fromBlock = ctx.deployBlock > MAX_SCAN_RANGE ? ctx.deployBlock - MAX_SCAN_RANGE : 0n;
+      // Scan from deployBlock - 10,000 blocks to capture early distribution
+      // The scanHolderBalances function itself caps the total range to 50,000 blocks
+      const fromBlock = ctx.deployBlock > 10_000n ? ctx.deployBlock - 10_000n : 0n;
       const result = await scanHolderBalances(ctx.client as AnyClient, ctx.tokenAddress, fromBlock, warnings);
 
       const totalSupply = (await (ctx.client as AnyClient).readContract({

@@ -381,36 +381,54 @@ export async function scanHolderBalances(
   let chunksFailed  = 0;
   let chunksTotal   = 0;
 
-  const totalChunks = Number((latestBlock - fromBlock) / SCAN_CHUNK) + 1;
-  console.log(`  [evidence:holderScan] Scanning ${totalChunks} chunks from block ${fromBlock} to ${latestBlock}`);
+  // Hard cap: never scan more than 50,000 blocks (5 chunks) total
+  // This prevents excessively long scans for old tokens
+  const MAX_SCAN_RANGE = 50_000n;
+  const toBlock = fromBlock + MAX_SCAN_RANGE < latestBlock
+    ? fromBlock + MAX_SCAN_RANGE
+    : latestBlock;
 
-  for (let chunkStart = fromBlock; chunkStart <= latestBlock; chunkStart += SCAN_CHUNK) {
-    const chunkEnd = chunkStart + SCAN_CHUNK - 1n < latestBlock
+  const totalChunks = Number((toBlock - fromBlock) / SCAN_CHUNK) + 1;
+  console.log(`  [evidence:holderScan] Scanning ${totalChunks} chunks from block ${fromBlock} to ${toBlock}`);
+
+  for (let chunkStart = fromBlock; chunkStart <= toBlock; chunkStart += SCAN_CHUNK) {
+    const chunkEnd = chunkStart + SCAN_CHUNK - 1n < toBlock
       ? chunkStart + SCAN_CHUNK - 1n
-      : latestBlock;
+      : toBlock;
 
     chunksTotal++;
-    try {
-      const logs = await client.getLogs({
-        address: tokenAddress,
-        event: TRANSFER_EVENT_ABI[0],
-        fromBlock: chunkStart,
-        toBlock: chunkEnd,
-      });
-      for (const log of logs) {
-        const args = log.args as { from: string; to: string; value: bigint };
-        const { from, to, value } = args;
-        if (!value) continue;
-        if (from !== NULL_ADDRESS) {
-          balances.set(from, (balances.get(from) ?? 0n) - value);
+    let chunkSucceeded = false;
+    // Retry failed chunks up to 2 times to handle transient RPC errors
+    for (let retry = 0; retry < 3 && !chunkSucceeded; retry++) {
+      try {
+        const logs = await client.getLogs({
+          address: tokenAddress,
+          event: TRANSFER_EVENT_ABI[0],
+          fromBlock: chunkStart,
+          toBlock: chunkEnd,
+        });
+        for (const log of logs) {
+          const args = log.args as { from: string; to: string; value: bigint };
+          const { from, to, value } = args;
+          if (!value) continue;
+          if (from !== NULL_ADDRESS) {
+            balances.set(from, (balances.get(from) ?? 0n) - value);
+          }
+          balances.set(to, (balances.get(to) ?? 0n) + value);
         }
-        balances.set(to, (balances.get(to) ?? 0n) + value);
+        chunkSucceeded = true;
+      } catch (err) {
+        if (retry === 2) {
+          // Final retry failed
+          chunksFailed++;
+          warn(warnings, "holderScan", `chunk [${chunkStart}, ${chunkEnd}] failed after 3 retries`, err);
+          // Continue scanning other chunks instead of stopping completely
+        }
+        // Wait 100ms before retry to avoid overwhelming the RPC
+        if (retry < 2) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
       }
-    } catch (err) {
-      chunksFailed++;
-      warn(warnings, "holderScan", `chunk [${chunkStart}, ${chunkEnd}] failed`, err);
-      // Stop — don't burn requests on a connection that's already failing
-      break;
     }
   }
 

@@ -38,7 +38,7 @@ async function sendFullReport(
     }
   };
 
-  const TIMEOUT_MS = 5 * 60_000;
+  const TIMEOUT_MS = 10 * 60_000; // Increased to 10 minutes for agentic mode
   let outcome: Awaited<ReturnType<typeof answerTokenQuestion>>;
   try {
     outcome = await Promise.race([
@@ -46,7 +46,7 @@ async function sendFullReport(
       // of using the current block, which would be wrong for non-fresh tokens.
       answerTokenQuestion(client, address as `0x${string}`, undefined, "chat", onProgress, false, false),
       new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("Analysis timed out after 5 minutes")), TIMEOUT_MS)
+        setTimeout(() => reject(new Error("Analysis timed out after 10 minutes")), TIMEOUT_MS)
       ),
     ]);
   } catch (err) {
@@ -55,7 +55,7 @@ async function sendFullReport(
 
     let userMessage = `Couldn't check that token: ${errorMessage}`;
     if (errorMessage.includes("timed out")) {
-      userMessage = `⏱️ Analysis timed out — the RPC may be under load. Try again in a minute.`;
+      userMessage = `⏱️ Analysis timed out — the RPC may be under load or the analysis is taking longer than expected. Try again in a few minutes.`;
     }
 
     await ctx.api.sendMessage(chatId, userMessage);

@@ -6,8 +6,6 @@
  */
 
 import { Redis } from "@upstash/redis";
-import type { TokenEvidence } from "./evidence.js";
-import type { ToolCallRecord, RiskFlag } from "./rugcheck-types.js";
 import type { StoredAnalysis } from "./utils/interface.js";
 
 // ─── Environment validation ─────────────────────────────────────────────────────

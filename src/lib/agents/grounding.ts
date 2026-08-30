@@ -17,6 +17,18 @@
 import type { ToolCallRecord, RiskFlag } from "../rugcheck-types.js";
 import type { IterationDecision } from "../utils/interface.js";
 
+const FLAG_ID_TO_TOOL: Record<string, string> = {
+  proxy_detected: "getSourceCode",
+  admin_privilege_risk: "getSourceCode",
+  lp_not_locked: "checkLpLock",
+  deployer_prior_rugs: "getDeployerHistory",
+  deployer_rapid_deploys: "getDeployerVelocity",
+  holder_concentration: "getHolderLedger",
+  wash_trading_detected: "getTradeHistory",
+  sell_test_failed: "runSellTest",
+  // ...
+};
+
 // ─── Grounding validator ─────────────────────────────────────────────────────────
 
 /**
@@ -26,13 +38,11 @@ import type { IterationDecision } from "../utils/interface.js";
  * is in validateStopConditions(), which checks mandatory-tier coverage.
  */
 export function validateGrounding(flags: RiskFlag[], transcript: ToolCallRecord[]): boolean {
-  // Structural check: if the LLM produced a LOW verdict with no tool calls at
-  // all, that's suspicious — but LOW-with-no-tools is caught by
-  // validateStopConditions() instead, which has access to the verdict.
-  // Nothing to assert here that isn't already covered elsewhere.
-  void flags;
-  void transcript;
-  return true;
+  const calledTools = new Set(transcript.map(t => t.name));
+  return flags.every(f => {
+    const tool = FLAG_ID_TO_TOOL[f.id];
+    return tool === undefined || calledTools.has(tool);
+  });
 }
 
 // ─── Stop conditions validator ─────────────────────────────────────────────────

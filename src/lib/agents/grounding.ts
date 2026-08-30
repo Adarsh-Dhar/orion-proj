@@ -1,26 +1,18 @@
 /**
- * grounding.ts — validators for the multi-agent scoring pipeline's output.
+ * grounding.ts — validator for the multi-agent scoring pipeline's output.
  *
- * Two independent checks run after the orchestrator merges specialist flags:
- *  - validateGrounding(): evidentiary — does each flag's claim actually
- *    match the underlying data? Delegated to a second, smaller LLM call
- *    (the "critic") that must use tools to look up the specific evidence
- *    field or tool-call output it needs per flag, rather than being handed
- *    everything and trusted. This replaces the earlier purely-structural
- *    "was the right tool called by *someone*" check, which could be
- *    satisfied by an unrelated specialist's tool call and never verified
- *    a flag's actual content.
- *  - validateStopConditions(): structural — did the pipeline resolve every
- *    mandatory tier before landing on a LOW verdict / stopping at a
- *    boundary score? Deterministic, no LLM involved. (Currently unused by
- *    orchestrator.ts, which does its own inline mandatory-tier check —
- *    kept here for parity with the older single-loop design and available
- *    to wire back in.)
+ * validateGrounding(): evidentiary — does each flag's claim actually match
+ * the underlying data? Delegated to a second, smaller LLM call (the
+ * "critic") that must use tools to look up the specific evidence field or
+ * tool-call output it needs per flag, rather than being handed everything
+ * and trusted. This replaces an earlier purely-structural "was the right
+ * tool called by *someone*" check, which could be satisfied by an
+ * unrelated specialist's tool call and never verified a flag's actual
+ * content.
  */
 
 import type { TokenEvidence } from "../evidence.js";
 import type { ToolCallRecord, RiskFlag } from "../rugcheck-types.js";
-import type { IterationDecision } from "../utils/interface.js";
 import { callGeminiWithTools, type Message } from "../gemini-client.js";
 
 // ─── Critic tool schema ──────────────────────────────────────────────────────
@@ -225,25 +217,4 @@ export async function withHardCap<T>(promise: Promise<T>, startedAt: number): Pr
     promise,
     new Promise<"TIMEOUT">((resolve) => setTimeout(() => resolve("TIMEOUT"), remaining)),
   ]);
-}
-
-// ─── Stop conditions validator ─────────────────────────────────────────────
-// Deterministic structural check — unchanged, no LLM involved.
-
-export function validateStopConditions(
-  decisions: IterationDecision[],
-  verdict: string
-): boolean {
-  if (decisions.length === 0) return true;
-  const last = decisions[decisions.length - 1];
-
-  if (verdict === "LOW" && last.unresolvedMandatory.length > 0) {
-    console.warn(`[grounding] LOW verdict with unresolved mandatory tiers: ${last.unresolvedMandatory.join(", ")}`);
-    return false;
-  }
-  if (last.action === "stop" && last.bandProximity === "boundary" && last.unresolvedMandatory.length > 0) {
-    console.warn(`[grounding] Stopped at a boundary score with unresolved mandatory checks`);
-    return false;
-  }
-  return true;
 }

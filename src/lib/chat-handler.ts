@@ -187,7 +187,7 @@ export function registerChatHandler(bot: Bot<any>, client: AnyClient): void {
 
     // Wrap the full pipeline in a 5-minute timeout so the user always gets
     // a reply — deploy block binary search can be slow under RPC load.
-    const TIMEOUT_MS = 5 * 60_000;
+    const TIMEOUT_MS = 10 * 60_000; // Increased to 10 minutes for agentic mode
     let outcome: Awaited<ReturnType<typeof answerTokenQuestion>>;
     try {
       outcome = await Promise.race([
@@ -210,7 +210,7 @@ export function registerChatHandler(bot: Bot<any>, client: AnyClient): void {
 
       let userMessage = `Couldn't check that token: ${errorMessage}`;
       if (errorMessage.includes("timed out")) {
-        userMessage = `⏱️ Analysis timed out — the RPC may be under load. Try again in a minute.`;
+        userMessage = `⏱️ Analysis timed out — the RPC may be under load or the analysis is taking longer than expected. Try again in a few minutes.`;
       }
 
       await ctx.api.sendMessage(chatId, userMessage);

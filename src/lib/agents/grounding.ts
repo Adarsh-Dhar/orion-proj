@@ -151,14 +151,17 @@ export async function validateGrounding(
 
       if (response.type === "tool_calls") {
         messages.push(response.modelContent);
+        // When there are multiple tool calls, we need to consolidate all responses
+        // into a single user turn with multiple functionResponse parts
+        const responseParts = response.toolCalls.map(call => ({
+          functionResponse: {
+            name: call.name,
+            response: dispatchCriticTool(call.name, call.args, evidence, transcript),
+          },
+        }));
         messages.push({
           role: "user",
-          parts: response.toolCalls.map(call => ({
-            functionResponse: {
-              name: call.name,
-              response: dispatchCriticTool(call.name, call.args, evidence, transcript),
-            },
-          })),
+          parts: responseParts,
         });
         continue;
       }

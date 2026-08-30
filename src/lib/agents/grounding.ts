@@ -51,6 +51,34 @@ const CRITIC_TOOLS = [
       required: ["toolName"],
     },
   },
+  // Allow direct calls to specialist tools for convenience
+  {
+    name: "getDeployerHistory",
+    description: "Look up deployer history from transcript - returns deployerSeenBefore and deployerPriorTokens",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: "getDeployerVelocity", 
+    description: "Look up deployer velocity from transcript - returns deploysLast15Min, deploysLastHour, deploysLast24h",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: "getHolderLedger",
+    description: "Look up holder distribution from transcript - returns top5Holders, top5HoldersPct",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
 ] as const;
 
 const CRITIC_MAX_ITERATIONS = 6;
@@ -58,6 +86,8 @@ const CRITIC_MAX_ITERATIONS = 6;
 const CRITIC_SYSTEM_PROMPT = `You are a fact-checker reviewing risk flags produced by specialist AI \
 agents during a crypto rug-pull risk analysis. You do NOT get the full evidence dump up front — you must \
 call getEvidenceField and/or getToolCallOutput to look up whatever you need to verify each flag.
+
+You can also call tools directly by their actual names (e.g. "getDeployerHistory", "getHolderLedger") to look up their outputs.
 
 For each flag, check whether its "detail" text is actually supported by the data you look up. \
 Common failure modes to catch:
@@ -120,7 +150,12 @@ function dispatchCriticTool(
     const matches = transcript.filter(t => t.name === toolName).map(t => t.output);
     return matches.length > 0 ? { results: matches } : { error: `No calls to "${toolName}" found in the transcript.` };
   }
-  return { error: `Unknown tool: ${name}` };
+  // Handle direct tool name lookups for specialist tools (getDeployerHistory, getDeployerVelocity, getHolderLedger)
+  const matches = transcript.filter(t => t.name === name).map(t => t.output);
+  if (matches.length > 0) {
+    return { results: matches };
+  }
+  return { error: `No calls to "${name}" found in the transcript.` };
 }
 
 /**

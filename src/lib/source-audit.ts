@@ -1,5 +1,5 @@
 /**
- * agents/source-audit-agent.ts — LLM-powered replacement for the flat
+ * source-audit.ts — LLM-powered replacement for the flat
  * SUSPICIOUS_SOURCE_KEYWORDS / PRIVILEGE_KEYWORDS grep in evidence.ts.
  *
  * WHY THIS EXISTS:
@@ -24,7 +24,7 @@
  *      (missing API key, network error, non-2xx, unparseable JSON, empty
  *      'functions' array), this throws rather than degrading to a heuristic.
  *
- * Design principles (matching agents/llm-score.ts):
+ * Design principles (matching llm-score.ts):
  * - Never silently treat an LLM failure as "no risk found". There is no
  *   keyword-heuristic fallback here on purpose — a caller that can't get a
  *   trustworthy audit should see a visible failure, not a token that quietly
@@ -39,13 +39,8 @@
  */
 
 import { createHash } from "node:crypto";
-import type { FunctionAudit, SourceAuditMethod } from "./types.js";
-
-// ─── Env ─────────────────────────────────────────────────────────────────────
-
-const GEMINI_API_KEY  = process.env.GEMINI_API_KEY ?? "";
-const GEMINI_MODEL    = process.env.GEMINI_MODEL   ?? "gemini-2.0-flash-lite";
-const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+import type { FunctionAudit, SourceAuditMethod } from "./llm-types.js";
+import { GEMINI_API_KEY, callGeminiText, stripJsonFences } from "./gemini-client.js";
 
 /** Findings below this confidence are kept out of suspiciousFunctions/secondaryAdminDetected
  *  but still logged as warnings — low-confidence LLM output should not silently
@@ -202,7 +197,7 @@ IMPORTANT RULES:
 1. Return ONLY valid JSON — no markdown, no prose, no code fences.
 2. Only use severity values: "LOW", "MEDIUM", "HIGH", "CRITICAL".
 3. confidence must be a number between 0 and 1. Be honest — do not default to 0.9 out of habit. Ambiguous patterns (like Example C) deserve mid-range confidence.
-4. Do not invent functions that were not given to you. Return exactly one verdict object per input function, in the same order, using the exact same "name".
+4. Do not invent functions that were not given to you. Return exactly one verdict object per input function, in the same order, using the exact "name".
 5. secondaryAdminCandidate must be false unless the input explicitly states ownership is renounced AND you found a separate privileged address as described above.
 
 Required JSON output shape:
@@ -306,44 +301,17 @@ export async function analyzeSourceWithLLM(
 
   let rawModelText = "";
   try {
-    const response = await fetch(GEMINI_ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [
-          { role: "user", parts: [{ text: RUBRIC_SYSTEM_PROMPT }] },
-          { role: "model", parts: [{ text: "Understood. I will reason through steps 1–4 for every function before giving a verdict, and return only valid JSON in the specified shape." }] },
-          { role: "user", parts: [{ text: userMessage }] },
-        ],
-      }),
-    });
-
-    const data = (await response.json()) as {
-      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-      error?: { code: number; message: string };
-    };
-
-    if (data.error) {
-      throw new Error(`[sourceAudit] Gemini API error ${data.error.code}: ${data.error.message}`);
-    }
-    if (!response.ok) {
-      throw new Error(`[sourceAudit] HTTP ${response.status} from Gemini`);
-    }
-
-    rawModelText = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
-    if (!rawModelText) {
-      throw new Error("[sourceAudit] Gemini returned an empty response");
-    }
+    rawModelText = await callGeminiText(
+      RUBRIC_SYSTEM_PROMPT,
+      "Understood. I will reason through steps 1–4 for every function before giving a verdict, and return only valid JSON in the specified shape.",
+      userMessage
+    );
   } catch (err) {
-    if (err instanceof Error && err.message.startsWith("[sourceAudit]")) throw err;
     const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(`[sourceAudit] Network error calling Gemini: ${msg}`);
+    throw new Error(`[sourceAudit] ${msg}`);
   }
 
-  const cleaned = rawModelText
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/\s*```\s*$/, "")
-    .trim();
+  const cleaned = stripJsonFences(rawModelText);
 
   let parsed: unknown;
   try {

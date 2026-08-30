@@ -5,7 +5,7 @@
  *   collectMinimalEvidence(client, tokenAddress, poolAddress, pairedAsset, deployBlock)
  *     → TokenEvidence  (metadata + ownership + proxy + deployer + liquidity only)
  *
- *   Individual evidence functions (called on-demand by agent-tools.ts):
+ *   Individual evidence functions (called on-demand by agents/tools.ts):
  *     scanHolderBalances, checkSourceVerification, runSellTest,
  *     checkLpLockStatus, checkDeployerVelocity, scanTradeActivity
  *
@@ -63,8 +63,8 @@ import {
   type Venue,
 } from "./utils/constants.js";
 import type { TokenEvidence, DeployerResult, HolderScanResult, TradeActivity, ReVerifyResult } from "./utils/interface.js";
-import { analyzeSourceWithLLM } from "./agents/source-audit-agent.js";
-import type { FunctionAudit, SourceAuditMethod } from "./agents/types.js";
+import { analyzeSourceWithLLM } from "./source-audit.js";
+import type { FunctionAudit, SourceAuditMethod } from "./llm-types.js";
 
 // Re-export types that are used by other modules
 export type { TokenEvidence, DeployerResult, HolderScanResult, TradeActivity, ReVerifyResult };
@@ -108,15 +108,15 @@ function warn(warnings: string[], tag: string, context: string, err: unknown): v
   warnings.push(entry);
 }
 
-async function safeRead<T>(
-  fn: () => Promise<T>,
-  fallback: T,
-  tag: string,
-  warnings: string[]
-): Promise<T> {
-  try { return await fn(); }
-  catch (err) { warn(warnings, tag, "read failed, using fallback", err); return fallback; }
-}
+// async function safeRead<T>(
+//   fn: () => Promise<T>,
+//   fallback: T,
+//   tag: string,
+//   warnings: string[]
+// ): Promise<T> {
+//   try { return await fn(); }
+//   catch (err) { warn(warnings, tag, "read failed, using fallback", err); return fallback; }
+// }
 
 async function safeReadNullable<T>(
   fn: () => Promise<T>,
@@ -1149,7 +1149,7 @@ function buildTradeActivity(
 }
 
 // ── 4. Source verification — fetch + LLM rubric audit ─────────────────────────
-// Keyword-grep replaced by analyzeSourceWithLLM() (src/lib/agents/source-audit-agent.ts).
+// Keyword-grep replaced by analyzeSourceWithLLM() (src/lib/source-audit.ts).
 // This function now only does the Etherscan fetch; all judgment (suspicious
 // function detection, secondary-admin detection) happens in the agent, which
 // falls back to a keyword heuristic internally if the LLM call fails.
@@ -1307,7 +1307,7 @@ export async function checkSourceVerification(
 
 /** Identification only: pool/token resolution, deploy block, hasLiquidity.
  *  Everything else (holder scan, source check, sell test, LP lock, deployer
- *  forensics, trade activity) is now called on-demand via agent-tools.ts,
+ *  forensics, trade activity) is now called on-demand via agents/tools.ts,
  *  not bundled here. */
 export async function collectMinimalEvidence(
   client: AnyClient,

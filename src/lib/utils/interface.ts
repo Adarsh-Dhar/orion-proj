@@ -236,7 +236,7 @@ export interface TokenEvidence {
    *  a failed audit throws rather than ever producing a weaker-provenance result. */
   sourceAuditMethod: "llm" | null;
   /** Full rubric detail per function, including low-confidence/benign findings — for logging/debugging only. */
-  sourceFunctionAudits: import("../agents/types.js").FunctionAudit[];
+  sourceFunctionAudits: import("../llm-types.js").FunctionAudit[];
   /** True when isProxy=true AND the audit above ran against the real
    *  implementation contract's source rather than the thin proxy shim. */
   proxyImplementationAudited: boolean;
@@ -491,7 +491,7 @@ export interface RugCheckResult {
   secondaryAdminDetected: boolean;
   secondaryAdminSnippet: string | null;
   sourceAuditMethod?: "llm" | null;
-  sourceFunctionAudits?: import("../agents/types.js").FunctionAudit[];
+  sourceFunctionAudits?: import("../llm-types.js").FunctionAudit[];
   deployerSeenBefore: boolean;
   deployerPriorTokens: string[];
 

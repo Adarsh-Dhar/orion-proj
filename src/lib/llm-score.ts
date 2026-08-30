@@ -1,8 +1,15 @@
 /**
- * llm-score.ts — Gemini-powered rug risk scorer.
+ * llm-score.ts — Gemini-powered rug risk scorer (single-shot path).
  *
- * Takes a TokenEvidence object (all raw on-chain facts, no pre-computed flags),
- * sends it to Gemini with a structured prompt, and returns a validated score.
+ * MOVED from agents/llm-score.ts as part of the agents/ restructuring:
+ * this file now only owns single-shot scoring (scoreWithLLM), used both
+ * for "evidence is clear" tokens and as the fallback when the agentic
+ * orchestrator (agents/orchestrator.ts) fails outright. The agentic
+ * function-calling loop that used to live here (scoreWithLLMAgentic,
+ * _reportDecision, buildInitialMessages, appendFunctionResults, the local
+ * ToolCall/Message types) has been replaced by agents/orchestrator.ts +
+ * agents/specialists/*.ts, which share the transport layer in
+ * gemini-client.ts instead of duplicating it.
  *
  * Design principles:
  * - Never returns a default/fallback score. If the LLM call fails for any
@@ -20,18 +27,13 @@
  *   verdict === "INSUFFICIENT", which must be preserved.
  */
 
-import type { TokenEvidence } from "../evidence.js";
-import type { RiskFlag, RiskLevel } from "../rugcheck-types.js";
-import type { ToolCallRecord } from "../rugcheck-types.js";
-import type { Venue } from "../utils/constants.js";
+import type { TokenEvidence } from "./evidence.js";
+import type { RiskFlag, RiskLevel } from "./rugcheck-types.js";
+import type { ToolCallRecord } from "./rugcheck-types.js";
+import type { Venue } from "./utils/constants.js";
+import { GEMINI_API_KEY, callGeminiText, stripJsonFences } from "./gemini-client.js";
 
 export type ScoreMode = "alert" | "chat" | "agentic";
-
-// ─── Env ─────────────────────────────────────────────────────────────────────
-
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? "";
-const GEMINI_MODEL   = process.env.GEMINI_MODEL   ?? "gemini-2.0-flash-lite";
-const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -48,7 +50,7 @@ export interface LLMScoreSuccess {
   toolCallTranscript?: ToolCallRecord[];
   /** Final decision trace — mirrors toolCallTranscript but isolates the
    *  reasoning for auditability/rendering separately from raw tool I/O. */
-  decisionTrace?: import("../utils/interface.js").IterationDecision[];
+  decisionTrace?: import("./utils/interface.js").IterationDecision[];
 }
 
 export interface LLMScoreFailure {
@@ -96,12 +98,7 @@ IMPORTANT RULES:
    - "chat" with no question (bare address): add an "answer" field with a natural,
      conversational risk read of the token (2–4 sentences) — as if explaining it to someone,
      not a formal restatement of 'summary'.
-   - "agentic": You have access to tools to gather additional evidence. Use them when the initial evidence is ambiguous or incomplete. Before finalizing, consider what a scammer would have done to pass the checks you've run, and issue one more tool call if it surfaces a gap.
-9. Before each real tool call, you MUST first call \`_reportDecision\` with your current reasoning. This is mandatory — do not call any evidence tool without calling \`_reportDecision\` immediately before it in the same turn. Fields: runningScore (your current running estimate 0–100), bandProximity ("deep" when score is clearly inside a band, "boundary" when within ~5 pts of a band edge), unresolvedMandatory (names of tier-1/2/3 tools not yet called: getSourceCode, checkLpLock, getDeployerHistory), reason (one evidence-cited sentence explaining WHY you are continuing or stopping — cite the specific field and value that drove the decision), action ("continue" to keep gathering or "stop" if you already have sufficient evidence to issue a verdict), nextTool (name of the real tool you are about to call, omit if action="stop").
-10. A single decisive flag (proxy detected +35, dev wallet >50% +40, deployer velocity 5+/hr +35) is sufficient to stop immediately at CRITICAL/HIGH — do not run remaining tiers just to be thorough. In that case call \`_reportDecision\` with action="stop" and then emit your final JSON verdict immediately (no further tool calls).
-11. A LOW verdict requires tier 1 (source), tier 2 (LP lock), and tier 3 (deployer history) to have all been attempted and come back clean — never output LOW with unresolvedMandatory non-empty.
-12. If mandatory tiers remain unresolved when the iteration budget is exhausted, output verdict "INSUFFICIENT" with unresolvedMandatory populated — never force a score onto incomplete evidence.
-13. CHECK "hasLiquidity" FIRST, BEFORE SCORING ANY LIQUIDITY-DEPENDENT FIELD. This is the single most important rule for freshly-launched tokens:
+9. CHECK "hasLiquidity" FIRST, BEFORE SCORING ANY LIQUIDITY-DEPENDENT FIELD. This is the single most important rule for freshly-launched tokens:
    - hasLiquidity=false means a real on-chain read CONFIRMED the pool has zero liquidity right now — not that a call failed. This is completely normal for a token that is minutes (or seconds) old and the deployer hasn't added LP yet, or the add tx just hasn't mined.
    - When hasLiquidity=false, DO NOT flag or add points for: poolLiquidity/initialLiquidityEth being 0 or null, sellTestPassed being null, lpPositionStatus being "unverified", liquidityEverPulled/burnEventCount, liquidityDeltaPct, or totalSwaps/uniqueTraders/wash-trading fields being 0 or null. None of these can produce a real answer with no pool yet — treat them as "pending, will be re-checked automatically once liquidity lands," not as risk or as unverifiable evidence. Do not include a flag for them at all.
    - When hasLiquidity=false, do NOT penalize "ownership not renounced" at the normal +25 weight — renouncing before liquidity even exists is unusual, not standard practice. If you flag it at all, treat it as low-severity/informational (a few points at most), and instead focus on what privileges the owner role actually has per the source audit (suspiciousFunctions, secondaryAdminDetected).
@@ -253,11 +250,11 @@ export async function scoreWithLLM(
   const modeClause = mode === "alert"
     ? `\n\nOUTPUT MODE: "alert" — this is going straight into a push notification. Keep ` +
       `'summary' to one short punchy sentence. Include only the 1–3 most material flags. ` +
-      `Do NOT include an "answer" field.`
+      `Do NOT include an "answer" field.` 
     : opts?.userQuestion
       ? `\n\nOUTPUT MODE: "chat" — the user asked: "${opts.userQuestion}"\n` +
         `Add an "answer" field (string) that directly and conversationally answers THIS ` +
-        `question using only the evidence above. Do not just repeat 'summary'.`
+        `question using only the evidence above. Do not just repeat 'summary'.` 
       : `\n\nOUTPUT MODE: "chat" — no specific question was asked, just the token address. ` +
         `Add an "answer" field (string) with a natural, conversational risk read of this ` +
         `token (2–4 sentences), not a formal restatement of 'summary'.`;
@@ -273,48 +270,20 @@ export async function scoreWithLLM(
   // ── Call Gemini ────────────────────────────────────────────────────────────
   let rawModelText = "";
   try {
-    const response = await fetch(GEMINI_ENDPOINT, {
-      method:  "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [
-          // Fake first exchange to prime the model's persona
-          { role: "user",  parts: [{ text: SYSTEM_PROMPT }] },
-          { role: "model", parts: [{ text: "Understood. I will analyse on-chain evidence and return only valid JSON in the specified format, treating null and unverified fields as risk signals." }] },
-          // Actual request
-          { role: "user",  parts: [{ text: userMessage }] },
-        ],
-      }),
-    });
-
-    const data = await response.json() as {
-      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-      error?: { code: number; message: string };
-    };
-
-    if (data.error) {
-      return { ok: false, reason: `Gemini API error ${data.error.code}: ${data.error.message}` };
-    }
-    if (!response.ok) {
-      return { ok: false, reason: `HTTP ${response.status}: ${response.statusText}` };
-    }
-
-    rawModelText = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? "";
-    if (!rawModelText) {
-      return { ok: false, reason: "Gemini returned an empty response", rawModelText };
-    }
+    rawModelText = await callGeminiText(
+      SYSTEM_PROMPT,
+      "Understood. I will analyse on-chain evidence and return only valid JSON in the specified format, treating null and unverified fields as risk signals.",
+      userMessage
+    );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { ok: false, reason: `Network error calling Gemini: ${msg}` };
+    return { ok: false, reason: msg };
   }
 
   // ── Parse JSON ─────────────────────────────────────────────────────────────
   // The model is instructed to return JSON only. Strip any accidental markdown
   // code fences before parsing.
-  const cleaned = rawModelText
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/\s*```\s*$/,       "")
-    .trim();
+  const cleaned = stripJsonFences(rawModelText);
 
   let parsed: unknown;
   try {
@@ -338,343 +307,4 @@ export async function scoreWithLLM(
   }
 
   return { ...validated, rawModelText };
-}
-
-// ─── Agentic function-calling variant ───────────────────────────────────────────
-
-/**
- * Pseudo-tool that Gemini calls to emit its stop/continue reasoning.
- * It is passed alongside the real evidence tools so Gemini can call it as a
- * structured function call (which we intercept and parse into IterationDecision)
- * rather than embedding a JSON block in free text (which we'd have to scrape).
- * It is NEVER forwarded to dispatchTool and NEVER gets a functionResponse —
- * we simply acknowledge it and continue the loop.
- */
-const REPORT_DECISION_TOOL = {
-  name: "_reportDecision",
-  description: "MANDATORY: Call this immediately before every evidence tool call, and also when you decide to stop early. Reports your current reasoning so the audit log captures why you continued or stopped.",
-  parameters: {
-    type: "object",
-    properties: {
-      runningScore:        { type: "number",  description: "Your running risk estimate 0–100 based on evidence gathered so far." },
-      bandProximity:       { type: "string",  enum: ["deep", "boundary"], description: "\"deep\" = clearly inside a band, \"boundary\" = within ~5 pts of a band edge." },
-      unresolvedMandatory: { type: "array",   items: { type: "string" }, description: "Names of mandatory-tier tools (getSourceCode, checkLpLock, getDeployerHistory) not yet called." },
-      reason:              { type: "string",  description: "One evidence-cited sentence: cite the specific field and value driving the continue/stop decision." },
-      action:              { type: "string",  enum: ["continue", "stop"], description: "\"continue\" to call more tools, \"stop\" if you have sufficient evidence to emit a final verdict." },
-      nextTool:            { type: "string",  description: "Name of the real tool you are about to call. Omit or set null when action=\"stop\"." },
-    },
-    required: ["runningScore", "bandProximity", "unresolvedMandatory", "reason", "action"],
-  },
-} as const;
-
-interface ToolCall {
-  name: string;
-  args: Record<string, unknown>;
-}
-
-interface ToolCallResponse {
-  type: "tool_calls";
-  toolCalls: ToolCall[];
-  raw: string;
-  /** The model's own turn, echoed back verbatim on the next request. */
-  modelContent: Message;
-}
-
-interface FinalResponse {
-  type: "final";
-  json: unknown;
-  raw: string;
-}
-
-type AgenticResponse = ToolCallResponse | FinalResponse;
-
-interface MessagePart {
-  text?: string;
-  functionCall?: { name: string; args: Record<string, unknown> };
-  functionResponse?: { name: string; response: unknown };
-  [key: string]: unknown; // Make it indexable
-}
-
-interface Message {
-  role: string;
-  parts: MessagePart[];
-}
-
-/**
- * Call Gemini with function calling support.
- * Returns either tool calls to execute (plus the exact model content that
- * requested them, so it can be echoed back verbatim) or a final JSON response.
- */
-async function callGeminiWithTools(
-  messages: Array<{ role: string; parts: Array<Record<string, unknown>> }>,
-  tools: readonly unknown[]
-): Promise<AgenticResponse> {
-  // Gemini's functionDeclarations schema only allows name, description, and
-  // parameters — any extra fields (e.g. our internal `tier` metadata) cause
-  // a 400 "Unknown name" error. Strip them before sending.
-  const functionDeclarations = tools.map((t) => {
-    const { tier: _tier, ...rest } = t as Record<string, unknown>;
-    return rest;
-  });
-
-  const response = await fetch(GEMINI_ENDPOINT, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: messages,
-      tools: [{ functionDeclarations }],
-    }),
-  });
-
-  const data = await response.json() as {
-    candidates?: Array<{ content?: { role?: string; parts?: MessagePart[] } }>;
-    error?: { code: number; message: string };
-  };
-
-  if (data.error) {
-    throw new Error(`Gemini API error ${data.error.code}: ${data.error.message}`);
-  }
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-  }
-
-  const candidate = data.candidates?.[0];
-  if (!candidate?.content?.parts) {
-    throw new Error("Gemini returned empty response");
-  }
-
-  const parts = candidate.content.parts;
-  const rawText = parts.map(p => p.text ?? "").join("");
-
-  // Check for function calls. Gemini's own turn — role "model" — must be
-  // echoed back verbatim (all parts, including any function calls) so the
-  // subsequent functionResponse turn lines up with it.
-  const functionCalls = parts
-    .filter((p): p is MessagePart & { functionCall: { name: string; args: Record<string, unknown> } } => !!p.functionCall)
-    .map(p => ({ name: p.functionCall.name, args: p.functionCall.args }));
-
-  if (functionCalls.length > 0) {
-    return {
-      type: "tool_calls",
-      toolCalls: functionCalls,
-      raw: rawText,
-      modelContent: { role: "model", parts },
-    };
-  }
-
-  // Parse as final JSON response
-  const cleaned = rawText
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/\s*```\s*$/, "")
-    .trim();
-
-  try {
-    const json = JSON.parse(cleaned);
-    return { type: "final", json, raw: rawText };
-  } catch {
-    throw new Error(`Failed to parse final JSON: ${cleaned.slice(0, 200)}`);
-  }
-}
-
-/**
- * Build initial messages for the agentic loop.
- */
-function buildInitialMessages(evidence: TokenEvidence): Message[] {
-  const evidenceJson = JSON.stringify(evidence, null, 2);
-  
-  return [
-    {
-      role: "user",
-      parts: [{
-        text: `${SYSTEM_PROMPT}
-
-You are now operating in AGENTIC mode. You have access to tools to gather additional evidence beyond the initial scan.
-
-INITIAL EVIDENCE:
-${evidenceJson}
-
-Your task:
-1. Review the initial evidence
-2. If the evidence is ambiguous or incomplete, use tools to gather more information
-3. Before finalizing, ask yourself what a scammer would have done to pass the checks you've run, and issue one more tool call if it surfaces a gap
-4. When you have sufficient evidence, return your final risk assessment as JSON
-
-IMPORTANT: Every numeric fact in your final flags must be traceable to a tool result. Do not hallucinate numbers.
-`,
-      }],
-    },
-  ];
-}
-
-/**
- * Append a completed round of tool calls to the message history.
- *
- * Gemini requires:
- *   1. The model's own turn that requested the call(s) — role "model" —
- *      echoed back exactly as returned (not reconstructed as role "user").
- *   2. A single immediately-following "user" turn carrying ALL of that
- *      turn's functionResponse parts together. When a model turn issues
- *      several function calls at once, splitting them into separate
- *      call/response turn pairs violates Gemini's strict turn ordering
- *      ("a functionResponse part must appear in a user turn that comes
- *      immediately after the model turn containing the matching
- *      functionCall") and the API rejects the request with a 400.
- */
-function appendFunctionResults(
-  messages: Message[],
-  modelContent: Message,
-  results: Array<{ call: ToolCall; output: unknown }>
-): Message[] {
-  return [
-    ...messages,
-    modelContent,
-    {
-      role: "user",
-      parts: results.map(({ call, output }) => ({
-        functionResponse: { name: call.name, response: output },
-      })),
-    },
-  ];
-}
-
-/**
- * Score with LLM in agentic mode with function calling.
- */
-export async function scoreWithLLMAgentic(
-  evidence: TokenEvidence,
-  dispatchTool: (name: string, args: Record<string, unknown>) => Promise<unknown>,
-  tools: readonly unknown[],
-  opts?: { maxIterations?: number; decisions?: import("../utils/interface.js").IterationDecision[]; mandatoryTiers?: string[] }
-): Promise<LLMScoreResult> {
-  if (!GEMINI_API_KEY) {
-    return { ok: false, reason: "GEMINI_API_KEY is not set" };
-  }
-
-  const maxIterations = opts?.maxIterations ?? 12;
-  const decisions = opts?.decisions ?? [];
-  const mandatoryTiers = opts?.mandatoryTiers ?? [];
-  let messages = buildInitialMessages(evidence);
-  const transcript: ToolCallRecord[] = [];
-  let runningScore = 0;
-
-  // Prepend _reportDecision so Gemini can call it as a structured function
-  // before each real tool. We intercept it and never forward it to dispatchTool.
-  const allTools: readonly unknown[] = [REPORT_DECISION_TOOL, ...tools];
-
-  // The most recent _reportDecision call the model made in this turn.
-  // We attach it to the next real tool call's ToolCallRecord.
-  let pendingDecision: import("../utils/interface.js").IterationDecision | null = null;
-
-  for (let i = 0; i < maxIterations; i++) {
-    try {
-      const response = await callGeminiWithTools(messages, allTools);
-
-      if (response.type === "final") {
-        const validated = validateParsed(response.json);
-        if (!validated) {
-          return {
-            ok: false,
-            reason: `Model returned JSON with missing/invalid fields: ${response.raw.slice(0, 300)}`,
-            rawModelText: response.raw,
-          };
-        }
-
-        return {
-          ...validated,
-          rawModelText: response.raw,
-          toolCallTranscript: transcript,
-          decisionTrace: decisions,
-        };
-      }
-
-      // Partition: _reportDecision calls (meta) vs. real tool calls.
-      const metaCalls  = response.toolCalls.filter(c => c.name === "_reportDecision");
-      const realCalls  = response.toolCalls.filter(c => c.name !== "_reportDecision");
-
-      // Parse _reportDecision calls first — take the LAST one if the model
-      // somehow batched several (only the immediately-preceding one matters).
-      for (const meta of metaCalls) {
-        const a = meta.args as Record<string, unknown>;
-        const parsed: import("../utils/interface.js").IterationDecision = {
-          runningScore:        typeof a.runningScore  === "number" ? a.runningScore  : runningScore,
-          bandProximity:       a.bandProximity === "boundary"       ? "boundary"     : "deep",
-          unresolvedMandatory: Array.isArray(a.unresolvedMandatory) ? (a.unresolvedMandatory as string[]) : mandatoryTiers.filter(t => !transcript.some(r => r.name === t)),
-          reason:              typeof a.reason        === "string"  ? a.reason       : `Called ${realCalls[0]?.name ?? "unknown"}`,
-          action:              a.action === "stop"                   ? "stop"         : "continue",
-          nextTool:            typeof a.nextTool      === "string"  ? a.nextTool     : realCalls[0]?.name,
-        };
-        pendingDecision = parsed;
-        decisions.push(parsed);
-
-        // Update runningScore from the model's own estimate
-        runningScore = parsed.runningScore;
-
-        // Model decided to stop — no further tool calls needed this turn.
-        // The real call list should be empty; if not, honour the stop signal.
-        if (parsed.action === "stop") {
-          // Remove any real tool calls the model included in the same turn after
-          // a stop decision — they should not be executed.
-          realCalls.length = 0;
-        }
-      }
-
-      // If only _reportDecision was called (stop signal or pre-final), we still
-      // MUST send functionResponse parts back for every _reportDecision call —
-      // Gemini rejects conversations that end on a model turn with unacknowledged
-      // function calls ("Requests ending with a model turn are not supported").
-      if (realCalls.length === 0) {
-        // Acknowledge all _reportDecision calls with a minimal response.
-        // The content doesn't matter — this is just satisfying Gemini's turn
-        // ordering requirement. Then continue so the model can emit its verdict.
-        const ackResults = metaCalls.map(mc => ({
-          call: mc,
-          output: { ok: true },
-        }));
-        messages = appendFunctionResults(messages, response.modelContent, ackResults);
-        continue;
-      }
-
-      // Execute all real tool calls and build transcript entries.
-      // Also include ack responses for any _reportDecision calls in the same
-      // turn — every functionCall in a model turn needs a functionResponse.
-      const results: Array<{ call: ToolCall; output: unknown }> = [
-        // Acknowledge meta calls first (order matches the model turn's part order)
-        ...metaCalls.map(mc => ({ call: mc, output: { ok: true } })),
-      ];
-      for (const call of realCalls) {
-        // Use the model-provided decision; fall back to a minimal sentinel if
-        // the model omitted _reportDecision for this call.
-        const decision: import("../utils/interface.js").IterationDecision = pendingDecision ?? {
-          runningScore,
-          bandProximity: runningScore < 25 || runningScore > 75 ? "deep" : "boundary",
-          unresolvedMandatory: mandatoryTiers.filter(t => !transcript.some(r => r.name === t)),
-          reason: `[model omitted _reportDecision before ${call.name}]`,
-          action: "continue",
-          nextTool: call.name,
-        };
-        // Reset so the next real call doesn't reuse the same decision object.
-        pendingDecision = null;
-
-        try {
-          const output = await dispatchTool(call.name, call.args);
-          transcript.push({ name: call.name, args: call.args, output, ts: Date.now(), decision });
-          results.push({ call, output });
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          const output = { error: msg };
-          transcript.push({ name: call.name, args: call.args, output, ts: Date.now(), decision });
-          results.push({ call, output });
-        }
-      }
-      messages = appendFunctionResults(messages, response.modelContent, results);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return { ok: false, reason: `Agentic loop failed: ${msg}` };
-    }
-  }
-
-  return {
-    ok: false,
-    reason: `Agent exceeded ${maxIterations} tool calls without a verdict`,
-  };
 }

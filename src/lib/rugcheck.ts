@@ -18,13 +18,13 @@ import {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = PublicClient<any>;
 
-import { collectMinimalEvidence }   from "./evidence.js";
-import { scoreWithLLM }      from "./agents/llm-score.js";
+import { collectMinimalEvidence } from "./evidence.js";
+import { scoreWithLLM } from "./llm-score.js";
 import { computeScore, breakdownToFlags, breakdownToSummary } from "./scoring.js";
 import type { TokenEvidence } from "./evidence.js";
 import type { BotState } from "./state.js";
 import { getDeployerHistory, recordDeployerToken } from "./state.js";
-import { runAgentLoop } from "./agents/agent-loop.js";
+import { runOrchestrator } from "./agents/orchestrator.js";
 import type { ToolContext } from "./utils/interface.js";
 import { storeAnalysis } from "./analysis-store.js";
 import type { Venue } from "./utils/constants.js";
@@ -187,7 +187,7 @@ export async function runRugCheckLLM(
       isProxy: evidence.isProxy,
     };
 
-    const { result, transcript } = await runAgentLoop(evidence, toolContext, { maxIterations: 12 });
+    const { result, transcript } = await runOrchestrator(evidence, toolContext, { maxIterations: 12 });
     llmResult = result;
     toolCallTranscript = transcript;
     decisionTrace = result.ok ? result.decisionTrace : undefined;

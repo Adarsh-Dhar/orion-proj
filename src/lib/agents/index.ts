@@ -1,25 +1,26 @@
 /**
- * agents/index.ts — barrel export for every LLM-driven agent in the bot.
+ * agents/index.ts — barrel export for the multi-agent scoring pipeline.
  *
  * Agents living here:
- *   - llm-score.ts          — single-shot + agentic rug-risk scorer (Gemini)
- *   - agent-loop.ts         — the agentic investigation loop used for
- *                             ambiguous evidence (function-calling driver)
- *   - agent-tools.ts        — tool schemas + dispatcher consumed by agent-loop.ts
- *   - grounding.ts          — numeric-provenance validator for agent-loop.ts,
- *                             preventing the agent from citing hallucinated numbers
- *   - source-audit-agent.ts — rubric-based source-code backdoor/keyword
- *                             replacement (see checkSourceVerification in
- *                             evidence.ts for the call site)
+ *   - orchestrator.ts  — dispatches the specialists below, merges their
+ *                        flags/transcripts, validates grounding
+ *   - grounding.ts     — structural validator preventing the pipeline from
+ *                        citing flags no specialist's tool call supports
+ *   - tools.ts         — tool schemas + per-specialist dispatchers
+ *   - types.ts         — SpecialistResult/SpecialistAgent contract
+ *   - specialists/*.ts — the five domain specialists themselves
+ *
+ * Single-shot scoring (llm-score.ts), the Gemini source-code audit
+ * (source-audit.ts), and the shared Gemini transport (gemini-client.ts)
+ * moved up to src/lib/ — they aren't part of the agent pipeline itself.
  *
  * Prefer importing directly from the specific module (e.g.
- * "./agents/llm-score.js") in hot paths — this barrel is mainly for
+ * "./agents/orchestrator.js") in hot paths — this barrel is mainly for
  * discoverability and for call sites that need more than one agent.
  */
 
-export * from "./llm-score.js";
-export * from "./agent-tools.js";
-export * from "./agent-loop.js";
+export * from "./orchestrator.js";
 export * from "./grounding.js";
-export * from "./source-audit-agent.js";
+export * from "./tools.js";
 export * from "./types.js";
+export * from "./specialists/index.js";

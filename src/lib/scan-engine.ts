@@ -167,26 +167,74 @@ export async function resolveTokenPool(
   console.log(`[timing] Starting pool resolution for ${tokenAddress}`);
   
   // ── V3 path ──────────────────────────────────────────────────────────────
-  for (const quote of getCoreQuoteAssets()) {
-    for (const fee of FEE_TIERS) {
-      try {
-        const pool = await client.readContract({
-          address: UNISWAP_V3_FACTORY,
-          abi: GET_POOL_ABI,
-          functionName: "getPool",
-          args: [tokenAddress, quote.address, fee],
-        }) as Address;
-        if (pool && pool.toLowerCase() !== NULL_POOL) {
-          const v3Duration = Date.now() - resolveStart;
-          console.log(`[timing] V3 pool found in ${v3Duration}ms: ${pool}`);
-          return { poolAddress: pool, pairedLabel: quote.label, pairedAsset: quote.address, venue: "v3" };
+  // Previously: nested for-loop, one `await client.readContract(...)` per
+  // (quoteAsset, feeTier) pair — with a 100-token quote list × 4 fee tiers,
+  // that's up to 400 sequential eth_call round-trips, one at a time, with
+  // NO logging in between "Starting pool resolution" and "V3 path
+  // completed". At ~800ms/call that's minutes of total silence, easily
+  // mistaken for a hang (which is exactly what happened). multicall batches
+  // all of them into effectively one RPC round-trip via the standard
+  // Multicall3 contract instead of 400 separate sequential ones.
+  const quoteAssets = getCoreQuoteAssets();
+  const v3Calls = quoteAssets.flatMap((quote) =>
+    FEE_TIERS.map((fee) => ({
+      address: UNISWAP_V3_FACTORY,
+      abi: GET_POOL_ABI,
+      functionName: "getPool" as const,
+      args: [tokenAddress, quote.address, fee] as const,
+    }))
+  );
+
+  console.log(`[timing] Checking ${v3Calls.length} (quoteAsset, feeTier) pairs via multicall...`);
+  let v3Results;
+  let multicallSucceeded = false;
+  try {
+    v3Results = await client.multicall({ contracts: v3Calls, allowFailure: true });
+    multicallSucceeded = true;
+    console.log(`[timing] Multicall completed successfully`);
+  } catch (err) {
+    console.log(`[timing] Multicall failed: ${err instanceof Error ? err.message : String(err)}`);
+    console.log(`[timing] Falling back to sequential calls for V3 path`);
+    // Fallback to sequential calls if multicall fails
+    for (const quote of quoteAssets) {
+      for (const fee of FEE_TIERS) {
+        try {
+          const pool = await client.readContract({
+            address: UNISWAP_V3_FACTORY,
+            abi: GET_POOL_ABI,
+            functionName: "getPool",
+            args: [tokenAddress, quote.address, fee],
+          }) as Address;
+          if (pool && pool.toLowerCase() !== NULL_POOL) {
+            const v3Duration = Date.now() - resolveStart;
+            console.log(`[timing] V3 pool found via fallback in ${v3Duration}ms: ${pool}`);
+            return { poolAddress: pool, pairedLabel: quote.label, pairedAsset: quote.address, venue: "v3" };
+          }
+        } catch {
+          // non-existent pair — keep trying
         }
-      } catch {
-        // non-existent pair — keep trying
+      }
+    }
+    const v3Complete = Date.now();
+    console.log(`[timing] V3 fallback path completed in ${v3Complete - resolveStart}ms, starting V4 scan`);
+  }
+
+  // Only process multicall results if it succeeded
+  if (multicallSucceeded && v3Results) {
+    for (let i = 0; i < v3Results.length; i++) {
+      const result = v3Results[i];
+      if (result.status !== "success") continue; // reverted (no pool for this pair) — not an error
+      const pool = result.result as Address;
+      if (pool && pool.toLowerCase() !== NULL_POOL) {
+        const quote = quoteAssets[Math.floor(i / FEE_TIERS.length)];
+        const v3Duration = Date.now() - resolveStart;
+        console.log(`[timing] V3 pool found in ${v3Duration}ms: ${pool}`);
+        return { poolAddress: pool, pairedLabel: quote.label, pairedAsset: quote.address, venue: "v3" };
       }
     }
   }
   
+  // If we get here, multicall succeeded but no pool was found
   const v3Complete = Date.now();
   console.log(`[timing] V3 path completed in ${v3Complete - resolveStart}ms, starting V4 scan`);
 
@@ -353,13 +401,20 @@ export async function scanBlockRange(
       );
     } catch (err) {
       chunksFailed++;
+      const errorMsg = err instanceof Error ? err.message : String(err);
       console.warn(
         `\n  [scan-engine] chunk [${chunkStart}–${chunkEnd}] failed: ` +
-        `${err instanceof Error ? err.message : String(err)}`
+        `${errorMsg}`
       );
+      
+      // If rate limited, wait longer before retrying
+      if (errorMsg.includes("429") || errorMsg.includes("rate limit")) {
+        console.log(`[scan-engine] Rate limited, waiting 10 seconds before next chunk...`);
+        await sleep(10_000);
+      }
     }
 
-    if (chunkStart + CHUNK_SIZE <= toBlock) await sleep(150); // ~6.5 req/s — well within Alchemy free tier (330 req/s)
+    if (chunkStart + CHUNK_SIZE <= toBlock) await sleep(500); // Increased delay to reduce rate limiting
   }
 
   console.log(

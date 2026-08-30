@@ -21,7 +21,7 @@
  *   initQuoteAssets()                   → Promise<void>  (throws on failure)
  */
 
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import { Redis } from "@upstash/redis";
 import type { Address } from "viem";
 
 // ─── Curated core pairing assets ──────────────────────────────────────────────
@@ -62,8 +62,40 @@ const COINGECKO_BASE_LIST_URL = "https://tokens.coingecko.com/base/all.json";
 /** Cache TTL: 6 hours in milliseconds. */
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 
-/** Flat-file cache — same convention as bot-state.json. */
-const CACHE_PATH = "./quote-assets-cache.json";
+/** Redis cache key — same Upstash instance/creds as state.ts and analysis-store.ts. */
+const CACHE_KEY = "quote-assets:cache";
+
+// ─── Redis client ────────────────────────────────────────────────────────────
+
+const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+
+let redisClient: Redis | null = null;
+
+/**
+ * Initialize the Upstash Redis client if credentials are available.
+ * Returns null if credentials are missing — the bot still runs, it just
+ * refetches from Coingecko on every startup instead of using a cache.
+ */
+function getRedisClient(): Redis | null {
+  if (redisClient) return redisClient;
+
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) {
+    console.warn("[quote-assets] Upstash credentials not set — quote-asset cache disabled, will fetch fresh on every startup");
+    return null;
+  }
+
+  try {
+    redisClient = new Redis({
+      url: UPSTASH_URL,
+      token: UPSTASH_TOKEN,
+    });
+    return redisClient;
+  } catch (err) {
+    console.error("[quote-assets] Failed to initialize Upstash client:", err);
+    return null;
+  }
+}
 
 // ─── In-memory state ──────────────────────────────────────────────────────────
 
@@ -105,24 +137,36 @@ interface CacheFile {
   tokens: Array<{ address: string; symbol: string }>;
 }
 
-function loadDiskCache(): CacheFile | null {
-  if (!existsSync(CACHE_PATH)) return null;
+async function loadRedisCache(): Promise<CacheFile | null> {
+  const client = getRedisClient();
+  if (!client) return null;
+
   try {
-    const parsed = JSON.parse(readFileSync(CACHE_PATH, "utf-8")) as CacheFile;
+    const data = await client.get(CACHE_KEY);
+    if (!data) return null;
+
+    // Upstash auto-deserializes plain objects; fall back to JSON.parse in
+    // case a value was ever written as a raw JSON string.
+    const parsed = (typeof data === "string" ? JSON.parse(data) : data) as CacheFile;
     if (typeof parsed.fetchedAt === "number" && Array.isArray(parsed.tokens)) {
       return parsed;
     }
-  } catch {
-    // malformed — treat as missing
+  } catch (err) {
+    console.warn(`[quote-assets] Failed to read cache from Redis: ${err instanceof Error ? err.message : err}`);
   }
   return null;
 }
 
-function saveDiskCache(tokens: Array<{ address: string; symbol: string }>): void {
+async function saveRedisCache(tokens: Array<{ address: string; symbol: string }>): Promise<void> {
+  const client = getRedisClient();
+  if (!client) return;
+
   try {
-    writeFileSync(CACHE_PATH, JSON.stringify({ fetchedAt: Date.now(), tokens }, null, 2), "utf-8");
+    await client.set(CACHE_KEY, { fetchedAt: Date.now(), tokens }, {
+      ex: Math.ceil((CACHE_TTL_MS * 2) / 1000), // generous TTL safety net; refresh() keeps it warm well before this
+    });
   } catch (err) {
-    console.warn(`[quote-assets] Failed to write cache: ${err instanceof Error ? err.message : err}`);
+    console.warn(`[quote-assets] Failed to write cache to Redis: ${err instanceof Error ? err.message : err}`);
   }
 }
 
@@ -168,7 +212,7 @@ async function refresh(): Promise<void> {
   try {
     const tokens = await fetchFromCoingecko();
     applyTokenList(tokens);
-    saveDiskCache(tokens);
+    await saveRedisCache(tokens);
     console.log(`[quote-assets] Refreshed — ${quoteAssetMap.size} quote assets known`);
     setTimeout(() => refresh(), CACHE_TTL_MS);
   } catch (err) {
@@ -184,7 +228,7 @@ async function refresh(): Promise<void> {
 /**
  * Must be called once before any scan loop starts.
  *
- * - Fresh disk cache (< 6 h): applies it instantly, no network call.
+ * - Fresh Redis cache (< 6 h): applies it instantly, no network call.
  * - Stale / missing cache: attempts a live fetch from Coingecko. If the
  *   fetch fails (network timeout, blocked, etc.), logs a warning and
  *   continues — the bot works fine with only CORE_QUOTE_ASSETS; the broad
@@ -193,7 +237,7 @@ async function refresh(): Promise<void> {
  * Either way, schedules a background refresh for when the cache next expires.
  */
 export async function initQuoteAssets(): Promise<void> {
-  const cached = loadDiskCache();
+  const cached = await loadRedisCache();
 
   if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
     applyTokenList(cached.tokens);
@@ -209,7 +253,7 @@ export async function initQuoteAssets(): Promise<void> {
   try {
     const tokens = await fetchFromCoingecko();
     applyTokenList(tokens);
-    saveDiskCache(tokens);
+    await saveRedisCache(tokens);
     console.log(`[quote-assets] Fetched ${quoteAssetMap.size} quote assets from Coingecko`);
   } catch (err) {
     console.warn(`[quote-assets] Coingecko fetch failed — continuing with ${CORE_QUOTE_ASSETS.length} core assets only. Labels for non-core quote assets will fall back to short address. Error: ${err instanceof Error ? err.message : err}`);

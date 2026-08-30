@@ -100,7 +100,7 @@ export { runRugCheckLLM, formatRugReport, formatAlertCard, formatChatReply } fro
 export { fetchTokenMetadata } from "./erc20.js";
 export { resolveTokenPool, findContractDeployBlock, scanBlockRange, shortAddr, formatFee, identifyTokens } from "./scan-engine.js";
 export { answerTokenQuestion, extractAddress, stripAddress } from "./rugcheck-handler.js";
-export { loadState, saveState, alreadyPosted, markPosted, getDeployerHistory, recordDeployerToken, recordLiquiditySnapshot, addToWatchlist, getWatchlistTokens } from "./state.js";
+export { loadState, saveState, saveStateAsync, alreadyPosted, markPosted, getDeployerHistory, recordDeployerToken, recordLiquiditySnapshot, addToWatchlist, getWatchlistTokens } from "./state.js";
 export { sendReport, sendPlain, bot } from "./telegram.js";
 export { collectMinimalEvidence, findDeployer, scanHolderBalances, checkLiquidityDelta, runSellTest, checkLpLockStatus, checkLiquidityPullHistory, scanTradeActivity, checkSourceVerification, reVerifyEvidence } from "./evidence.js";
 export { computeScore, attachComputedScore } from "./scoring.js";

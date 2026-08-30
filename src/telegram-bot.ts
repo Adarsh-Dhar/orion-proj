@@ -22,6 +22,7 @@ import { registerChatHandler } from "./lib/chat-handler.js";
 import { registerInlineHandler } from "./lib/inline-handler.js";
 import { formatAlertCard } from "./lib/rugcheck.js";
 import { loadState, saveState, alreadyPosted, markPosted, addToWatchlist, getWatchlistTokens, recordLiquiditySnapshot } from "./lib/state.js";
+import type { BotState } from "./lib/state.js";
 import { checkLiquidityDelta } from "./lib/evidence.js";
 import { UNISWAP_V3_FACTORY, UNISWAP_V4_POOL_MANAGER } from "./lib/utils/constants.js";
 import { initQuoteAssets } from "./lib/quote-assets.js";
@@ -100,13 +101,8 @@ async function getBlockNumberWithRetry(maxAttempts = 5): Promise<bigint> {
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
-const state = loadState();
-
-// ─── Register chat handler ────────────────────────────────────────────────────
-
-registerChatHandler(bot, client as any, state);
-registerInlineHandler(bot, client as any, state);
-let lastScannedBlock: bigint | null = state.lastScannedBlock ? BigInt(state.lastScannedBlock) : 0n;
+let state: BotState;
+let lastScannedBlock: bigint | null = 0n;
 let sniperRun = 0;
 
 // ─── Sniper tick ──────────────────────────────────────────────────────────────
@@ -266,6 +262,14 @@ async function loop(fn: () => Promise<void>, intervalMs: number): Promise<void> 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
+  // Load bot state from Redis (or fallback to empty state if Redis unavailable)
+  state = await loadState();
+  lastScannedBlock = state.lastScannedBlock ? BigInt(state.lastScannedBlock) : 0n;
+
+  // Register chat handlers with the loaded state
+  registerChatHandler(bot, client as any, state);
+  registerInlineHandler(bot, client as any, state);
+
   // Load the live quote-asset list before any scanning starts — near-instant
   // if a disk cache exists, otherwise does one blocking fetch so the first
   // scan still has full coverage. Falls back to the static list on failure.

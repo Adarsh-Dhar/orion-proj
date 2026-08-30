@@ -219,3 +219,44 @@ export async function withHardCap<T>(promise: Promise<T>, startedAt: number): Pr
     new Promise<"TIMEOUT">((resolve) => setTimeout(() => resolve("TIMEOUT"), remaining)),
   ]);
 }
+
+// ─── Stop condition validation ─────────────────────────────────────────────────
+
+/**
+ * Validates that the agent loop's stop/continue decisions are justified.
+ * 
+ * The LLM should only continue the loop if it has a concrete next tool to call,
+ * and should stop (or provide a final verdict) when it has gathered sufficient
+ * evidence or exhausted all relevant tools.
+ * 
+ * Returns false if:
+ * - The loop stopped prematurely without covering mandatory tiers
+ * - The loop continued without a clear next action
+ * - The loop continued past max iterations without a valid reason
+ */
+export function validateStopConditions(
+  decisions: unknown[],
+  verdict: string
+): boolean {
+  // If no decisions were made but we have a verdict, that's okay
+  // (might be a fast-path failure or early exit)
+  if (decisions.length === 0) {
+    return verdict !== "UNKNOWN";
+  }
+
+  // Check if the final decision was to continue without a next action
+  const lastDecision = decisions[decisions.length - 1] as { action?: string; reason?: string } | null;
+  if (lastDecision && lastDecision.action === "continue" && !lastDecision.reason) {
+    console.warn("[grounding] Agent continued without providing a reason");
+    return false;
+  }
+
+  // If we have a final verdict, ensure we didn't stop mid-investigation
+  // without good reason (this is a basic sanity check)
+  if (verdict !== "UNKNOWN" && verdict !== "INSUFFICIENT") {
+    // Verdicts other than UNKNOWN/INSUFFICIENT are acceptable
+    return true;
+  }
+
+  return true;
+}

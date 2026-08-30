@@ -21,7 +21,7 @@ export const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? "";
 
 /** Legacy single-model override. Only used as the pool for callers that
  *  don't pass an AgentKey (i.e. nothing in MODEL_POOLS applies to them). */
-export const GEMINI_MODEL = process.env.GEMINI_MODEL ?? "gemini-2.0-flash-lite";
+export const GEMINI_MODEL = process.env.GEMINI_MODEL ?? "gemini-3.5-flash-lite";
 
 function endpointFor(model: string): string {
   return `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
@@ -57,8 +57,8 @@ export const MODEL_POOLS: Record<AgentKey, readonly string[]> = {
   "source-audit": ["gemini-3-flash-preview", "gemini-2.5-flash"],
   "deployer-reputation-agent": ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite"],
   "holder-distribution-agent": ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
-  "lp-honeypot-agent": ["gemini-2.5-flash-lite", "gemma-4-26b-a4b-it"],
-  "trading-activity-agent": ["gemma-4-31b-it", "gemini-2.5-flash-lite"],
+  "lp-honeypot-agent": ["gemini-3.5-flash-lite", "gemma-4-26b-a4b-it"],
+  "trading-activity-agent": ["gemma-4-31b-it", "gemini-3.5-flash-lite"],
 };
 
 /** Tried after an AgentKey's own pool is exhausted, and used as the whole

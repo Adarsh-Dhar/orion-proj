@@ -106,7 +106,7 @@ function dispatchCriticTool(
   args: Record<string, unknown>,
   evidence: TokenEvidence,
   transcript: ToolCallRecord[]
-): unknown {
+): Record<string, unknown> {
   if (name === "getEvidenceField") {
     const fields = Array.isArray(args.fields) ? (args.fields as string[]) : [];
     const out: Record<string, unknown> = {};
@@ -118,9 +118,9 @@ function dispatchCriticTool(
   if (name === "getToolCallOutput") {
     const toolName = typeof args.toolName === "string" ? args.toolName : "";
     const matches = transcript.filter(t => t.name === toolName).map(t => t.output);
-    return matches.length > 0 ? matches : `No calls to "${toolName}" found in the transcript.`;
+    return matches.length > 0 ? { results: matches } : { error: `No calls to "${toolName}" found in the transcript.` };
   }
-  return `Unknown tool: ${name}`;
+  return { error: `Unknown tool: ${name}` };
 }
 
 /**
@@ -153,12 +153,19 @@ export async function validateGrounding(
         messages.push(response.modelContent);
         // When there are multiple tool calls, we need to consolidate all responses
         // into a single user turn with multiple functionResponse parts
-        const responseParts = response.toolCalls.map(call => ({
-          functionResponse: {
-            name: call.name,
-            response: dispatchCriticTool(call.name, call.args, evidence, transcript),
-          },
-        }));
+        const responseParts = response.toolCalls.map(call => {
+          const toolResult = dispatchCriticTool(call.name, call.args, evidence, transcript);
+          // Ensure response is always a structured object, never a raw string
+          const response = typeof toolResult === 'string' 
+            ? { error: toolResult } 
+            : toolResult;
+          return {
+            functionResponse: {
+              name: call.name,
+              response,
+            },
+          };
+        });
         messages.push({
           role: "user",
           parts: responseParts,

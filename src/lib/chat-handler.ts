@@ -38,7 +38,7 @@ async function sendFullReport(
     }
   };
 
-  const TIMEOUT_MS = 10 * 60_000; // Increased to 10 minutes for agentic mode
+  const TIMEOUT_MS = 15 * 60_000; // Increased to 15 minutes for agentic mode
   let outcome: Awaited<ReturnType<typeof answerTokenQuestion>>;
   try {
     outcome = await Promise.race([
@@ -46,7 +46,7 @@ async function sendFullReport(
       // of using the current block, which would be wrong for non-fresh tokens.
       answerTokenQuestion(client, address as `0x${string}`, undefined, "chat", onProgress, false, false),
       new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("Analysis timed out after 10 minutes")), TIMEOUT_MS)
+        setTimeout(() => reject(new Error("Analysis timed out after 15 minutes")), TIMEOUT_MS)
       ),
     ]);
   } catch (err) {
@@ -185,9 +185,9 @@ export function registerChatHandler(bot: Bot<any>, client: AnyClient): void {
       }
     };
 
-    // Wrap the full pipeline in a 5-minute timeout so the user always gets
+    // Wrap the full pipeline in a timeout so the user always gets
     // a reply — deploy block binary search can be slow under RPC load.
-    const TIMEOUT_MS = 10 * 60_000; // Increased to 10 minutes for agentic mode
+    const TIMEOUT_MS = 15 * 60_000; // Increased to 15 minutes for agentic mode
     let outcome: Awaited<ReturnType<typeof answerTokenQuestion>>;
     try {
       outcome = await Promise.race([
@@ -201,7 +201,7 @@ export function registerChatHandler(bot: Bot<any>, client: AnyClient): void {
           isSniperMode
         ),
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("Analysis timed out after 10 minutes")), TIMEOUT_MS)
+          setTimeout(() => reject(new Error("Analysis timed out after 15 minutes")), TIMEOUT_MS)
         ),
       ]);
     } catch (err) {

@@ -74,7 +74,7 @@ type AnyClient = PublicClient<any>;
 
 /** Max blocks per eth_getLogs call.
  *  Alchemy free tier: 10 blocks. PAYG / Growth: raise to 500 or 2000. */
-const SCAN_CHUNK   = 10n;
+const SCAN_CHUNK   = 10_000n;
 const MAX_LOOKBACK = 200_000n;
 
 /**
@@ -381,9 +381,9 @@ export async function scanHolderBalances(
   let chunksFailed  = 0;
   let chunksTotal   = 0;
 
-  // Hard cap: never scan more than 50,000 blocks (5 chunks) total
+  // Hard cap: never scan more than 100,000 blocks (10 chunks) total
   // This prevents excessively long scans for old tokens
-  const MAX_SCAN_RANGE = 50_000n;
+  const MAX_SCAN_RANGE = 100_000n;
   const toBlock = fromBlock + MAX_SCAN_RANGE < latestBlock
     ? fromBlock + MAX_SCAN_RANGE
     : latestBlock;

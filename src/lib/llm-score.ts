@@ -1,15 +1,28 @@
 /**
- * llm-score.ts — Gemini-powered rug risk scorer (single-shot path).
+ * llm-score.ts — Gemini-powered rug risk scorer (single-shot path) +
+ * chat-answer generator.
  *
- * MOVED from agents/llm-score.ts as part of the agents/ restructuring:
- * this file now only owns single-shot scoring (scoreWithLLM), used both
- * for "evidence is clear" tokens and as the fallback when the agentic
- * orchestrator (agents/orchestrator.ts) fails outright. The agentic
- * function-calling loop that used to live here (scoreWithLLMAgentic,
+ * MOVED from agents/llm-score.ts as part of the agents/ restructuring. The
+ * agentic function-calling loop that used to live here (scoreWithLLMAgentic,
  * _reportDecision, buildInitialMessages, appendFunctionResults, the local
  * ToolCall/Message types) has been replaced by agents/orchestrator.ts +
  * agents/specialists/*.ts, which share the transport layer in
  * gemini-client.ts instead of duplicating it.
+ *
+ * Scoring is now ALWAYS agentic: rugcheck.ts calls runOrchestrator() for
+ * every token, ambiguous or not. This file's two remaining jobs are:
+ *   - scoreWithLLM: the fallback used ONLY when the orchestrator fails
+ *     outright (missing key, network error, hard-cap timeout, etc.) — a
+ *     working single-shot score beats no score at all.
+ *   - answerAboutToken: the conversational "answer" field shown in chat
+ *     mode. This is deliberately a separate, later call rather than part
+ *     of scoring — it runs *after* rugcheck.ts has already finalized the
+ *     authoritative score/verdict/flags (via computeScore()), so the
+ *     answer can never describe a different number than the one actually
+ *     displayed. (That was a real inconsistency in the old flow: the
+ *     single-shot call used to produce its own score + answer together,
+ *     and rugcheck.ts would then silently override the score afterward —
+ *     leaving the answer text describing a stale score.)
  *
  * Design principles:
  * - Never returns a default/fallback score. If the LLM call fails for any
@@ -307,4 +320,67 @@ export async function scoreWithLLM(
   }
 
   return { ...validated, rawModelText };
+}
+
+// ─── Chat-answer generator ──────────────────────────────────────────────────
+
+/**
+ * Generates the conversational "answer" field shown in chat mode.
+ *
+ * Deliberately takes the FINAL, already-computed score/verdict/flags/summary
+ * as ground truth rather than deriving its own — this call's only job is to
+ * explain that assessment in plain language (optionally answering a specific
+ * question), never to re-score. This guarantees the answer text can't
+ * contradict the number actually shown in the report.
+ *
+ * Returns undefined on any failure (missing API key, network error, empty
+ * response). A missing answer is never fatal — the caller already has a
+ * complete, correctly-scored result without it; chat mode just shows the
+ * score/flags/summary on their own in that case.
+ */
+export async function answerAboutToken(
+  evidence: TokenEvidence,
+  finalResult: { score: number; verdict: string; flags: RiskFlag[]; summary: string },
+  userQuestion?: string
+): Promise<string | undefined> {
+  if (!GEMINI_API_KEY) return undefined;
+
+  const evidenceJson = JSON.stringify(evidence, null, 2);
+  const flagsJson = JSON.stringify(finalResult.flags, null, 2);
+
+  const systemPrompt =
+    `You are an expert DeFi security analyst. You have already been given the ` +
+    `FINAL, authoritative risk assessment for a token — your only job is to ` +
+    `explain it to the user in plain conversational text. Do NOT invent a ` +
+    `different score, verdict, or new risk flags; only interpret what you are given.`;
+
+  const questionClause = userQuestion
+    ? `The user asked: "${userQuestion}"\n` +
+      `Answer that question directly in 2–4 sentences, using only the evidence ` +
+      `and assessment below. Do not just restate the summary.`
+    : `No specific question was asked — just give a natural, conversational risk ` +
+      `read of this token in 2–4 sentences, not a formal restatement of the summary.`;
+
+  const userMessage =
+    `FINAL ASSESSMENT (authoritative — do not change these numbers):\n` +
+    `Score: ${finalResult.score}/100\n` +
+    `Verdict: ${finalResult.verdict}\n` +
+    `Summary: ${finalResult.summary}\n` +
+    `Flags: ${flagsJson}\n\n` +
+    `EVIDENCE:\n${evidenceJson}\n\n` +
+    `${questionClause}\n\n` +
+    `Respond with plain text only — no JSON, no markdown formatting, no code fences.`;
+
+  try {
+    const rawText = await callGeminiText(
+      systemPrompt,
+      "Understood. I will explain the given assessment in plain conversational text without changing any numbers.",
+      userMessage
+    );
+    const cleaned = stripJsonFences(rawText);
+    return cleaned.length > 0 ? cleaned : undefined;
+  } catch (err) {
+    console.warn(`[llm-score] answerAboutToken failed: ${err instanceof Error ? err.message : err}`);
+    return undefined;
+  }
 }

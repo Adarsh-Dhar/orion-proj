@@ -19,7 +19,7 @@ import {
 type AnyClient = PublicClient<any>;
 
 import { collectMinimalEvidence } from "./evidence.js";
-import { scoreWithLLM } from "./llm-score.js";
+import { scoreWithLLM, answerAboutToken } from "./llm-score.js";
 import { computeScore, breakdownToFlags, breakdownToSummary } from "./scoring.js";
 import type { TokenEvidence } from "./evidence.js";
 import { getDeployerHistory, recordDeployerToken } from "./state.js";
@@ -31,56 +31,6 @@ import type { Venue } from "./utils/constants.js";
 // ─── Re-export shared types ───────────────────────────────────────────────────
 
 import type { RiskLevel, VerdictLevel, RiskFlag, RugCheckResult } from "./rugcheck-types.js";
-
-// ─── Ambiguity detector ──────────────────────────────────────────────────────────
-
-/**
- * Determine if the evidence is ambiguous and requires agentic investigation.
- * Returns true if the evidence shows conflicting signals or insufficient data.
- */
-function isAmbiguous(evidence: TokenEvidence): boolean {
-  // Conflicting signals: sell test passed but high concentration
-  if (evidence.sellTestPassed === true && evidence.top5HoldersPct !== null && evidence.top5HoldersPct > 60) {
-    return true;
-  }
-
-  // Source verification missing/null
-  if (evidence.sourceVerified === null) {
-    return true;
-  }
-
-  // Deployer seen before but otherwise clean signals
-  if (evidence.deployerSeenBefore && evidence.sellTestPassed === true && evidence.liquidityLocked === true) {
-    return true;
-  }
-
-  // Ownership renounced but LP not locked
-  if (evidence.ownershipRenounced === true && evidence.lpPositionStatus === "held_by_eoa") {
-    return true;
-  }
-
-  // Low liquidity but not zero
-  if (evidence.initialLiquidityEth !== null && evidence.initialLiquidityEth > 0 && evidence.initialLiquidityEth < 0.5) {
-    return true;
-  }
-
-  // Trade scan failed or partial
-  if (evidence.tradeScanPartial) {
-    return true;
-  }
-
-  // Holder scan partial
-  if (evidence.holderScanPartial) {
-    return true;
-  }
-
-  // Multiple RPC warnings
-  if (evidence.rpcWarnings.length >= 3) {
-    return true;
-  }
-
-  return false;
-}
 
 // ─── LLM scorer ───────────────────────────────────────────────────────────────
 
@@ -164,50 +114,48 @@ export async function runRugCheckLLM(
   const liquidityLocked = evidence.liquidityLocked;
   const initialLiquidityEth = evidence.initialLiquidityEth ?? 0;
 
-  // ── 3. Score with LLM (hybrid: single-shot for clean/obvious, agentic for ambiguous) ─────────────────────
-  console.log("  Sending evidence to Gemini for scoring...");
-  
+  // ── 3. Score with LLM (always agentic — no single-shot gate) ─────────────
+  console.log("  Sending evidence to Gemini for scoring (agentic)...");
+
   let llmResult;
   let toolCallTranscript: import("./rugcheck-types.js").ToolCallRecord[] | undefined;
   let decisionTrace: import("./utils/interface.js").IterationDecision[] | undefined;
 
-  if (isAmbiguous(evidence)) {
-    console.log("  Evidence is ambiguous — entering agentic investigation mode...");
+  const toolContext: ToolContext = {
+    client,
+    tokenAddress,
+    poolAddress,
+    deployBlock,
+    ownershipRenounced: evidence.ownershipRenounced,
+    ownerAddress: evidence.ownerAddress,
+    isProxy: evidence.isProxy,
+  };
 
-    const toolContext: ToolContext = {
-      client,
-      tokenAddress,
-      poolAddress,
-      deployBlock,
-      ownershipRenounced: evidence.ownershipRenounced,
-      ownerAddress: evidence.ownerAddress,
-      isProxy: evidence.isProxy,
-    };
+  const { result, transcript } = await runOrchestrator(evidence, toolContext, { maxIterations: 12 });
+  llmResult = result;
+  toolCallTranscript = transcript;
+  decisionTrace = result.ok ? result.decisionTrace : undefined;
 
-    const { result, transcript } = await runOrchestrator(evidence, toolContext, { maxIterations: 12 });
-    llmResult = result;
-    toolCallTranscript = transcript;
-    decisionTrace = result.ok ? result.decisionTrace : undefined;
-
-    console.log(`  Agentic investigation complete: ${llmResult.ok ? "SUCCESS" : "FAILED"}`);
-    if (transcript.length > 0) {
-      console.log(`  Tool calls made: ${transcript.length}`);
-      for (const call of transcript) {
-        console.log(`    - ${call.name} at ${new Date(call.ts).toISOString()}`);
-      }
+  console.log(`  Agentic investigation complete: ${llmResult.ok ? "SUCCESS" : "FAILED"}`);
+  if (transcript.length > 0) {
+    console.log(`  Tool calls made: ${transcript.length}`);
+    for (const call of transcript) {
+      console.log(`    - ${call.name} at ${new Date(call.ts).toISOString()}`);
     }
+  }
 
-    // If agentic mode failed outright (not just an ungrounded-flags rejection),
-    // fall back to single-shot scoring rather than surfacing a hard failure —
-    // a working single-shot score beats no score at all.
-    if (!llmResult.ok) {
-      console.warn(`  [Agentic] Falling back to single-shot scoring: ${llmResult.reason}`);
-      llmResult = await scoreWithLLM(evidence, opts);
-      toolCallTranscript = undefined;
-    }
-  } else {
-    console.log("  Evidence is clear — using single-shot LLM scoring...");
+  // If the orchestrator failed outright (missing key, network error, hard-cap
+  // timeout, ungrounded-flags rejection) — fall back to single-shot scoring
+  // rather than surfacing a hard failure. A working single-shot score beats
+  // no score at all. toolCallTranscript is reset to undefined here so the
+  // rest of this function (and scoringMethod below) can tell "orchestrator
+  // succeeded" apart from "fell back to single-shot" — scoreWithLLM already
+  // produces its own `answer` field via opts.userQuestion/opts.mode, so the
+  // separate answerAboutToken() step further down is skipped in this case.
+  if (!llmResult.ok) {
+    console.warn(`  [Agentic] Falling back to single-shot scoring: ${llmResult.reason}`);
     llmResult = await scoreWithLLM(evidence, opts);
+    toolCallTranscript = undefined;
   }
 
   if (!llmResult.ok) {
@@ -288,7 +236,26 @@ export async function runRugCheckLLM(
 
   console.log(`  Deterministic score: ${llmResult.verdict} (${llmResult.score}/100)`);
   console.log(`  Score breakdown: ${computed.breakdown.map(b => `${b.id}=${b.contribution}`).join(", ")}`);
-  
+
+  // ── Chat-mode conversational answer ───────────────────────────────────────
+  // Only needed for chat mode (alert mode never shows an "answer" field), and
+  // only when the orchestrator actually produced this result — the
+  // single-shot fallback above already generated its own `answer` via
+  // opts.userQuestion/opts.mode, so running this again would be redundant.
+  // Runs after the score/verdict/flags/summary above are fully finalized, so
+  // the answer is guaranteed to describe the same numbers the report shows.
+  const effectiveMode = opts?.mode ?? "chat";
+  if (effectiveMode === "chat" && toolCallTranscript !== undefined) {
+    const answer = await answerAboutToken(
+      evidence,
+      { score: llmResult.score, verdict: llmResult.verdict, flags: llmResult.flags, summary: llmResult.summary },
+      opts?.userQuestion
+    );
+    if (answer) {
+      llmResult = { ...llmResult, answer };
+    }
+  }
+
   // Log tool call transcript if it exists
   if (toolCallTranscript && toolCallTranscript.length > 0) {
     console.log("\n  ── Tool Call Transcript ─────────────────────────────────────");

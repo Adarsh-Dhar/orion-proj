@@ -201,7 +201,7 @@ export function registerChatHandler(bot: Bot<any>, client: AnyClient): void {
           isSniperMode
         ),
         new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("Analysis timed out after 5 minutes")), TIMEOUT_MS)
+          setTimeout(() => reject(new Error("Analysis timed out after 10 minutes")), TIMEOUT_MS)
         ),
       ]);
     } catch (err) {

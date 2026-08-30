@@ -7,7 +7,8 @@
  * computes score/verdict by reusing scoring.ts's deterministic weighting
  * (rather than trusting free-form LLM math the way the old single-agent
  * loop did), then hands the merged flags to validateGrounding from
- * grounding.ts exactly as agent-loop.ts did.
+ * grounding.ts (which now uses a critic LLM with tools to verify each
+ * flag's factual grounding, not just structural tool-call presence).
  *
  * Call-site shape is unchanged from runAgentLoop: same (evidence, ctx, opts)
  * input, same { result, transcript } output — rugcheck.ts's call site only
@@ -19,7 +20,7 @@ import type { ToolContext } from "../utils/interface.js";
 import type { LLMScoreResult, RiskFlag, ToolCallRecord } from "../rugcheck-types.js";
 import type { SpecialistAgent } from "./types.js";
 import { computeScore } from "../scoring.js";
-import { validateGrounding } from "./grounding.js";
+import { validateGrounding, withHardCap, HARD_CAP_MS } from "./grounding.js";
 import {
   sourceOwnerAgent,
   deployerReputationAgent,
@@ -62,10 +63,22 @@ export async function runOrchestrator(
     return { result: { ok: false, reason: "GEMINI_API_KEY is not set" }, transcript: [] };
   }
 
+  const startedAt = Date.now();
+
   const active = SPECIALISTS.filter((s) => s.shouldRun(evidence));
   const activeNames = new Set(active.map((s) => s.name));
 
-  const results = await Promise.all(active.map((s) => s.run(evidence, ctx)));
+  const specialistOutcome = await withHardCap(
+    Promise.all(active.map((s) => s.run(evidence, ctx))),
+    startedAt
+  );
+  if (specialistOutcome === "TIMEOUT") {
+    return {
+      result: { ok: false, reason: `Specialist dispatch exceeded the ${HARD_CAP_MS / 3_600_000}h hard cap` },
+      transcript: [],
+    };
+  }
+  const results = specialistOutcome;
 
   const flags: RiskFlag[] = [];
   const transcript: ToolCallRecord[] = [];
@@ -80,7 +93,14 @@ export async function runOrchestrator(
     console.warn(`  [orchestrator] specialist warnings:\n    ${specialistWarnings.join("\n    ")}`);
   }
 
-  const groundingOk = validateGrounding(flags, transcript);
+  const groundingOutcome = await withHardCap(validateGrounding(flags, transcript, evidence), startedAt);
+  if (groundingOutcome === "TIMEOUT") {
+    return {
+      result: { ok: false, reason: `Grounding critic exceeded the ${HARD_CAP_MS / 3_600_000}h hard cap` },
+      transcript,
+    };
+  }
+  const groundingOk = groundingOutcome;
   if (!groundingOk) {
     return {
       result: { ok: false, reason: "A specialist returned flags not grounded in a tool call it actually made" },

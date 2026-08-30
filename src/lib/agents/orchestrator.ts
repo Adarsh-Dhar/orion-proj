@@ -18,7 +18,7 @@
 import type { TokenEvidence } from "../evidence.js";
 import type { ToolContext } from "../utils/interface.js";
 import type { LLMScoreResult, RiskFlag, ToolCallRecord } from "../rugcheck-types.js";
-import type { SpecialistAgent } from "./types.js";
+import type { SpecialistAgent, SpecialistResult } from "./types.js";
 import { computeScore } from "../scoring.js";
 import { validateGrounding, withHardCap, HARD_CAP_MS } from "./grounding.js";
 import {
@@ -68,8 +68,30 @@ export async function runOrchestrator(
   const active = SPECIALISTS.filter((s) => s.shouldRun(evidence));
   const activeNames = new Set(active.map((s) => s.name));
 
+  // Add individual timeout per specialist (5 minutes each) to prevent
+  // one slow specialist from blocking the entire Promise.all
+  const SPECIALIST_TIMEOUT_MS = 5 * 60_000; // 5 minutes per specialist
+  const specialistsWithTimeout = active.map((s) =>
+    Promise.race([
+      s.run(evidence, ctx),
+      new Promise<SpecialistResult>((_, reject) =>
+        setTimeout(() => reject(new Error(`Specialist ${s.name} exceeded ${SPECIALIST_TIMEOUT_MS / 60_000}m timeout`)), SPECIALIST_TIMEOUT_MS)
+      ),
+    ]).catch((err) => {
+      // If a specialist times out or fails, return a failure result
+      // instead of letting the entire Promise.all fail
+      console.warn(`  [orchestrator] Specialist ${s.name} failed: ${err instanceof Error ? err.message : String(err)}`);
+      return {
+        agentName: s.name,
+        flags: [],
+        toolCallTranscript: [],
+        warnings: [`Specialist ${s.name} failed: ${err instanceof Error ? err.message : String(err)}`],
+      };
+    })
+  );
+
   const specialistOutcome = await withHardCap(
-    Promise.all(active.map((s) => s.run(evidence, ctx))),
+    Promise.all(specialistsWithTimeout),
     startedAt
   );
   if (specialistOutcome === "TIMEOUT") {

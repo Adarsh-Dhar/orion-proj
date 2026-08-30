@@ -381,6 +381,9 @@ export async function scanHolderBalances(
   let chunksFailed  = 0;
   let chunksTotal   = 0;
 
+  const totalChunks = Number((latestBlock - fromBlock) / SCAN_CHUNK) + 1;
+  console.log(`  [evidence:holderScan] Scanning ${totalChunks} chunks from block ${fromBlock} to ${latestBlock}`);
+
   for (let chunkStart = fromBlock; chunkStart <= latestBlock; chunkStart += SCAN_CHUNK) {
     const chunkEnd = chunkStart + SCAN_CHUNK - 1n < latestBlock
       ? chunkStart + SCAN_CHUNK - 1n

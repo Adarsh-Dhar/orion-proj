@@ -144,6 +144,38 @@ export async function runRugCheckLLM(
     }
   }
 
+  // Merge holder ledger data from transcript back into evidence
+  // The holder-distribution-agent collects this data but it only goes into the transcript
+  // We need to update the evidence so the scoring system can use it
+  const holderLedgerCall = transcript.find(t => t.name === "getHolderLedger");
+  if (holderLedgerCall && typeof holderLedgerCall.output === "object" && holderLedgerCall.output !== null) {
+    const output = holderLedgerCall.output as {
+      topHolders?: Array<{ address: string; balance: string; pct: number }>;
+      scanPartial?: boolean;
+      scanFailed?: boolean;
+    };
+    if (output.topHolders && Array.isArray(output.topHolders)) {
+      evidence.top5Holders = output.topHolders.slice(0, 5);
+      const totalPct = output.topHolders.slice(0, 5).reduce((sum, h) => sum + h.pct, 0);
+      evidence.top5HoldersPct = totalPct > 0 ? totalPct : null;
+      
+      // Find deployer's balance
+      const deployerHolder = output.topHolders.find(h => 
+        h.address.toLowerCase() === evidence.deployerAddress?.toLowerCase()
+      );
+      if (deployerHolder) {
+        evidence.deployerCurrentBalance = deployerHolder.balance;
+        evidence.deployerPct = deployerHolder.pct;
+      }
+    }
+    if (output.scanPartial !== undefined) {
+      evidence.holderScanPartial = output.scanPartial;
+    }
+    if (output.scanFailed !== undefined) {
+      evidence.holderScanFailed = output.scanFailed;
+    }
+  }
+
   // If the orchestrator failed outright (missing key, network error, hard-cap
   // timeout, ungrounded-flags rejection) — fall back to single-shot scoring
   // rather than surfacing a hard failure. A working single-shot score beats

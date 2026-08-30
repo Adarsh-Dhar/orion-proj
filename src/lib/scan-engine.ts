@@ -163,6 +163,9 @@ export async function resolveTokenPool(
   client: AnyClient,
   tokenAddress: Address
 ): Promise<ResolvedPool | null> {
+  const resolveStart = Date.now();
+  console.log(`[timing] Starting pool resolution for ${tokenAddress}`);
+  
   // ── V3 path ──────────────────────────────────────────────────────────────
   for (const quote of getCoreQuoteAssets()) {
     for (const fee of FEE_TIERS) {
@@ -174,6 +177,8 @@ export async function resolveTokenPool(
           args: [tokenAddress, quote.address, fee],
         }) as Address;
         if (pool && pool.toLowerCase() !== NULL_POOL) {
+          const v3Duration = Date.now() - resolveStart;
+          console.log(`[timing] V3 pool found in ${v3Duration}ms: ${pool}`);
           return { poolAddress: pool, pairedLabel: quote.label, pairedAsset: quote.address, venue: "v3" };
         }
       } catch {
@@ -181,6 +186,9 @@ export async function resolveTokenPool(
       }
     }
   }
+  
+  const v3Complete = Date.now();
+  console.log(`[timing] V3 path completed in ${v3Complete - resolveStart}ms, starting V4 scan`);
 
   // ── V4 path — scan Initialize events near the token's deploy block ──────
   // Strategy:
@@ -194,13 +202,21 @@ export async function resolveTokenPool(
   //
   // Total worst-case: (210 + 490) / 10 = 70 getLogs calls vs the old 10,000.
   try {
+    const deployStart = Date.now();
+    console.log(`[timing] Starting V4 deploy block search`);
     const deployBlock  = await findContractDeployBlock(client, tokenAddress);
+    const deployDuration = Date.now() - deployStart;
+    console.log(`[timing] Deploy block found: ${deployBlock} in ${deployDuration}ms`);
+    
     const currentBlock = await client.getBlockNumber();
     const CHUNK        = 10n;
 
     // Helper: scan a [from, to] range for a matching Initialize event
-    const scanRange = async (from: bigint, to: bigint): Promise<ResolvedPool | null> => {
+    const scanRange = async (from: bigint, to: bigint, rangeName: string): Promise<ResolvedPool | null> => {
+      const rangeStart = Date.now();
+      console.log(`[timing] Starting ${rangeName} scan: blocks ${from}-${to}`);
       const scanTo = to < currentBlock ? to : currentBlock;
+      let chunksScanned = 0;
       for (let chunkStart = from; chunkStart <= scanTo; chunkStart += CHUNK) {
         const chunkEnd = chunkStart + CHUNK - 1n < scanTo ? chunkStart + CHUNK - 1n : scanTo;
         try {
@@ -222,20 +238,28 @@ export async function resolveTokenPool(
             const pairedAddr  = c0 === t ? currency1 : currency0;
             const pairedLower = pairedAddr.toLowerCase();
             const pairedLabel = getQuoteAssetLabel(pairedLower, shortAddr(pairedAddr));
+            const rangeDuration = Date.now() - rangeStart;
+            console.log(`[timing] ${rangeName} scan found pool in ${rangeDuration}ms`);
             return { poolAddress: id as Address, pairedLabel, pairedAsset: pairedAddr, venue: "v4" };
           }
         } catch {
           // chunk failed — keep scanning
         }
+        chunksScanned++;
+        if (chunksScanned % 10 === 0) {
+          console.log(`[timing] ${rangeName} scan progress: ${chunksScanned} chunks scanned`);
+        }
         await sleep(150);
       }
+      const rangeDuration = Date.now() - rangeStart;
+      console.log(`[timing] ${rangeName} scan completed in ${rangeDuration}ms, no pool found`);
       return null;
     };
 
     // Pass 1: forward scan from (deployBlock-10) to (deployBlock+200)
     const forwardFrom = deployBlock > 10n ? deployBlock - 10n : 0n;
     const forwardTo   = deployBlock + 200n;
-    const forwardHit  = await scanRange(forwardFrom, forwardTo);
+    const forwardHit  = await scanRange(forwardFrom, forwardTo, "forward");
     if (forwardHit) return forwardHit;
 
     // Pass 2: backward scan (deployBlock-500) to (deployBlock-11) for tokens
@@ -243,12 +267,17 @@ export async function resolveTokenPool(
     if (deployBlock > 11n) {
       const backwardFrom = deployBlock > 500n ? deployBlock - 500n : 0n;
       const backwardTo   = deployBlock - 11n;
-      const backwardHit  = await scanRange(backwardFrom, backwardTo);
+      const backwardHit  = await scanRange(backwardFrom, backwardTo, "backward");
       if (backwardHit) return backwardHit;
     }
-  } catch {
+  } catch (err) {
+    console.log(`[timing] V4 scan failed: ${err instanceof Error ? err.message : String(err)}`);
     // V4 scan failed entirely — fall through to null
   }
+
+  const totalDuration = Date.now() - resolveStart;
+  console.log(`[timing] Pool resolution completed in ${totalDuration}ms, no pool found`);
+  return null;
 
   return null;
 }
@@ -284,21 +313,33 @@ export async function scanBlockRange(
       : toBlock;
 
     try {
+      const chunkStartMs = Date.now();
+      console.log(`[timing] Starting chunk ${chunksFetched + 1}/${numChunks}: blocks ${chunkStart}-${chunkEnd}`);
+      
       // Fetch V3 PoolCreated events
+      const v3Start = Date.now();
       const v3Logs = await client.getLogs({
         address: UNISWAP_V3_FACTORY,
         event:   POOL_CREATED_ABI[0],
         fromBlock: chunkStart,
         toBlock:   chunkEnd,
       });
+      const v3Duration = Date.now() - v3Start;
+      console.log(`[timing] V3 getLogs completed in ${v3Duration}ms`);
 
       // Fetch V4 Initialize events
+      const v4Start = Date.now();
       const v4Logs = await client.getLogs({
         address: UNISWAP_V4_POOL_MANAGER,
         event:   V4_INITIALIZE_ABI[0],
         fromBlock: chunkStart,
         toBlock:   chunkEnd,
       });
+      const v4Duration = Date.now() - v4Start;
+      console.log(`[timing] V4 getLogs completed in ${v4Duration}ms`);
+      
+      const chunkDuration = Date.now() - chunkStartMs;
+      console.log(`[timing] Chunk ${chunksFetched + 1} total duration: ${chunkDuration}ms`);
 
       // Tag V3 logs with venue
       const taggedV3Logs = (v3Logs as unknown as V3PoolLog[]).map(log => ({ ...log, venue: "v3" as const }));
@@ -414,11 +455,16 @@ export async function scanBlockRange(
     }
 
     // Fetch ERC-20 metadata
+    const metaStart = Date.now();
+    console.log(`[timing] Starting metadata fetch for ${newToken}`);
     let meta;
     try {
       meta = await fetchTokenMetadata(client, newToken);
+      const metaDuration = Date.now() - metaStart;
+      console.log(`[timing] Metadata fetch completed in ${metaDuration}ms`);
     } catch (err) {
-      console.error(`  [scan-engine] metadata fetch failed for ${newToken}: ${err}\n`);
+      const metaDuration = Date.now() - metaStart;
+      console.error(`[timing] Metadata fetch failed for ${newToken} in ${metaDuration}ms: ${err}\n`);
       console.log(`${"─".repeat(66)}\n`);
       skipped++;
       continue;
@@ -432,6 +478,8 @@ export async function scanBlockRange(
     await sleep(30_000);
 
     // Run LLM rug check
+    const rugCheckStart = Date.now();
+    console.log(`[timing] Starting rug check for ${newToken}`);
     let rugResult;
     try {
       rugResult = await runRugCheckLLM(client, newToken, poolAddress, pairedLabel, blockNum, meta, {
@@ -440,8 +488,11 @@ export async function scanBlockRange(
         hookAddress,
         v4PoolParams,
       });
+      const rugCheckDuration = Date.now() - rugCheckStart;
+      console.log(`[timing] Rug check completed in ${rugCheckDuration}ms`);
     } catch (err) {
-      console.error(`  [scan-engine] rug check failed for ${newToken}: ${err}\n`);
+      const rugCheckDuration = Date.now() - rugCheckStart;
+      console.error(`[timing] Rug check failed for ${newToken} in ${rugCheckDuration}ms: ${err}\n`);
       console.log(`${"─".repeat(66)}\n`);
       skipped++;
       continue;

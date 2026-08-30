@@ -1,23 +1,29 @@
 /**
  * evidence.ts — pure on-chain data collection, no scoring.
  *
+ * REAL-TIME ONLY. Every function that used to scan a historical block range
+ * via client.getLogs or Etherscan's `logs` module (findDeployer,
+ * scanHolderBalances, checkLpLockStatus, checkLiquidityPullHistory,
+ * scanTradeActivity, checkPreLiquidityDistribution) has been removed and
+ * replaced with a same-signature stub that returns an honest
+ * null/empty/"unverified" result immediately — see the "REMOVED" comment
+ * above each one. That data is inherently historical (who minted the
+ * token, who has held it over time, whether liquidity was ever pulled) and
+ * there is no real-time substitute for it; this app no longer tries.
+ *
  * Exports:
  *   collectMinimalEvidence(client, tokenAddress, poolAddress, pairedAsset, deployBlock)
- *     → TokenEvidence  (metadata + ownership + proxy + deployer + liquidity only)
+ *     → TokenEvidence  (metadata + ownership + proxy + liquidity only —
+ *       deployerAddress etc. are always null now, see above)
  *
  *   Individual evidence functions (called on-demand by agents/tools.ts):
- *     scanHolderBalances, checkSourceVerification, runSellTest,
- *     checkLpLockStatus, checkDeployerVelocity, scanTradeActivity
+ *     checkSourceVerification, runSellTest, checkDeployerVelocity,
+ *     checkDeployerWalletAge, checkLiquidityDelta — all real-time or
+ *     txlist-based (not the blocked `logs` module), so these still work.
  *
  * All RPC failures are logged to stdout AND recorded in `rpcWarnings[]` so
  * the LLM scorer can see which fields are unverified rather than treating
  * nulls as implicitly clean.
- *
- * Key fix vs old rugcheck.ts:
- *   getHolderBalances now resolves "latest" explicitly via getBlockNumber(),
- *   then walks FORWARD in SCAN_CHUNK windows rather than making
- *   one unbounded call. This eliminates the "range exceeds limit" error that
- *   broke every historical scan.
  *
  * V4 support:
  *   All pool-specific reads have a V4 branch that uses the singleton
@@ -27,7 +33,7 @@
  *   branch on `venue` before issuing any RPC call against poolAddress.
  */
 
-import { type Address, formatEther, encodeFunctionData, parseEventLogs } from "viem";
+import { type Address, formatEther, encodeFunctionData } from "viem";
 import type { PublicClient } from "viem";
 import type { LiquiditySnapshot } from "./state.js";
 import { getLiquidityHistory } from "./state.js";
@@ -38,28 +44,17 @@ import {
   POOL_SLOT0_ABI,
   POOL_LIQUIDITY_ABI,
   POOL_TOKENS_ABI,
-  TRANSFER_EVENT_ABI,
   ERC20_ABI,
-  UNISWAP_V3_POSITION_MANAGER,
-  UNCX_V3_LOCKER,
   BURN_ADDRESS,
   ETHERSCAN_API_BASE,
   BASE_CHAIN_ID,
-  POOL_MINT_EVENT_ABI,
-  POOL_BURN_EVENT_ABI,
-  POOL_SWAP_EVENT_ABI,
-  NPM_INCREASE_LIQUIDITY_EVENT_ABI,
-  NPM_OWNER_OF_ABI,
   ERC20_TRANSFER_ABI,
-  ERC20_TRANSFER_TOPIC0,
   // V4-specific
   UNISWAP_V4_POOL_MANAGER,
   UNISWAP_V4_STATE_VIEW,
   UNISWAP_V4_QUOTER,
   V4_STATE_VIEW_SLOT0_ABI,
   V4_STATE_VIEW_LIQUIDITY_ABI,
-  V4_SWAP_EVENT_ABI,
-  V4_MODIFY_LIQUIDITY_EVENT_ABI,
   V4_QUOTER_EXACT_INPUT_SINGLE_ABI,
   type Venue,
 } from "./utils/constants.js";
@@ -73,21 +68,6 @@ export type { TokenEvidence, DeployerResult, HolderScanResult, TradeActivity, Re
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = PublicClient<any>;
 
-/** Max blocks per eth_getLogs call.
- *  Alchemy free tier: 10 blocks. PAYG / Growth: raise to 500 or 2000. */
-const SCAN_CHUNK   = 10_000n;
-const MAX_LOOKBACK = 200_000n;
-
-/**
- * Window used when searching for the initial LP-add event (Mint on V3,
- * ModifyLiquidity on V4).  On Base (~2 s/block) this is roughly 15–20 min,
- * which is wide enough to catch deployers who add liquidity well after pool
- * creation, while still being a bounded single getLogs call.
- *
- * NOTE: this exceeds Alchemy free-tier limits (10 blocks) so it makes
- * multiple chunked requests internally — see checkLpLockStatusV3/V4.
- */
-const LP_LOCK_SCAN_WINDOW = 500n;
 const ZERO_SLOT    =
   "0x0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -128,122 +108,14 @@ async function safeReadNullable<T>(
   catch (err) { warn(warnings, tag, "read failed", err); return null; }
 }
 
-// ─── Etherscan log-indexing helper (replaces raw eth_getLogs for wide ranges) ─
-
-/**
- * Why this exists: raw `eth_getLogs` over a token's full history is capped by
- * the RPC provider's block-range limit — on Alchemy's free tier that's just
- * 10 blocks on Base, so a 100,000-block holder scan would need 10,000
- * sequential RPC calls (and a 200,000-block deployer lookback, 20,000 calls).
- * No amount of retry/backoff fixes this: it's a hard per-request validation
- * limit, not throttling, so every over-limit call fails identically forever.
- *
- * Etherscan's log-indexing API (module=logs&action=getLogs) has no such
- * per-request block-range limit — it's a pre-built index, not a live node —
- * so the same scan becomes one paginated call instead of thousands of RPC
- * round-trips. This is the same Etherscan v2 unified API (and the same
- * ETHERSCAN_API_KEY) already used by fetchDeployerTxHistory and
- * fetchVerifiedSource below.
- */
-
-/** Etherscan caps getLogs results at 1000 rows per page. */
-const ETHERSCAN_LOGS_PAGE_SIZE = 1000;
-/** Hard ceiling on pages walked per call — bounds worst-case latency for a
- *  token with an extreme transfer count instead of paginating unbounded. */
-const ETHERSCAN_LOGS_MAX_PAGES = 20;
-/** Free-tier Etherscan/Basescan allows 5 req/sec — pace page requests to stay under it. */
-const ETHERSCAN_LOGS_PAGE_DELAY_MS = 250;
-
-interface DecodedTransferLog {
-  blockNumber: bigint;
-  args: { from: string; to: string; value: bigint };
-}
-
-/**
- * Fetch every ERC-20 Transfer log for `tokenAddress` in [fromBlock, toBlock]
- * via Etherscan instead of eth_getLogs. When `fromAddressFilter` is given,
- * restricts to Transfers *from* that address (used by findDeployer to
- * isolate mint events from the zero address) via topic1 + AND.
- *
- * Returns `truncated: true` if ETHERSCAN_LOGS_MAX_PAGES was hit — there may
- * be more logs in range than were returned.
- */
-async function fetchTransferLogsFromEtherscan(
-  tokenAddress: Address,
-  fromBlock: bigint,
-  toBlock: bigint,
-  apiKey: string,
-  warnings: string[],
-  tag: string,
-  fromAddressFilter?: Address
-): Promise<{ logs: DecodedTransferLog[]; truncated: boolean; hadError: boolean }> {
-  const logs: DecodedTransferLog[] = [];
-  let truncated = false;
-  let hadError  = false;
-
-  for (let page = 1; page <= ETHERSCAN_LOGS_MAX_PAGES; page++) {
-    const params = new URLSearchParams({
-      chainid: String(BASE_CHAIN_ID),
-      module: "logs",
-      action: "getLogs",
-      address: tokenAddress,
-      fromBlock: fromBlock.toString(),
-      toBlock: toBlock.toString(),
-      topic0: ERC20_TRANSFER_TOPIC0,
-      page: String(page),
-      offset: String(ETHERSCAN_LOGS_PAGE_SIZE),
-      apikey: apiKey,
-    });
-    if (fromAddressFilter) {
-      // topic1 = "from" address, left-padded to 32 bytes, as Etherscan expects.
-      params.set("topic1", `0x${"0".repeat(24)}${fromAddressFilter.slice(2).toLowerCase()}`);
-      params.set("topic0_1_opr", "and");
-    }
-
-    let json: { status: string; message: string; result: unknown };
-    try {
-      const res = await fetch(`${ETHERSCAN_API_BASE}?${params.toString()}`);
-      json = await res.json() as typeof json;
-    } catch (err) {
-      warn(warnings, tag, `Etherscan getLogs page ${page} fetch failed`, err);
-      hadError = true;
-      break;
-    }
-
-    // Etherscan returns status "0" + message "No records found" for a
-    // genuinely empty (not erroring) result — treat that as success, not
-    // failure. For real errors, `message` is always the generic "NOTOK" —
-    // the actual reason (bad key, rate limit, bad param, etc.) is in `result`.
-    if (json.status !== "1") {
-      if (json.message && !/no records found/i.test(json.message)) {
-        const reason = typeof json.result === "string" ? json.result : JSON.stringify(json.result);
-        warn(warnings, tag, `Etherscan getLogs page ${page} error`, reason);
-        hadError = true;
-      }
-      break;
-    }
-    if (!Array.isArray(json.result)) { hadError = true; break; }
-
-    const rows = json.result as Array<{ topics: string[]; data: string; blockNumber: string }>;
-    for (const row of rows) {
-      try {
-        const from        = `0x${row.topics[1].slice(-40)}`;
-        const to          = `0x${row.topics[2].slice(-40)}`;
-        const value       = BigInt(row.data === "0x" ? "0x0" : row.data);
-        const blockNumber = BigInt(row.blockNumber);
-        logs.push({ blockNumber, args: { from, to, value } });
-      } catch {
-        // Malformed row — skip it rather than aborting the whole page.
-      }
-    }
-
-    if (rows.length < ETHERSCAN_LOGS_PAGE_SIZE) break; // last page reached
-    if (page === ETHERSCAN_LOGS_MAX_PAGES) { truncated = true; break; }
-    await new Promise(resolve => setTimeout(resolve, ETHERSCAN_LOGS_PAGE_DELAY_MS));
-  }
-
-  return { logs, truncated, hadError };
-}
+// ─── (Etherscan log-indexing helper — REMOVED, real-time-only mode) ────────
+// This used to fetch ERC-20 Transfer logs from Etherscan's `logs` module for
+// findDeployer / scanHolderBalances / checkPreLiquidityDistribution. Base's
+// free-tier Etherscan key returns "Free API access is not supported for
+// this chain" for every call to that module, and there's no raw-RPC fallback
+// that stays under the free-tier eth_getLogs block-range cap either. All
+// three callers are gone (see below), so this helper is gone too — it only
+// existed to serve them.
 
 // ─── Etherscan deployer tx history helper ────────────────────────────────────
 
@@ -376,365 +248,51 @@ export async function checkDeployerWalletAge(
   return { walletAgeAtDeploySeconds, fundingGapSeconds, fundingSourceAddress };
 }
 
-// ─── New signal: pre-liquidity distribution ───────────────────────────────────
+// ─── New signal: pre-liquidity distribution — REMOVED (real-time-only mode) ──
+// Historically walked Transfer events between mintBlock and scanToBlock to
+// find pre-launch recipients. Same historical-scan problem as findDeployer
+// above; this field isn't wired into any tool or the default evidence
+// object today, so it's removed rather than stubbed.
 
-/**
- * Walk Transfer events from `mintBlock` to `scanToBlock` and collect every
- * recipient that is not the deployer, the pool, or the null address.
- * These wallets were seeded with tokens before any public trading was possible.
- *
- * `preSeededPct` is left as null here; the caller fills it in once it has
- * the full holder-balance map available (avoids a redundant on-chain read).
- */
-export async function checkPreLiquidityDistribution(
-  client: AnyClient,
-  tokenAddress: Address,
-  mintBlock: bigint,
-  scanToBlock: bigint,
-  deployerAddress: string,
-  poolAddress: string,
-  warnings: string[]
-): Promise<{ preSeededWallets: string[]; preSeededPct: null }> {
-  const apiKey = process.env.ETHERSCAN_API_KEY;
-  if (!apiKey) {
-    warn(warnings, "preSeed", "ETHERSCAN_API_KEY not set — falling back to slower RPC scan", "missing env var");
-    return checkPreLiquidityDistributionViaRpc(client, tokenAddress, mintBlock, scanToBlock, deployerAddress, poolAddress, warnings);
-  }
+// ─── Deployer finder — REMOVED (real-time-only mode) ─────────────────────────
 
-  const deployerLower = deployerAddress.toLowerCase();
-  const poolLower     = poolAddress.toLowerCase();
-
-  const { logs, truncated } = await fetchTransferLogsFromEtherscan(
-    tokenAddress, mintBlock, scanToBlock, apiKey, warnings, "preSeed"
-  );
-  if (truncated) {
-    warn(warnings, "preSeed", `hit ${ETHERSCAN_LOGS_MAX_PAGES}-page cap — result may be incomplete`, "truncated");
-  }
-
-  const recipients = new Set<string>();
-  for (const log of logs) {
-    const to = log.args.to?.toLowerCase();
-    if (!to) continue;
-    if (to === deployerLower) continue;
-    if (to === poolLower)     continue;
-    if (to === NULL_ADDRESS.toLowerCase()) continue;
-    recipients.add(to);
-  }
-
-  return { preSeededWallets: [...recipients], preSeededPct: null };
-}
-
-/** Fallback used only when ETHERSCAN_API_KEY is not configured. Subject to
- *  the RPC provider's eth_getLogs block-range cap — see SCAN_CHUNK comment. */
-async function checkPreLiquidityDistributionViaRpc(
-  client: AnyClient,
-  tokenAddress: Address,
-  mintBlock: bigint,
-  scanToBlock: bigint,
-  deployerAddress: string,
-  poolAddress: string,
-  warnings: string[]
-): Promise<{ preSeededWallets: string[]; preSeededPct: null }> {
-  const recipients = new Set<string>();
-  const deployerLower = deployerAddress.toLowerCase();
-  const poolLower     = poolAddress.toLowerCase();
-
-  for (let chunkStart = mintBlock; chunkStart <= scanToBlock; chunkStart += SCAN_CHUNK) {
-    const chunkEnd = chunkStart + SCAN_CHUNK - 1n < scanToBlock
-      ? chunkStart + SCAN_CHUNK - 1n
-      : scanToBlock;
-    try {
-      const logs = await client.getLogs({
-        address: tokenAddress,
-        event: TRANSFER_EVENT_ABI[0],
-        fromBlock: chunkStart,
-        toBlock:   chunkEnd,
-      });
-      for (const log of logs) {
-        const args = log.args as { from: string; to: string; value?: bigint };
-        const to   = args.to?.toLowerCase();
-        if (!to) continue;
-        if (to === deployerLower) continue;
-        if (to === poolLower)     continue;
-        if (to === NULL_ADDRESS.toLowerCase()) continue;
-        recipients.add(to);
-      }
-    } catch (err) {
-      warn(warnings, "preSeed", `chunk [${chunkStart}, ${chunkEnd}] failed`, err);
-      break;
-    }
-  }
-
-  return { preSeededWallets: [...recipients], preSeededPct: null };
-}
-
-// ─── Deployer finder ─────────────────────────────────────────────────────────
-
-
-
-/** Mint found within this many blocks of deployBlock is reported as "tight"
- *  provenance rather than "wide" — same semantic the old SCAN_CHUNK-sized
- *  first pass used, just no longer tied to the RPC chunk size. */
-const TIGHT_MINT_WINDOW_BLOCKS = 10_000n;
 
 export async function findDeployer(
-  client: AnyClient,
-  tokenAddress: Address,
-  deployBlock: bigint,
+  _client: AnyClient,
+  _tokenAddress: Address,
+  _deployBlock: bigint,
   warnings: string[]
 ): Promise<DeployerResult> {
-  const apiKey = process.env.ETHERSCAN_API_KEY;
-  if (!apiKey) {
-    warn(warnings, "findDeployer", "ETHERSCAN_API_KEY not set — falling back to slower RPC scan", "missing env var");
-    return findDeployerViaRpc(client, tokenAddress, deployBlock, warnings);
-  }
-
-  // Mint happens at or before the pool creation block. One paginated
-  // Etherscan call over the full lookback window replaces the old backward
-  // chunk-walk entirely — no RPC block-range limit to work around.
-  const hardFloor = deployBlock > MAX_LOOKBACK ? deployBlock - MAX_LOOKBACK : 0n;
-  const { logs, truncated } = await fetchTransferLogsFromEtherscan(
-    tokenAddress, hardFloor, deployBlock, apiKey, warnings, "findDeployer", NULL_ADDRESS as Address
-  );
-  if (truncated) {
-    warn(warnings, "findDeployer", `hit ${ETHERSCAN_LOGS_MAX_PAGES}-page cap — earliest mint may be missing`, "truncated");
-  }
-
-  if (logs.length === 0) {
-    return { address: null, mintBlock: null, mintAmount: null, source: "unknown" };
-  }
-
-  const sorted = [...logs].sort((a, b) => (a.blockNumber < b.blockNumber ? -1 : 1));
-  const first  = sorted[0];
-  return {
-    address: first.args.to,
-    mintBlock: first.blockNumber,
-    mintAmount: first.args.value,
-    source: deployBlock - first.blockNumber <= TIGHT_MINT_WINDOW_BLOCKS ? "tight" : "wide",
-  };
-}
-
-/** Fallback used only when ETHERSCAN_API_KEY is not configured. Subject to
- *  the RPC provider's eth_getLogs block-range cap — see SCAN_CHUNK comment. */
-async function findDeployerViaRpc(
-  client: AnyClient,
-  tokenAddress: Address,
-  deployBlock: bigint,
-  warnings: string[]
-): Promise<DeployerResult> {
-  // Mint happens at or before the pool creation block.
-  // Walk backwards in SCAN_CHUNK windows up to MAX_LOOKBACK blocks.
-  // "Tight" pass = the first few chunks immediately around deployBlock;
-  // "Wide" pass = the remaining history — same loop, different label.
-  const hardFloor = deployBlock > MAX_LOOKBACK ? deployBlock - MAX_LOOKBACK : 0n;
-  let chunkEnd = deployBlock;
-
-  while (chunkEnd >= hardFloor) {
-    const chunkStart = chunkEnd >= SCAN_CHUNK ? chunkEnd - (SCAN_CHUNK - 1n) : 0n;
-    const clampedStart = chunkStart > hardFloor ? chunkStart : hardFloor;
-    let logs;
-    try {
-      logs = await client.getLogs({
-        address: tokenAddress,
-        event: TRANSFER_EVENT_ABI[0],
-        args: { from: NULL_ADDRESS as Address },
-        fromBlock: clampedStart,
-        toBlock: chunkEnd,
-      });
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      const isRateLimited =
-        errorMsg.includes("429") ||
-        errorMsg.toLowerCase().includes("rate limit") ||
-        errorMsg.includes("JSON is not a valid request object");
-
-      if (isRateLimited) {
-        // One retry after a real backoff — a throttled first call shouldn't
-        // sink the whole deployer lookup immediately.
-        warn(warnings, "findDeployer", `chunk [${clampedStart}, ${chunkEnd}] rate-limited, retrying after backoff`, err);
-        await new Promise(resolve => setTimeout(resolve, 3_000));
-        try {
-          logs = await client.getLogs({
-            address: tokenAddress,
-            event: TRANSFER_EVENT_ABI[0],
-            args: { from: NULL_ADDRESS as Address },
-            fromBlock: clampedStart,
-            toBlock: chunkEnd,
-          });
-        } catch (err2) {
-          warn(warnings, "findDeployer", `chunk [${clampedStart}, ${chunkEnd}] failed after retry`, err2);
-          return { address: null, mintBlock: null, mintAmount: null, source: "unknown" };
-        }
-      } else {
-        warn(warnings, "findDeployer", `chunk [${clampedStart}, ${chunkEnd}] failed`, err);
-        // Stop — don't burn requests on a connection that's already failing
-        return { address: null, mintBlock: null, mintAmount: null, source: "unknown" };
-      }
-    }
-    if (logs.length > 0) {
-      const sorted = [...logs].sort((a, b) => (a.blockNumber! < b.blockNumber! ? -1 : 1));
-      const first  = sorted[0];
-      const to     = (first.args as { to: string }).to ?? null;
-      const value  = (first.args as { value?: bigint }).value ?? null;
-      return {
-        address: to,
-        mintBlock: first.blockNumber ?? null,
-        mintAmount: value,
-        source: chunkEnd === deployBlock ? "tight" : "wide",
-      };
-    }
-    if (clampedStart <= hardFloor) break;
-    chunkEnd = clampedStart - 1n;
-  }
-
+  // REMOVED (real-time-only mode): this used to scan Transfer-from-0x0 (mint)
+  // events across a wide historical window — either via Etherscan's `logs` 
+  // module (blocked on Base's free tier: "Free API access is not supported
+  // for this chain") or, as a fallback, raw chunked eth_getLogs (capped at
+  // 10 blocks/call on free RPC tiers, making a real deploy-block-to-now scan
+  // impractical). Deployer identity is inherently historical — there is no
+  // real-time equivalent — so this now returns an honest "unknown" instead
+  // of burning calls against a wall that always fails the same way.
+  warn(warnings, "findDeployer", "historical deployer/mint scan removed", "real-time-only mode — deployer identity requires historical event data");
   return { address: null, mintBlock: null, mintAmount: null, source: "unknown" };
 }
 
-// ─── Holder balance scan ──────────────────────────────────────────────────────
 
 
+// ─── Holder balance scan — REMOVED (real-time-only mode) ────────────────────
+// Historically this walked every Transfer event from a wide starting block
+// to the chain head — via Etherscan's `logs` module (blocked on Base's free
+// tier) or, as a fallback, raw chunked eth_getLogs (capped far too low by
+// RPC providers to be practical). Both are gone. getHolderLedger now returns
+// an honest empty/failed result instantly instead of trying and failing.
 
-/** Never scan more than this many blocks total, regardless of provider —
- *  bounds worst-case cost for very old tokens. */
-const MAX_HOLDER_SCAN_RANGE = 100_000n;
 
-/**
- * Fetch holder balances by scanning Transfer events from `fromBlock` to the
- * current chain head (capped at MAX_HOLDER_SCAN_RANGE) via Etherscan's
- * log-indexing API — one paginated call instead of a raw eth_getLogs chunk
- * walk that would blow past the RPC provider's block-range limit.
- */
 export async function scanHolderBalances(
-  client: AnyClient,
-  tokenAddress: Address,
+  _client: AnyClient,
+  _tokenAddress: Address,
   fromBlock: bigint,
   warnings: string[]
 ): Promise<HolderScanResult> {
-  const apiKey = process.env.ETHERSCAN_API_KEY;
-  if (!apiKey) {
-    warn(warnings, "holderScan", "ETHERSCAN_API_KEY not set — falling back to slower RPC scan", "missing env var");
-    return scanHolderBalancesViaRpc(client, tokenAddress, fromBlock, warnings);
-  }
-
-  const latestBlock = await client.getBlockNumber();
-  const toBlock = fromBlock + MAX_HOLDER_SCAN_RANGE < latestBlock
-    ? fromBlock + MAX_HOLDER_SCAN_RANGE
-    : latestBlock;
-
-  console.log(`  [evidence:holderScan] Scanning blocks ${fromBlock} to ${toBlock} via Etherscan`);
-
-  const { logs, truncated, hadError } = await fetchTransferLogsFromEtherscan(
-    tokenAddress, fromBlock, toBlock, apiKey, warnings, "holderScan"
-  );
-  if (truncated) {
-    warn(warnings, "holderScan", `hit ${ETHERSCAN_LOGS_MAX_PAGES}-page cap — holder balances may be incomplete`, "truncated");
-  }
-
-  const balances = new Map<string, bigint>();
-  for (const log of logs) {
-    const { from, to, value } = log.args;
-    if (!value) continue;
-    if (from !== NULL_ADDRESS) {
-      balances.set(from, (balances.get(from) ?? 0n) - value);
-    }
-    balances.set(to, (balances.get(to) ?? 0n) + value);
-  }
-
-  // Remove dust / burned balances
-  for (const [addr, bal] of balances) {
-    if (bal <= 0n) balances.delete(addr);
-  }
-
-  return {
-    balances,
-    partial: truncated,
-    failed:  hadError,
-    scanFrom: fromBlock,
-    scanTo:   toBlock,
-  };
-}
-
-/** Fallback used only when ETHERSCAN_API_KEY is not configured. Subject to
- *  the RPC provider's eth_getLogs block-range cap — see SCAN_CHUNK comment. */
-async function scanHolderBalancesViaRpc(
-  client: AnyClient,
-  tokenAddress: Address,
-  fromBlock: bigint,
-  warnings: string[]
-): Promise<HolderScanResult> {
-  const latestBlock = await client.getBlockNumber();
-  const balances    = new Map<string, bigint>();
-  let chunksFailed  = 0;
-  let chunksTotal   = 0;
-
-  const toBlock = fromBlock + MAX_HOLDER_SCAN_RANGE < latestBlock
-    ? fromBlock + MAX_HOLDER_SCAN_RANGE
-    : latestBlock;
-
-  const totalChunks = Number((toBlock - fromBlock) / SCAN_CHUNK) + 1;
-  console.log(`  [evidence:holderScan] Scanning ${totalChunks} chunks from block ${fromBlock} to ${toBlock}`);
-
-  for (let chunkStart = fromBlock; chunkStart <= toBlock; chunkStart += SCAN_CHUNK) {
-    const chunkEnd = chunkStart + SCAN_CHUNK - 1n < toBlock
-      ? chunkStart + SCAN_CHUNK - 1n
-      : toBlock;
-
-    chunksTotal++;
-    let chunkSucceeded = false;
-    // Retry failed chunks up to 2 times to handle transient RPC errors
-    for (let retry = 0; retry < 3 && !chunkSucceeded; retry++) {
-      try {
-        const logs = await client.getLogs({
-          address: tokenAddress,
-          event: TRANSFER_EVENT_ABI[0],
-          fromBlock: chunkStart,
-          toBlock: chunkEnd,
-        });
-        for (const log of logs) {
-          const args = log.args as { from: string; to: string; value: bigint };
-          const { from, to, value } = args;
-          if (!value) continue;
-          if (from !== NULL_ADDRESS) {
-            balances.set(from, (balances.get(from) ?? 0n) - value);
-          }
-          balances.set(to, (balances.get(to) ?? 0n) + value);
-        }
-        chunkSucceeded = true;
-      } catch (err) {
-        const errorMsg = err instanceof Error ? err.message : String(err);
-        const isRateLimited =
-          errorMsg.includes("429") ||
-          errorMsg.toLowerCase().includes("rate limit") ||
-          errorMsg.includes("JSON is not a valid request object");
-
-        if (retry === 2) {
-          chunksFailed++;
-          warn(warnings, "holderScan", `chunk [${chunkStart}, ${chunkEnd}] failed after 3 retries`, err);
-        } else if (isRateLimited) {
-          const backoffMs = retry === 0 ? 2_000 : 6_000;
-          console.log(`  [evidence:holderScan] chunk [${chunkStart}, ${chunkEnd}] rate-limited, backing off ${backoffMs}ms`);
-          await new Promise(resolve => setTimeout(resolve, backoffMs));
-        } else {
-          await new Promise(resolve => setTimeout(resolve, 300));
-        }
-      }
-    }
-    if (chunkStart + SCAN_CHUNK <= toBlock) {
-      await new Promise(resolve => setTimeout(resolve, 150));
-    }
-  }
-
-  for (const [addr, bal] of balances) {
-    if (bal <= 0n) balances.delete(addr);
-  }
-
-  return {
-    balances,
-    partial: chunksFailed > 0 && chunksFailed < chunksTotal,
-    failed:  chunksFailed === chunksTotal && chunksTotal > 0,
-    scanFrom: fromBlock,
-    scanTo:   toBlock,
-  };
+  warn(warnings, "holderScan", "historical holder scan removed", "real-time-only mode — holder distribution requires historical event data");
+  return { balances: new Map(), partial: false, failed: true, scanFrom: fromBlock, scanTo: fromBlock };
 }
 
 // ─── Liquidity delta check ────────────────────────────────────────────────────
@@ -1018,445 +576,72 @@ export async function runSellTest(
   }
 }
 
-// ── 2. LP position lock/burn status ──────────────────────────────────────────
+// ── 2. LP position lock/burn status — REMOVED (real-time-only mode) ─────────
 //
-// V3: watch for Mint events on the pool contract, check whether the NFT
-// position manager minted an NFT, then check who owns that NFT.
-//
-// V4: there is no per-pool contract and no separate NFT position manager.
-// Liquidity is managed directly through PoolManager via ModifyLiquidity
-// events. We scan for the first positive-liquidityDelta ModifyLiquidity event
-// on PoolManager filtered by poolId to identify who added the initial LP, and
-// whether they later removed it (negative delta after the initial add).
+// Historically this scanned Mint/ModifyLiquidity events with client.getLogs
+// over a wide block window to find the LP position and its owner (burned /
+// locked / held by an EOA). That requires walking historical logs, which is
+// exactly the wide-range eth_getLogs / Etherscan `logs`-module pattern this
+// app no longer does (Base's free tier blocks the `logs` module; RPC
+// providers cap block ranges too low to make the raw fallback practical).
+// Kept as a same-signature stub so checkLpLock still "runs" (satisfying the
+// orchestrator's mandatory-tool check) and returns an honest "unverified"
+// instead of quietly failing or spending RPC calls that would fail anyway.
 
 export async function checkLpLockStatus(
-  client: AnyClient,
-  poolIdOrAddress: Address,
-  deployBlock: bigint,
+  _client: AnyClient,
+  _poolIdOrAddress: Address,
+  _deployBlock: bigint,
   warnings: string[],
-  venue: Venue = "v3"
+  _venue: Venue = "v3"
 ): Promise<{ lpTokenId: string | null; lpPositionOwner: string | null; lpPositionStatus: TokenEvidence["lpPositionStatus"] }> {
-  if (venue === "v4") {
-    return checkLpLockStatusV4(client, poolIdOrAddress, deployBlock, warnings);
-  }
-  return checkLpLockStatusV3(client, poolIdOrAddress, deployBlock, warnings);
+  warn(warnings, "lpLock", "historical LP-lock scan removed", "real-time-only mode — LP lock status requires historical event data");
+  return { lpTokenId: null, lpPositionOwner: null, lpPositionStatus: "unverified" };
 }
 
-async function checkLpLockStatusV3(
-  client: AnyClient,
-  poolAddress: Address,
-  deployBlock: bigint,
-  warnings: string[]
-): Promise<{ lpTokenId: string | null; lpPositionOwner: string | null; lpPositionStatus: TokenEvidence["lpPositionStatus"] }> {
-  try {
-    // Scan LP_LOCK_SCAN_WINDOW blocks in SCAN_CHUNK-sized requests (Alchemy free
-    // tier only allows 10 blocks per getLogs call).  We stop at the first Mint
-    // event rather than scanning the whole window every time.
-    const scanEnd = deployBlock + LP_LOCK_SCAN_WINDOW - 1n;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let mintLog: any | undefined;
-
-    for (
-      let chunkStart = deployBlock;
-      chunkStart <= scanEnd && !mintLog;
-      chunkStart += SCAN_CHUNK
-    ) {
-      const chunkEnd = chunkStart + SCAN_CHUNK - 1n < scanEnd
-        ? chunkStart + SCAN_CHUNK - 1n
-        : scanEnd;
-      try {
-        const logs = await client.getLogs({
-          address: poolAddress,
-          event: POOL_MINT_EVENT_ABI[0],
-          fromBlock: chunkStart,
-          toBlock: chunkEnd,
-        });
-        if (logs.length > 0) mintLog = logs[0];
-      } catch (err) {
-        warn(warnings, "lpLock", `V3 Mint scan chunk [${chunkStart}, ${chunkEnd}] failed`, err);
-        break;
-      }
-    }
-
-    if (!mintLog) {
-      return { lpTokenId: null, lpPositionOwner: null, lpPositionStatus: "unverified" };
-    }
-    const mintOwner = (mintLog.args as { owner: string }).owner;
-
-    if (mintOwner.toLowerCase() !== UNISWAP_V3_POSITION_MANAGER.toLowerCase()) {
-      // Liquidity added directly — no position NFT; that address controls it.
-      return { lpTokenId: null, lpPositionOwner: mintOwner, lpPositionStatus: "non_nft_position" };
-    }
-
-    const receipt     = await client.getTransactionReceipt({ hash: mintLog.transactionHash! });
-    const increaseLogs = parseEventLogs({ abi: NPM_INCREASE_LIQUIDITY_EVENT_ABI, logs: receipt.logs });
-    const npmLog       = increaseLogs.find(
-      (l) => l.address.toLowerCase() === UNISWAP_V3_POSITION_MANAGER.toLowerCase()
-    );
-
-    if (!npmLog) {
-      return { lpTokenId: null, lpPositionOwner: mintOwner, lpPositionStatus: "unverified" };
-    }
-
-    const tokenId = (npmLog.args as { tokenId: bigint }).tokenId;
-    const owner   = (await client.readContract({
-      address: UNISWAP_V3_POSITION_MANAGER,
-      abi:     NPM_OWNER_OF_ABI,
-      functionName: "ownerOf",
-      args: [tokenId],
-    })) as string;
-
-    let status: TokenEvidence["lpPositionStatus"];
-    if (owner.toLowerCase() === BURN_ADDRESS.toLowerCase())    status = "burned";
-    else if (owner.toLowerCase() === UNCX_V3_LOCKER.toLowerCase()) status = "locked_uncx";
-    else                                                           status = "held_by_eoa";
-
-    return { lpTokenId: tokenId.toString(), lpPositionOwner: owner, lpPositionStatus: status };
-  } catch (err) {
-    warn(warnings, "lpLock", "V3 position lookup failed", err);
-    return { lpTokenId: null, lpPositionOwner: null, lpPositionStatus: "unverified" };
-  }
-}
-
-async function checkLpLockStatusV4(
-  client: AnyClient,
-  poolId: Address,
-  deployBlock: bigint,
-  warnings: string[]
-): Promise<{ lpTokenId: string | null; lpPositionOwner: string | null; lpPositionStatus: TokenEvidence["lpPositionStatus"] }> {
-  // Scan ModifyLiquidity events on the PoolManager filtered by this pool's id.
-  // We look within a generous window (deploy block + 500) to catch the initial
-  // liquidity add, then check whether the same sender later pulled it.
-  try {
-    // Scan up to LP_LOCK_SCAN_WINDOW blocks in SCAN_CHUNK-sized chunks for the
-    // initial ModifyLiquidity add event.  Stop at first positive-delta match.
-    const scanEnd = deployBlock + LP_LOCK_SCAN_WINDOW - 1n;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let firstAdd: any | undefined;
-    const poolIdLower = poolId.toLowerCase();
-
-    for (
-      let chunkStart = deployBlock;
-      chunkStart <= scanEnd && !firstAdd;
-      chunkStart += SCAN_CHUNK
-    ) {
-      const chunkEnd = chunkStart + SCAN_CHUNK - 1n < scanEnd
-        ? chunkStart + SCAN_CHUNK - 1n
-        : scanEnd;
-      try {
-        const addLogs = await client.getLogs({
-          address: UNISWAP_V4_POOL_MANAGER as Address,
-          event:   V4_MODIFY_LIQUIDITY_EVENT_ABI[0],
-          fromBlock: chunkStart,
-          toBlock:   chunkEnd,
-        });
-        const poolAddLogs = (addLogs as unknown[]).filter(
-          (l: unknown) => ((l as { args: { id: string } }).args?.id?.toLowerCase() === poolIdLower)
-        );
-        firstAdd = (poolAddLogs as unknown[]).find(
-          (l: unknown) => ((l as { args: { liquidityDelta: bigint } }).args?.liquidityDelta ?? 0n) > 0n
-        );
-      } catch (err) {
-        warn(warnings, "lpLock", `V4 add-scan chunk [${chunkStart}, ${chunkEnd}] failed`, err);
-        break;
-      }
-    }
-    if (!firstAdd) {
-      return { lpTokenId: null, lpPositionOwner: null, lpPositionStatus: "unverified" };
-    }
-
-    const lpSender = (firstAdd.args as { sender: string }).sender;
-
-    // Now check from firstAdd block to latest for any negative-delta event
-    // from the same sender — that would mean they later pulled liquidity.
-    const latestBlock = await client.getBlockNumber();
-    let removedByLpOwner = false;
-
-    for (
-      let chunkStart = (firstAdd.blockNumber ?? deployBlock) + 1n;
-      chunkStart <= latestBlock;
-      chunkStart += SCAN_CHUNK
-    ) {
-      const chunkEnd = chunkStart + SCAN_CHUNK - 1n < latestBlock
-        ? chunkStart + SCAN_CHUNK - 1n
-        : latestBlock;
-      try {
-        const removeLogs = await client.getLogs({
-          address: UNISWAP_V4_POOL_MANAGER as Address,
-          event:   V4_MODIFY_LIQUIDITY_EVENT_ABI[0],
-          // Filter only by sender (address topic — works on free tier).
-          // poolId (bytes32 topic) filtered client-side.
-          args:    { sender: lpSender as Address },
-          fromBlock: chunkStart,
-          toBlock:   chunkEnd,
-        });
-        for (const l of removeLogs) {
-          const args = l.args as { id: string; liquidityDelta: bigint };
-          if (args.id?.toLowerCase() !== poolIdLower) continue;
-          if (args.liquidityDelta < 0n) {
-            removedByLpOwner = true;
-            break;
-          }
-        }
-      } catch (err) {
-        warn(warnings, "lpLock", `V4 remove-scan chunk [${chunkStart}, ${chunkEnd}] failed`, err);
-      }
-      if (removedByLpOwner) break;
-    }
-
-    // V4 has no NFT-based locker; we report the sender as owner.
-    // If they haven't pulled, classify as "non_nft_position" (direct control).
-    // If they have already pulled, classify as "held_by_eoa" (unprotected and drained).
-    const status: TokenEvidence["lpPositionStatus"] = removedByLpOwner
-      ? "held_by_eoa"
-      : "non_nft_position";
-
-    return { lpTokenId: null, lpPositionOwner: lpSender, lpPositionStatus: status };
-  } catch (err) {
-    warn(warnings, "lpLock", "V4 position lookup failed", err);
-    return { lpTokenId: null, lpPositionOwner: null, lpPositionStatus: "unverified" };
-  }
-}
-
-// ── 3. Liquidity pull history ─────────────────────────────────────────────────
-//
-// V3: scan Burn events on the pool contract.
-// V4: scan ModifyLiquidity events with negative liquidityDelta on PoolManager,
-//     filtered by poolId.
+// ── 3. Liquidity pull history — REMOVED (real-time-only mode) ───────────────
+// Historically this counted Burn / negative-liquidityDelta events across the
+// pool's whole history via client.getLogs. Same historical-scan problem as
+// everything else in this section — removed, not just "made to fail".
 
 export async function checkLiquidityPullHistory(
-  client: AnyClient,
-  poolIdOrAddress: Address,
-  deployBlock: bigint,
-  currentBlock: bigint,
-  warnings: string[],
-  venue: Venue = "v3"
+  _client: AnyClient,
+  _poolIdOrAddress: Address,
+  _deployBlock: bigint,
+  _currentBlock: bigint,
+  _warnings: string[],
+  _venue: Venue = "v3"
 ): Promise<{ liquidityEverPulled: boolean; burnEventCount: number }> {
-  if (venue === "v4") {
-    return checkLiquidityPullHistoryV4(client, poolIdOrAddress, deployBlock, currentBlock, warnings);
-  }
-  return checkLiquidityPullHistoryV3(client, poolIdOrAddress, deployBlock, currentBlock, warnings);
+  return { liquidityEverPulled: false, burnEventCount: 0 };
 }
 
-async function checkLiquidityPullHistoryV3(
-  client: AnyClient,
-  poolAddress: Address,
-  deployBlock: bigint,
-  currentBlock: bigint,
-  warnings: string[]
-): Promise<{ liquidityEverPulled: boolean; burnEventCount: number }> {
-  let count = 0;
-  for (
-    let chunkStart = deployBlock;
-    chunkStart <= currentBlock;
-    chunkStart += SCAN_CHUNK
-  ) {
-    const chunkEnd = chunkStart + SCAN_CHUNK - 1n < currentBlock
-      ? chunkStart + SCAN_CHUNK - 1n
-      : currentBlock;
-    try {
-      const logs = await client.getLogs({
-        address: poolAddress,
-        event:   POOL_BURN_EVENT_ABI[0],
-        fromBlock: chunkStart,
-        toBlock:   chunkEnd,
-      });
-      count += logs.length;
-    } catch (err) {
-      warn(warnings, "burnHistory", `V3 chunk [${chunkStart}, ${chunkEnd}] failed`, err);
-      break; // Stop — don't burn requests on a failing connection
-    }
-  }
-  return { liquidityEverPulled: count > 0, burnEventCount: count };
-}
-
-async function checkLiquidityPullHistoryV4(
-  client: AnyClient,
-  poolId: Address,
-  deployBlock: bigint,
-  currentBlock: bigint,
-  warnings: string[]
-): Promise<{ liquidityEverPulled: boolean; burnEventCount: number }> {
-  // Count ModifyLiquidity events with negative liquidityDelta — these are
-  // partial or full liquidity removals on a V4 pool.
-  let count = 0;
-  for (
-    let chunkStart = deployBlock;
-    chunkStart <= currentBlock;
-    chunkStart += SCAN_CHUNK
-  ) {
-    const chunkEnd = chunkStart + SCAN_CHUNK - 1n < currentBlock
-      ? chunkStart + SCAN_CHUNK - 1n
-      : currentBlock;
-    try {
-      const logs = await client.getLogs({
-        address: UNISWAP_V4_POOL_MANAGER as Address,
-        event:   V4_MODIFY_LIQUIDITY_EVENT_ABI[0],
-        // No bytes32 args filter — rejected by Alchemy free tier.
-        // Filter by poolId client-side.
-        fromBlock: chunkStart,
-        toBlock:   chunkEnd,
-      });
-      const poolIdLower = poolId.toLowerCase();
-      for (const l of logs) {
-        const args = l.args as { id: string; liquidityDelta: bigint };
-        if (args.id?.toLowerCase() !== poolIdLower) continue;
-        if (args.liquidityDelta < 0n) {
-          count++;
-        }
-      }
-    } catch (err) {
-      warn(warnings, "burnHistory", `V4 chunk [${chunkStart}, ${chunkEnd}] failed`, err);
-      break; // Stop — don't burn requests on a failing connection
-    }
-  }
-  return { liquidityEverPulled: count > 0, burnEventCount: count };
-}
-
-// ── Trade activity scan (wash trading detection) ──────────────────────────────
-//
-// V3: scan Swap events on the pool contract.
-// V4: scan Swap events on the PoolManager filtered by the poolId (id field).
-
+// ── Trade activity scan — REMOVED (real-time-only mode) ─────────────────────
+// Historically this scanned every Swap event from deployBlock to the current
+// head via client.getLogs to detect wash trading / bot volume. Same
+// historical-scan problem — removed. getTradeHistory now returns an honest
+// empty/unverified result instead of failing chunk-by-chunk against a block
+// range limit.
 
 
 export async function scanTradeActivity(
-  client: AnyClient,
-  poolIdOrAddress: Address,
-  fromBlock: bigint,
-  token0IsTarget: boolean,
+  _client: AnyClient,
+  _poolIdOrAddress: Address,
+  _fromBlock: bigint,
+  _token0IsTarget: boolean,
   warnings: string[],
-  venue: Venue = "v3"
+  _venue: Venue = "v3"
 ): Promise<TradeActivity> {
-  if (venue === "v4") {
-    return scanTradeActivityV4(client, poolIdOrAddress, fromBlock, token0IsTarget, warnings);
-  }
-  return scanTradeActivityV3(client, poolIdOrAddress, fromBlock, token0IsTarget, warnings);
-}
-
-async function scanTradeActivityV3(
-  client: AnyClient,
-  poolAddress: Address,
-  fromBlock: bigint,
-  token0IsTarget: boolean,
-  warnings: string[]
-): Promise<TradeActivity> {
-  const latestBlock    = await client.getBlockNumber();
-  const swapsByAddress = new Map<string, { buys: number; sells: number }>();
-  let chunksFailed = 0, chunksTotal = 0, totalSwaps = 0;
-
-  for (let chunkStart = fromBlock; chunkStart <= latestBlock; chunkStart += SCAN_CHUNK) {
-    const chunkEnd = chunkStart + SCAN_CHUNK - 1n < latestBlock
-      ? chunkStart + SCAN_CHUNK - 1n
-      : latestBlock;
-    chunksTotal++;
-    try {
-      const logs = await client.getLogs({
-        address: poolAddress,
-        event:   POOL_SWAP_EVENT_ABI[0],
-        fromBlock: chunkStart,
-        toBlock:   chunkEnd,
-      });
-      for (const log of logs) {
-        const { recipient, amount0, amount1 } = log.args as {
-          recipient: string; amount0: bigint; amount1: bigint;
-        };
-        totalSwaps++;
-        const targetAmount = token0IsTarget ? amount0 : amount1;
-        const isBuy = targetAmount < 0n;
-        const entry = swapsByAddress.get(recipient) ?? { buys: 0, sells: 0 };
-        if (isBuy) entry.buys++; else entry.sells++;
-        swapsByAddress.set(recipient, entry);
-      }
-    } catch (err) {
-      chunksFailed++;
-      warn(warnings, "tradeScan", `V3 chunk [${chunkStart}, ${chunkEnd}] failed`, err);
-      break; // Stop — don't burn requests on a failing connection
-    }
-  }
-
-  return buildTradeActivity(swapsByAddress, totalSwaps, chunksFailed > 0);
-}
-
-async function scanTradeActivityV4(
-  client: AnyClient,
-  poolId: Address,
-  fromBlock: bigint,
-  token0IsTarget: boolean,
-  warnings: string[]
-): Promise<TradeActivity> {
-  // V4 Swap events are emitted on the PoolManager contract.  The `id` field
-  // (indexed) carries the PoolId, so we can filter precisely.
-  const latestBlock    = await client.getBlockNumber();
-  const swapsByAddress = new Map<string, { buys: number; sells: number }>();
-  let chunksFailed = 0, chunksTotal = 0, totalSwaps = 0;
-
-  for (let chunkStart = fromBlock; chunkStart <= latestBlock; chunkStart += SCAN_CHUNK) {
-    const chunkEnd = chunkStart + SCAN_CHUNK - 1n < latestBlock
-      ? chunkStart + SCAN_CHUNK - 1n
-      : latestBlock;
-    chunksTotal++;
-    try {
-      const logs = await client.getLogs({
-        address: UNISWAP_V4_POOL_MANAGER as Address,
-        event:   V4_SWAP_EVENT_ABI[0],
-        // No bytes32 args filter — rejected by Alchemy free tier.
-        // Filter by poolId client-side.
-        fromBlock: chunkStart,
-        toBlock:   chunkEnd,
-      });
-      const poolIdLower = poolId.toLowerCase();
-      for (const log of logs) {
-        const args = log.args as { id: string; recipient: string; amount0: bigint; amount1: bigint };
-        if (args.id?.toLowerCase() !== poolIdLower) continue;
-        const { recipient, amount0, amount1 } = args;
-        totalSwaps++;
-        // Negative amount on the target side = pool sent that token to trader = buy
-        const targetAmount = token0IsTarget ? amount0 : amount1;
-        const isBuy = targetAmount < 0n;
-        const entry = swapsByAddress.get(recipient) ?? { buys: 0, sells: 0 };
-        if (isBuy) entry.buys++; else entry.sells++;
-        swapsByAddress.set(recipient, entry);
-      }
-    } catch (err) {
-      chunksFailed++;
-      warn(warnings, "tradeScan", `V4 chunk [${chunkStart}, ${chunkEnd}] failed`, err);
-      break; // Stop — don't burn requests on a failing connection
-    }
-  }
-
-  return buildTradeActivity(swapsByAddress, totalSwaps, chunksFailed > 0);
-}
-
-function buildTradeActivity(
-  swapsByAddress: Map<string, { buys: number; sells: number }>,
-  totalSwaps: number,
-  anyChunkFailed: boolean
-): TradeActivity {
-  const buyerAddresses  = new Set<string>();
-  const sellerAddresses = new Set<string>();
-  const roundTripTraders: string[] = [];
-  let buyCount = 0, sellCount = 0, maxSwapsForOne = 0;
-
-  for (const [addr, { buys, sells }] of swapsByAddress) {
-    buyCount  += buys;
-    sellCount += sells;
-    if (buys  > 0) buyerAddresses.add(addr);
-    if (sells > 0) sellerAddresses.add(addr);
-    if (buys  > 0 && sells > 0) roundTripTraders.push(addr);
-    maxSwapsForOne = Math.max(maxSwapsForOne, buys + sells);
-  }
-
+  warn(warnings, "tradeScan", "historical trade-activity scan removed", "real-time-only mode — trade history requires historical event data");
   return {
-    totalSwaps,
-    uniqueTraders: swapsByAddress.size,
-    buyCount,
-    sellCount,
-    buyerAddresses,
-    sellerAddresses,
-    roundTripTraders,
-    topTraderSwapShare: totalSwaps > 0 ? (maxSwapsForOne / totalSwaps) * 100 : 0,
-    scanPartial: anyChunkFailed,
+    totalSwaps: 0,
+    uniqueTraders: 0,
+    buyCount: 0,
+    sellCount: 0,
+    buyerAddresses: new Set(),
+    sellerAddresses: new Set(),
+    roundTripTraders: [],
+    topTraderSwapShare: 0,
+    scanPartial: true,
   };
 }
 
@@ -1698,8 +883,9 @@ export async function collectMinimalEvidence(
     warn(warnings, "proxy", "EIP-1967 slot read failed", err);
   }
 
-  // ── 4. Deployer (mint event scan) ─────────────────────────────────────────
-  const deployer = await findDeployer(client, tokenAddress, deployBlock, warnings);
+  // ── 4. Deployer (removed in real-time-only mode) ─────────────────────────
+  // Deployer identity is inherently historical — see findDeployer() above.
+  const deployer = { address: null, mintBlock: null, mintAmount: null, source: "unknown" };
 
   // ── 5. Pool liquidity + initial ETH value ─────────────────────────────────
   let poolLiquidityRaw: bigint | null = null;
@@ -1819,9 +1005,9 @@ export async function collectMinimalEvidence(
     ownershipRenounced,
     isProxy,
 
-    deployerAddress:        deployer.address,
-    deployerMintBlock:      deployer.mintBlock?.toString() ?? null,
-    deployerMintAmount:     deployer.mintAmount?.toString() ?? null,
+    deployerAddress:        null, // real-time-only mode: deployer identity requires historical data
+    deployerMintBlock:      null,
+    deployerMintAmount:     null,
     deployerCurrentBalance: null,
     deployerPct: null,
 
@@ -1898,14 +1084,14 @@ export async function collectMinimalEvidence(
  */
 
 /**
- * Lightweight re-check that only re-runs the two fields most likely to be
+ * Lightweight re-check that only re-runs the field most likely to be
  * wrong on a first-pass analysis run too close to pool creation:
  *
- *   1. LP lock status — was "unverified" because the Mint/ModifyLiquidity
- *      event hadn't landed yet.  Now re-scanned with a fresh block window.
+ *   Pool liquidity / initialLiquidityEth — was 0 / null because the
+ *   LP-add tx hadn't been mined yet at evidence-collection time.
  *
- *   2. Pool liquidity / initialLiquidityEth — was 0 / null because the
- *      LP-add tx hadn't been mined yet at evidence-collection time.
+ * LP lock status re-check removed (real-time-only mode: historical event
+ * scanning no longer supported).
  *
  * Everything else (holder scan, source check, trade activity, sell test) is
  * left untouched — those reads are expensive and their values don't change in
@@ -1933,28 +1119,7 @@ export async function reVerifyEvidence(
   const poolAddress = original.poolAddress as Address;
   const result: ReVerifyResult = { improved: false, warnings };
 
-  // ── 1. Re-check LP lock status if the first pass came back "unverified" ──
-  if (original.lpPositionStatus === "unverified") {
-    try {
-      const lpLock = await checkLpLockStatus(
-        client, poolAddress, deployBlock, warnings, venue
-      );
-      if (lpLock.lpPositionStatus !== "unverified") {
-        result.lpPositionStatus = lpLock.lpPositionStatus;
-        result.lpTokenId        = lpLock.lpTokenId;
-        result.lpPositionOwner  = lpLock.lpPositionOwner;
-        result.improved = true;
-        console.log(
-          `  [reverify] LP lock upgraded: unverified → ${lpLock.lpPositionStatus}` +
-          (lpLock.lpPositionOwner ? ` (owner: ${lpLock.lpPositionOwner})` : "")
-        );
-      } else {
-        console.log(`  [reverify] LP lock still unverified — no Mint/ModifyLiquidity found yet`);
-      }
-    } catch (err) {
-      warn(warnings, "reverify:lpLock", "LP lock re-check failed", err);
-    }
-  }
+  // LP lock status re-check removed (real-time-only mode)
 
   // ── 2. Re-check pool liquidity if the first pass read 0 or null ───────────
   const firstPassLiqZero =

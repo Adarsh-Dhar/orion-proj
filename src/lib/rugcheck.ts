@@ -66,8 +66,6 @@ export async function runRugCheckLLM(
     };
     /** Skip expensive checks for faster analysis */
     quickMode?: boolean;
-    /** Use efficient sniper-style analysis (recent blocks only) */
-    sniperMode?: boolean;
   }
 ): Promise<RugCheckResult> {
 

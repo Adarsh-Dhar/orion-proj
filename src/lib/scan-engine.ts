@@ -5,8 +5,8 @@
  *   shortAddr(addr)                        — "0x1234…abcd"
  *   formatFee(fee)                         — "0.30%"
  *   identifyTokens(t0, t1)                 — which token is new vs. quote asset
- *   findContractDeployBlock(client, addr)  — binary-search exact deploy block
- *   resolveTokenPool(client, tokenAddress) — find the Uniswap V3 pool for any token
+ *   findContractDeployBlock(client, addr)  — binary-search exact deploy block (kept for backward compatibility)
+ *   resolveTokenPool(client, tokenAddress) — find the Uniswap V3/V4 pool for any token
  *   scanBlockRange(client, from, to)       — fetch PoolCreated → rug-check → print report
  */
 
@@ -279,26 +279,14 @@ export async function resolveTokenPool(
   const v3Complete = Date.now();
   console.log(`[timing] V3 path completed in ${v3Complete - resolveStart}ms, starting V4 scan`);
 
-  // ── V4 path — scan Initialize events near the token's deploy block ──────
-  // Strategy:
-  //   1. Binary-search the token contract's deploy block (fast, ~26 RPC calls).
-  //   2. Scan deployBlock-10 → deployBlock+200 for a V4 Initialize event that
-  //      contains this token as currency0 or currency1.
-  //      On Base, pools are almost always initialized within a few blocks of
-  //      token deployment.  200 blocks ≈ 7 minutes — enough headroom.
-  //   3. If still not found, do one wider backward pass: deployBlock-500 → deployBlock-10
-  //      to catch tokens that were deployed long before their pool was created.
-  //
-  // Total worst-case: (210 + 490) / 10 = 70 getLogs calls vs the old 10,000.
+  // ── V4 path — scan Initialize events near the current block ──────────────
+  // Real-time only: no more binary-search deploy block lookup. Scan backward
+  // from the current block to find recent V4 Initialize events containing this
+  // token as currency0 or currency1.
   try {
-    const deployStart = Date.now();
-    console.log(`[timing] Starting V4 deploy block search`);
-    const deployBlock  = await findContractDeployBlock(client, tokenAddress);
-    const deployDuration = Date.now() - deployStart;
-    console.log(`[timing] Deploy block found: ${deployBlock} in ${deployDuration}ms`);
-    
     const currentBlock = await client.getBlockNumber();
     const CHUNK        = 10n;
+    const SCAN_BACK    = 1000n; // Scan back ~33 minutes (1000 blocks on Base)
 
     // Helper: scan a [from, to] range for a matching Initialize event
     const scanRange = async (from: bigint, to: bigint, rangeName: string): Promise<ResolvedPool | null> => {
@@ -345,20 +333,11 @@ export async function resolveTokenPool(
       return null;
     };
 
-    // Pass 1: forward scan from (deployBlock-10) to (deployBlock+200)
-    const forwardFrom = deployBlock > 10n ? deployBlock - 10n : 0n;
-    const forwardTo   = deployBlock + 200n;
-    const forwardHit  = await scanRange(forwardFrom, forwardTo, "forward");
-    if (forwardHit) return forwardHit;
-
-    // Pass 2: backward scan (deployBlock-500) to (deployBlock-11) for tokens
-    // whose pool was created well before or after deployment
-    if (deployBlock > 11n) {
-      const backwardFrom = deployBlock > 500n ? deployBlock - 500n : 0n;
-      const backwardTo   = deployBlock - 11n;
-      const backwardHit  = await scanRange(backwardFrom, backwardTo, "backward");
-      if (backwardHit) return backwardHit;
-    }
+    // Scan backward from current block to currentBlock - SCAN_BACK
+    const scanFrom = currentBlock > SCAN_BACK ? currentBlock - SCAN_BACK : 0n;
+    const scanTo   = currentBlock;
+    const scanHit  = await scanRange(scanFrom, scanTo, "backward");
+    if (scanHit) return scanHit;
   } catch (err) {
     console.log(`[timing] V4 scan failed: ${err instanceof Error ? err.message : String(err)}`);
     // V4 scan failed entirely — fall through to null

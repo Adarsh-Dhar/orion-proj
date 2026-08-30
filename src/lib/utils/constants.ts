@@ -177,21 +177,7 @@ export const EIP1967_IMPL_SLOT =
 /** null address — returned by owner() when ownership is renounced */
 export const NULL_ADDRESS = "0x0000000000000000000000000000000000000000" as const;
 
-// ─── Transfer event ABI (for dev wallet analysis) ────────────────────────────
-
-export const TRANSFER_EVENT_ABI = [
-  {
-    type: "event",
-    name: "Transfer",
-    inputs: [
-      { name: "from", type: "address", indexed: true },
-      { name: "to", type: "address", indexed: true },
-      { name: "value", type: "uint256", indexed: false },
-    ],
-  },
-] as const;
-
-/** Minimal ERC-20 ABI — only the four metadata reads we need */
+/** Minimal ERC-20 ABI — only the metadata + balance reads we need */
 export const ERC20_ABI = [
   {
     type: "function",
@@ -230,12 +216,8 @@ export const ERC20_ABI = [
   },
 ] as const;
 
-// ── New: LP / honeypot / source-check constants ────────────────────────────
+// ── Burn address (used in sell test holder filtering) ────────────────────────
 
-export const UNISWAP_V3_POSITION_MANAGER =
-  "0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1" as const;
-export const UNCX_V3_LOCKER =
-  "0x231278eDd38B00B07fBd52120CEf685B9BaEBCC1" as const;
 export const BURN_ADDRESS =
   "0x000000000000000000000000000000000000dEaD" as const;
 
@@ -289,104 +271,6 @@ export const V4_QUOTER_EXACT_INPUT_SINGLE_ABI = [{
 }] as const;
 
 export const ETHERSCAN_API_BASE = "https://api.etherscan.io/v2/api";
-
-/** keccak256("Transfer(address,address,uint256)") — topic0 for every ERC-20
- *  Transfer log. Used to query Etherscan's log-indexing API directly instead
- *  of raw eth_getLogs, which is subject to RPC-provider block-range caps
- *  (e.g. Alchemy free tier: 10 blocks on Base). */
-export const ERC20_TRANSFER_TOPIC0 =
-  "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef" as const;
-
-export const POOL_MINT_EVENT_ABI = [{
-  type: "event",
-  name: "Mint",
-  inputs: [
-    { name: "sender", type: "address", indexed: false },
-    { name: "owner", type: "address", indexed: true },
-    { name: "tickLower", type: "int24", indexed: true },
-    { name: "tickUpper", type: "int24", indexed: true },
-    { name: "amount", type: "uint128", indexed: false },
-    { name: "amount0", type: "uint256", indexed: false },
-    { name: "amount1", type: "uint256", indexed: false },
-  ],
-}] as const;
-
-export const POOL_BURN_EVENT_ABI = [{
-  type: "event",
-  name: "Burn",
-  inputs: [
-    { name: "owner", type: "address", indexed: true },
-    { name: "tickLower", type: "int24", indexed: true },
-    { name: "tickUpper", type: "int24", indexed: true },
-    { name: "amount", type: "uint128", indexed: false },
-    { name: "amount0", type: "uint256", indexed: false },
-    { name: "amount1", type: "uint256", indexed: false },
-  ],
-}] as const;
-
-export const POOL_SWAP_EVENT_ABI = [{
-  type: "event",
-  name: "Swap",
-  inputs: [
-    { name: "sender", type: "address", indexed: true },
-    { name: "recipient", type: "address", indexed: true },
-    { name: "amount0", type: "int256", indexed: false },
-    { name: "amount1", type: "int256", indexed: false },
-    { name: "sqrtPriceX96", type: "uint160", indexed: false },
-    { name: "liquidity", type: "uint128", indexed: false },
-    { name: "tick", type: "int24", indexed: false },
-  ],
-}] as const;
-
-/** V4 Swap event ABI (emitted on PoolManager, filtered by PoolId) */
-export const V4_SWAP_EVENT_ABI = [{
-  type: "event",
-  name: "Swap",
-  inputs: [
-    { name: "id", type: "bytes32", indexed: true },
-    { name: "sender", type: "address", indexed: true },
-    { name: "recipient", type: "address", indexed: true },
-    { name: "amount0", type: "int256", indexed: false },
-    { name: "amount1", type: "int256", indexed: false },
-    { name: "sqrtPriceX96", type: "uint160", indexed: false },
-    { name: "liquidity", type: "uint128", indexed: false },
-    { name: "tick", type: "int24", indexed: false },
-  ],
-}] as const;
-
-/** V4 ModifyLiquidity event ABI (emitted on PoolManager, filtered by PoolId) */
-export const V4_MODIFY_LIQUIDITY_EVENT_ABI = [{
-  type: "event",
-  name: "ModifyLiquidity",
-  inputs: [
-    { name: "id", type: "bytes32", indexed: true },
-    { name: "sender", type: "address", indexed: true },
-    { name: "tickLower", type: "int24", indexed: true },
-    { name: "tickUpper", type: "int24", indexed: true },
-    { name: "liquidityDelta", type: "int128", indexed: false },
-    { name: "amount0", type: "uint256", indexed: false },
-    { name: "amount1", type: "uint256", indexed: false },
-  ],
-}] as const;
-
-export const NPM_INCREASE_LIQUIDITY_EVENT_ABI = [{
-  type: "event",
-  name: "IncreaseLiquidity",
-  inputs: [
-    { name: "tokenId", type: "uint256", indexed: true },
-    { name: "liquidity", type: "uint128", indexed: false },
-    { name: "amount0", type: "uint256", indexed: false },
-    { name: "amount1", type: "uint256", indexed: false },
-  ],
-}] as const;
-
-export const NPM_OWNER_OF_ABI = [{
-  type: "function",
-  name: "ownerOf",
-  stateMutability: "view",
-  inputs: [{ name: "tokenId", type: "uint256" }],
-  outputs: [{ name: "", type: "address" }],
-}] as const;
 
 export const ERC20_TRANSFER_ABI = [{
   type: "function",

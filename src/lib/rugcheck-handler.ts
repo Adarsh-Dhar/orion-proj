@@ -2,8 +2,12 @@
  * rugcheck-handler.ts — shared pipeline used by both chat.ts and the
  * Telegram bot's message handler.
  *
- * Extracts the 5-step token-analysis flow that previously lived inline in
+ * Extracts the 4-step token-analysis flow that previously lived inline in
  * chat.ts so it can be called from anywhere without copy-pasting.
+ *
+ * Real-time only: there is no more historical-deploy-block / historical-log
+ * variant. Every caller (chat, inline, sniper) gets the same current-block
+ * evidence anchor. See the doc comment on answerTokenQuestion() below.
  *
  * Exports:
  *   extractAddress(text)                         — pull first 0x address from string
@@ -13,7 +17,7 @@
 
 import { type Address, type PublicClient } from "viem";
 import { fetchTokenMetadata }                from "./erc20.js";
-import { resolveTokenPool, findContractDeployBlock } from "./scan-engine.js";
+import { resolveTokenPool }                  from "./scan-engine.js";
 import { runRugCheckLLM }                    from "./rugcheck.js";
 import type { RugCheckResult }               from "./rugcheck-types.js";
 import type { HandlerSuccess, HandlerError, HandlerOutcome, TokenMeta } from "./utils/interface.js";
@@ -34,14 +38,26 @@ export function stripAddress(text: string, address: Address): string {
   return text.replace(address, "").trim();
 }
 
-// ─── Main pipeline ────────────────────────────────────────────────────────────// ─── Main pipeline ────────────────────────────────────────────────────────────
+// ─── Main pipeline ────────────────────────────────────────────────────────────
 
 /**
- * Full 5-step rug-check pipeline:
- *   1. Resolve Uniswap V3 pool for the token
+ * Full 4-step rug-check pipeline — real-time only:
+ *   1. Resolve Uniswap V3/V4 pool for the token
  *   2. Fetch ERC-20 metadata (name, symbol, supply)
- *   3. Binary-search the exact deploy block
+ *   3. Use the current block as the evidence-collection anchor
  *   4. Run LLM rug check (optionally answering userQuestion, in alert or chat mode)
+ *
+ * This used to binary-search the token's exact historical deploy block
+ * (~26 RPC calls) and then have evidence.ts scan Etherscan logs all the way
+ * back to it. That historical-log path is now removed: Base is on
+ * Etherscan's free tier, which blocks the `logs` module entirely
+ * ("Free API access is not supported for this chain"), so wide historical
+ * scans just failed and returned empty evidence anyway. Every query — chat,
+ * inline, and the sniper — now uses the same real-time approach: anchor on
+ * the current block and let evidence.ts pull whatever is reachable from
+ * there (current owner/balances/LP state, etc.) via live reads instead of
+ * historical log reconstruction. The report format is unchanged — it's the
+ * same formatRugReport() output either way.
  *
  * Returns either { result, meta } on success or { error } on failure so
  * callers can pattern-match without try/catch.
@@ -52,8 +68,7 @@ export async function answerTokenQuestion(
   userQuestion?: string,
   mode: "alert" | "chat" = "chat",
   onProgress?: (step: string, message: string) => void,
-  quickMode?: boolean,
-  sniperMode?: boolean
+  quickMode?: boolean
 ): Promise<HandlerOutcome> {
   console.log(`[rugcheck-handler] Starting analysis for ${tokenAddress} in ${mode} mode`);
   const startTime = Date.now();
@@ -107,37 +122,34 @@ export async function answerTokenQuestion(
     return { error: `Metadata fetch failed: ${msg}` };
   }
 
-  // ── 3. Deploy block ─────────────────────────────────────────────────────
-  console.log(`[rugcheck-handler] Step 3/4: Finding deploy block...`);
-  onProgress?.("deploy", "Searching for token deployment block...");
+  // ── 3. Evidence anchor block (real-time — no historical binary search) ───
+  console.log(`[rugcheck-handler] Step 3/4: Using current block as evidence anchor...`);
+  onProgress?.("deploy", "Reading current chain state...");
   let deployBlock: bigint;
   try {
-    if (sniperMode) {
-      // In sniper mode, skip the expensive binary-search deploy block lookup.
-      // Use getBlockNumber() with a short independent timeout. If the RPC is
-      // temporarily overloaded, fall back to 0n — evidence collection handles
-      // that gracefully by scanning from the current block anyway.
-      try {
-        deployBlock = await Promise.race([
-          client.getBlockNumber(),
-          new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error("getBlockNumber timeout")), 8_000)
-          ),
-        ]);
-        console.log(`[rugcheck-handler] Step 3/4: Using current block ${deployBlock} (sniper mode)`);
-      } catch {
-        deployBlock = 0n;
-        console.warn(`[rugcheck-handler] Step 3/4: getBlockNumber timed out — using block 0 (sniper mode)`);
-      }
-    } else {
-      deployBlock = await findContractDeployBlock(client, tokenAddress);
-      console.log(`[rugcheck-handler] Step 3/4: Deploy block found in ${Date.now() - startTime}ms`);
+    // Always the current block now — no more binary-searching the token's
+    // real historical deploy block. That search only mattered because
+    // evidence.ts used it as the start of a wide historical log scan, and
+    // that scan is gone (see the doc comment above). Falls back to 0n if the
+    // RPC stalls; evidence collection handles that the same way it always
+    // did for sniper-path tokens.
+    try {
+      deployBlock = await Promise.race([
+        client.getBlockNumber(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("getBlockNumber timeout")), 8_000)
+        ),
+      ]);
+      console.log(`[rugcheck-handler] Step 3/4: Using current block ${deployBlock}`);
+    } catch {
+      deployBlock = 0n;
+      console.warn(`[rugcheck-handler] Step 3/4: getBlockNumber timed out — using block 0`);
     }
-    onProgress?.("deploy_done", "Deploy block found successfully");
+    onProgress?.("deploy_done", "Chain state read successfully");
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[rugcheck-handler] Step 3/4 failed:`, err);
-    return { error: `Couldn't find deploy block — the RPC may be rate-limited. Try again in a moment. (${msg})` };
+    return { error: `Couldn't read current block — the RPC may be rate-limited. Try again in a moment. (${msg})` };
   }
 
   // ── 4. LLM rug check ────────────────────────────────────────────────────
@@ -151,7 +163,7 @@ export async function answerTokenQuestion(
       resolved.pairedLabel,
       deployBlock,
       meta,
-      { userQuestion, mode, venue: resolved.venue, quickMode, sniperMode }
+      { userQuestion, mode, venue: resolved.venue, quickMode }
     );
     console.log(`[rugcheck-handler] Step 4/4: LLM check completed in ${Date.now() - startTime}ms`);
     console.log(`[rugcheck-handler] Total analysis time: ${Date.now() - startTime}ms`);

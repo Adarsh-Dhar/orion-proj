@@ -42,9 +42,9 @@ async function sendFullReport(
   let outcome: Awaited<ReturnType<typeof answerTokenQuestion>>;
   try {
     outcome = await Promise.race([
-      // isSniperMode=false so we do a real deploy-block binary search instead
-      // of using the current block, which would be wrong for non-fresh tokens.
-      answerTokenQuestion(client, address as `0x${string}`, undefined, "chat", onProgress, false, false),
+      // Real-time only — see rugcheck-handler.ts. No more deploy-block
+      // binary search; evidence is anchored on the current block.
+      answerTokenQuestion(client, address as `0x${string}`, undefined, "chat", onProgress, false),
       new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("Analysis timed out after 15 minutes")), TIMEOUT_MS)
       ),
@@ -140,13 +140,6 @@ export function registerChatHandler(bot: Bot<any>, client: AnyClient): void {
     // Check if user wants quick mode (skip expensive checks)
     const isQuickMode = text.toLowerCase().includes("quick") || text.toLowerCase().includes("fast");
 
-    // Never use sniper mode for manual chat queries — sniper mode sets the
-    // deploy block to the current block, which is wrong for tokens that were
-    // deployed earlier. Chat queries need the real deploy block so evidence
-    // collection scans the right range. Quick mode is still available for
-    // users who want to skip the expensive binary-search deploy block lookup.
-    const isSniperMode = false;
-
     await ctx.api.sendMessage(chatId, "Running on-chain rug check…");
     console.log(`[chat-handler] Starting analysis for ${address}`);
 
@@ -197,8 +190,7 @@ export function registerChatHandler(bot: Bot<any>, client: AnyClient): void {
           question.length > 0 ? question : undefined,
           "chat",
           onProgress,
-          isQuickMode,
-          isSniperMode
+          isQuickMode
         ),
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error("Analysis timed out after 15 minutes")), TIMEOUT_MS)

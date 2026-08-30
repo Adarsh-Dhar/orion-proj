@@ -115,6 +115,12 @@ interface CriticVerdict {
   reason: string;
 }
 
+export interface GroundingResult {
+  ok: boolean;
+  groundedFlags: RiskFlag[];
+  dropped: Array<{ id: string; reason: string }>;
+}
+
 function buildCriticMessages(flags: RiskFlag[]): Message[] {
   return [
     { role: "user", parts: [{ text: CRITIC_SYSTEM_PROMPT }] },
@@ -161,18 +167,20 @@ function dispatchCriticTool(
 /**
  * Ask a critic LLM to verify that each flag is actually grounded in the
  * evidence/transcript, by having it look the data up via tools rather than
- * trusting a text dump. Returns true only if every non-trivial flag
- * (points > 0) is judged grounded.
+ * trusting a text dump. Returns a filtered list of grounded flags instead of
+ * a simple pass/fail boolean — only the flags the critic rejects are dropped,
+ * and only a critic-level failure (network, bad JSON, budget exhausted) returns
+ * ok: false.
  *
  * Fails closed: if the critic call itself errors out (network, bad JSON,
- * budget exhausted), this returns false rather than silently passing.
+ * budget exhausted), this returns ok: false rather than silently passing.
  */
 export async function validateGrounding(
   flags: RiskFlag[],
   transcript: ToolCallRecord[],
   evidence: TokenEvidence
-): Promise<boolean> {
-  if (flags.length === 0) return true;
+): Promise<GroundingResult> {
+  if (flags.length === 0) return { ok: true, groundedFlags: flags, dropped: [] };
 
   const messages = buildCriticMessages(flags);
 
@@ -191,8 +199,8 @@ export async function validateGrounding(
         const responseParts = response.toolCalls.map(call => {
           const toolResult = dispatchCriticTool(call.name, call.args, evidence, transcript);
           // Ensure response is always a structured object, never a raw string
-          const response = typeof toolResult === 'string' 
-            ? { error: toolResult } 
+          const response = typeof toolResult === 'string'
+            ? { error: toolResult }
             : toolResult;
           return {
             functionResponse: {
@@ -213,26 +221,36 @@ export async function validateGrounding(
 
       if (!Array.isArray(parsed.verdicts)) {
         console.warn("[grounding] critic returned malformed verdict shape");
-        return false;
+        return { ok: false, groundedFlags: [], dropped: [] };
       }
 
       const byId = new Map(parsed.verdicts.map(v => [v.id, v]));
+      const groundedFlags: RiskFlag[] = [];
+      const dropped: Array<{ id: string; reason: string }> = [];
+
       for (const flag of flags) {
-        if (flag.points <= 0) continue; // informational flags don't need grounding
+        if (flag.points <= 0) {
+          // Informational flags don't need grounding — auto-accept
+          groundedFlags.push(flag);
+          continue;
+        }
         const verdict = byId.get(flag.id);
         if (!verdict || !verdict.grounded) {
+          dropped.push({ id: flag.id, reason: verdict?.reason ?? "no verdict returned" });
           console.warn(`[grounding] flag "${flag.id}" failed critic review: ${verdict?.reason ?? "no verdict returned"}`);
-          return false;
+        } else {
+          groundedFlags.push(flag);
         }
       }
-      return true;
+
+      return { ok: true, groundedFlags, dropped };
     }
 
     console.warn("[grounding] critic exceeded max iterations without a final verdict");
-    return false;
+    return { ok: false, groundedFlags: [], dropped: [] };
   } catch (err) {
     console.warn(`[grounding] critic call failed: ${err instanceof Error ? err.message : String(err)}`);
-    return false;
+    return { ok: false, groundedFlags: [], dropped: [] };
   }
 }
 

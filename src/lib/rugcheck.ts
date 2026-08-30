@@ -376,6 +376,10 @@ export async function runRugCheckLLM(
 const VERDICT_EMOJI:  Record<VerdictLevel, string> = { LOW: "🟢", MEDIUM: "🟡", HIGH: "🟠", CRITICAL: "🔴", UNKNOWN: "⚪", INSUFFICIENT: "⚪" };
 const SEVERITY_EMOJI: Record<RiskLevel, string> = { LOW: "🟢", MEDIUM: "🟡", HIGH: "🟠", CRITICAL: "🔴" };
 
+function formatScore(score: number): string {
+  return score < 0 ? "N/A" : `${score.toFixed(2)}/100`;
+}
+
 export function formatRugReport(
   r: RugCheckResult,
   meta: { name: string; symbol: string; totalSupplyFormatted: string }
@@ -467,7 +471,7 @@ export function formatRugReport(
   }
   lines.push(`║`);
   lines.push(`║  ── Verdict ─────────────────────────────────────────────────`);
-  lines.push(`║  Score    : ${r.score.toFixed(2)}/100`);
+  lines.push(`║  Score    : ${formatScore(r.score)}`);
   lines.push(`║  Verdict  : ${v} ${r.verdict}`);
   lines.push(`║  Summary  : ${r.summary}`);
   
@@ -507,7 +511,7 @@ export function formatAlertCard(
   const lines: string[] = [];
 
   const venueTag = r.venue === "v4" ? " · V4" : " · V3";
-  lines.push(`${v} ${r.verdict} — ${meta.name} ($${meta.symbol})  ·  ${r.score.toFixed(2)}/100${venueTag}`);
+  lines.push(`${v} ${r.verdict} — ${meta.name} ($${meta.symbol})  ·  ${formatScore(r.score)}${venueTag}`);
   lines.push(r.summary);
 
   const last = r.decisionTrace?.[r.decisionTrace.length - 1];
@@ -553,7 +557,7 @@ export function formatChatReply(
   }
 
   const venueTag = r.venue === "v4" ? " · V4" : " · V3";
-  lines.push(`${v} ${r.verdict}  ·  ${r.score.toFixed(2)}/100  ·  ${meta.name} ($${meta.symbol})${venueTag}`);
+  lines.push(`${v} ${r.verdict}  ·  ${formatScore(r.score)}  ·  ${meta.name} ($${meta.symbol})${venueTag}`);
 
   const topFlags = [...r.flags].sort((a, b) => b.points - a.points).slice(0, 3);
   if (topFlags.length > 0) {

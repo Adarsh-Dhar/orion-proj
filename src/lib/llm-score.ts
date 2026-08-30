@@ -319,6 +319,11 @@ export async function scoreWithLLM(
     };
   }
 
+  // Normalize INSUFFICIENT verdict to use -1 score sentinel, matching orchestrator behavior
+  if (validated.verdict === "INSUFFICIENT") {
+    return { ...validated, score: -1, rawModelText };
+  }
+
   return { ...validated, rawModelText };
 }
 

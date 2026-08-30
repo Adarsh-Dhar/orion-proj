@@ -20,7 +20,7 @@ import type { ToolContext } from "../utils/interface.js";
 import type { LLMScoreResult, RiskFlag, ToolCallRecord } from "../rugcheck-types.js";
 import type { SpecialistAgent, SpecialistResult } from "./types.js";
 import { computeScore } from "../scoring.js";
-import { validateGrounding, withHardCap, HARD_CAP_MS } from "./grounding.js";
+import { validateGrounding, withHardCap, HARD_CAP_MS, type GroundingResult } from "./grounding.js";
 import {
   sourceOwnerAgent,
   deployerReputationAgent,
@@ -122,13 +122,18 @@ export async function runOrchestrator(
       transcript,
     };
   }
-  const groundingOk = groundingOutcome;
-  if (!groundingOk) {
+  if (!groundingOutcome.ok) {
     return {
-      result: { ok: false, reason: "A specialist returned flags not grounded in a tool call it actually made" },
+      result: { ok: false, reason: "Grounding critic failed to produce a verdict for this scan" },
       transcript,
     };
   }
+  if (groundingOutcome.dropped.length > 0) {
+    console.warn(`[orchestrator] dropped ${groundingOutcome.dropped.length} ungrounded flag(s): ${groundingOutcome.dropped.map(d => `${d.id} (${d.reason})`).join(", ")}`);
+  }
+  // Replace flags with the filtered, grounded list
+  flags.length = 0;
+  flags.push(...groundingOutcome.groundedFlags);
 
   const calledTools = new Set(transcript.map((t) => t.name));
   const unresolvedMandatory = Object.entries(MANDATORY_TOOL_OWNERS)
@@ -140,7 +145,9 @@ export async function runOrchestrator(
   // engine, not from any specialist's own math — same principle rugcheck.ts
   // already applies when it overrides the LLM's score after this returns.
   const computed = computeScore(evidence);
-  const verdict = unresolvedMandatory.length > 0 ? "INSUFFICIENT" : computed.verdict;
+  const insufficient = unresolvedMandatory.length > 0;
+  const verdict = insufficient ? "INSUFFICIENT" : computed.verdict;
+  const score = insufficient ? -1 : computed.score;   // -1 = existing "no score" sentinel
 
   const summary =
     flags.length > 0
@@ -149,7 +156,7 @@ export async function runOrchestrator(
 
   const result: LLMScoreResult = {
     ok: true,
-    score: computed.score,
+    score,
     verdict,
     flags,
     summary,

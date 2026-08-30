@@ -304,7 +304,8 @@ export async function analyzeSourceWithLLM(
     rawModelText = await callGeminiText(
       RUBRIC_SYSTEM_PROMPT,
       "Understood. I will reason through steps 1–4 for every function before giving a verdict, and return only valid JSON in the specified shape.",
-      userMessage
+      userMessage,
+      "source-audit"
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

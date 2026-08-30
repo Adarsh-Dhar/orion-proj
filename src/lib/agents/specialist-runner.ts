@@ -19,6 +19,7 @@ import {
   stripJsonFences,
   GEMINI_API_KEY,
   type Message,
+  type AgentKey,
 } from "../gemini-client.js";
 
 const VALID_SEVERITIES = new Set(["LOW", "MEDIUM", "HIGH", "CRITICAL"]);
@@ -113,7 +114,14 @@ export async function runSpecialistToolLoop(opts: RunSpecialistOpts): Promise<Sp
     try {
       response = await callGeminiWithTools(
         messages as unknown as Array<{ role: string; parts: Array<Record<string, unknown>> }>,
-        tools
+        tools,
+        // Every specialist's `name` is one of the AgentKey pool keys in
+        // gemini-client.ts's MODEL_POOLS (source-owner-agent,
+        // deployer-reputation-agent, holder-distribution-agent,
+        // lp-honeypot-agent, trading-activity-agent) — reusing it here
+        // means each specialist automatically gets its assigned pool
+        // without a second place to keep the mapping in sync.
+        name as AgentKey
       );
     } catch (err) {
       warnings.push(`[${name}] ${err instanceof Error ? err.message : String(err)}`);

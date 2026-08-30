@@ -145,7 +145,8 @@ export async function validateGrounding(
     for (let i = 0; i < CRITIC_MAX_ITERATIONS; i++) {
       const response = await callGeminiWithTools(
         messages as unknown as Array<{ role: string; parts: Array<Record<string, unknown>> }>,
-        CRITIC_TOOLS
+        CRITIC_TOOLS,
+        undefined // The critic uses the global fallback pool, not a specialist-specific pool
       );
 
       if (response.type === "tool_calls") {

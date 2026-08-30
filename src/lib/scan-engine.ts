@@ -18,7 +18,7 @@ import {
   V4_INITIALIZE_ABI,
   type Venue,
 } from "./utils/constants.js";
-import { isKnownQuoteAsset, getQuoteAssetLabel, CORE_QUOTE_ASSETS } from "./quote-assets.js";
+import { isKnownQuoteAsset, getQuoteAssetLabel, getCoreQuoteAssets } from "./quote-assets.js";
 import { fetchTokenMetadata } from "./erc20.js";
 import { runRugCheckLLM, formatRugReport } from "./rugcheck.js";
 import { reVerifyEvidence } from "./evidence.js";
@@ -164,7 +164,7 @@ export async function resolveTokenPool(
   tokenAddress: Address
 ): Promise<ResolvedPool | null> {
   // ── V3 path ──────────────────────────────────────────────────────────────
-  for (const quote of CORE_QUOTE_ASSETS) {
+  for (const quote of getCoreQuoteAssets()) {
     for (const fee of FEE_TIERS) {
       try {
         const pool = await client.readContract({

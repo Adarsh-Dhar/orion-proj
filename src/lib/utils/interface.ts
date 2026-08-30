@@ -24,7 +24,6 @@ export interface ToolContext {
   tokenAddress: Address;
   poolAddress: Address;
   deployBlock: bigint;
-  state?: BotState;
   // Cached values from initial evidence collection
   ownershipRenounced: boolean | null;
   ownerAddress: string | null;
@@ -81,19 +80,6 @@ export interface WatchlistEntry {
   firstPostedTimestamp: number;
 }
 
-export interface BotState {
-  /** Lower-cased token addresses already auto-posted. */
-  postedTokens: string[];
-  /** Deployer history: maps lower-cased deployer address to array of token addresses they've deployed. */
-  deployerHistory: Record<string, string[]>;
-  /** Liquidity history: maps lower-cased pool address to array of snapshots. */
-  liquidityHistory: Record<string, LiquiditySnapshot[]>;
-  /** Watchlist: tokens to monitor for liquidity drops after initial posting. */
-  watchlist: Record<string, WatchlistEntry>; // key: token address (lowercased)
-  /** Last scanned block watermark (persisted to avoid re-scanning on restart) */
-  lastScannedBlock: string | null;
-}
-
 export interface ComputedScore {
   score: number;         // 0–100, 2 decimal places
   verdict: RiskLevel;
@@ -128,7 +114,7 @@ export interface ScanOptions {
    * Called before evidence collection to check if a token should be skipped.
    * Return true to skip this token (e.g., already posted).
    */
-  shouldSkip?: (tokenAddress: string, poolAddress: string, pairedAsset: string) => boolean;
+  shouldSkip?: (tokenAddress: string, poolAddress: string, pairedAsset: string) => Promise<boolean>;
   /**
    * Called once per token immediately after the rug-check report is printed.
    * Errors thrown here are caught and logged — they never abort the scan loop.
@@ -137,10 +123,6 @@ export interface ScanOptions {
     name: string; symbol: string; decimals: number;
     totalSupply: bigint; totalSupplyFormatted: string;
   }) => Promise<void>;
-  /**
-   * Bot state for persistent storage (e.g., deployer history).
-   */
-  state?: BotState;
 }
 
 export interface TokenIdentity {

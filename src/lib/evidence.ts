@@ -29,8 +29,8 @@
 
 import { type Address, formatEther, encodeFunctionData, parseEventLogs } from "viem";
 import type { PublicClient } from "viem";
-import type { BotState, LiquiditySnapshot } from "./state.js";
-import { recordLiquiditySnapshot, saveState } from "./state.js";
+import type { LiquiditySnapshot } from "./state.js";
+import { getLiquidityHistory } from "./state.js";
 import {
   OWNER_ABI,
   NULL_ADDRESS,
@@ -439,7 +439,6 @@ export async function scanHolderBalances(
 export async function checkLiquidityDelta(
   client: AnyClient,
   poolIdOrAddress: Address,
-  state: BotState,
   venue: Venue = "v3"
 ): Promise<{
   liquidityDeltaPct: number | null;
@@ -447,7 +446,7 @@ export async function checkLiquidityDelta(
   snapshotAgeMinutes: number | null;
   currentSnapshot: LiquiditySnapshot;
 }> {
-  const history = state.liquidityHistory[poolIdOrAddress.toLowerCase()] ?? [];
+  const history = await getLiquidityHistory(poolIdOrAddress);
   const prev = history[history.length - 1];
 
   let current: bigint;
@@ -474,7 +473,8 @@ export async function checkLiquidityDelta(
     ts: Date.now(),
   };
 
-  // Don't save state here — let the caller batch-save to avoid excessive writes
+  // Caller is responsible for persisting the returned currentSnapshot via
+  // recordLiquiditySnapshot() — we only read history here.
   if (!prev) {
     return { liquidityDeltaPct: null, liquidityPreviousReading: null, snapshotAgeMinutes: null, currentSnapshot: snap };
   }

@@ -62,8 +62,9 @@ const MAX_SNIPPET_LINES = 40;
 // re-deploy of the same template burns a fresh Gemini call for a verdict
 // we've already computed. This is an in-memory, per-process cache — it does
 // NOT survive a restart. If you need cross-restart persistence, the natural
-// place to move this is BotState (state.ts, same pattern as deployerHistory)
-// or the Upstash-backed analysis-store.ts, keyed the same way.
+// place to move this is state.ts (same pattern as deployer history — one
+// Redis key per cache entry) or the Upstash-backed analysis-store.ts, keyed
+// the same way.
 //
 // Cache key includes ownershipRenounced + ownerAddress alongside a hash of
 // the source, because those two inputs can change the secondaryAdminCandidate

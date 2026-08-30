@@ -1,43 +1,51 @@
 /**
  * state.ts — Redis-backed persistence for the Telegram bot.
  *
- * Tracks postedTokens so a token discovered in overlapping scan windows
- * is never posted twice, and survives bot restarts.
+ * Tracks posted tokens (so a token discovered in overlapping scan windows
+ * is never posted twice), deployer history, liquidity snapshots, and the
+ * watchlist — all backed by the same Upstash Redis instance already used by
+ * analysis-store.ts (via UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN).
  *
- * Previously this persisted to a local `bot-state.json` file on disk.
- * It now persists to the same Upstash Redis instance already used by
- * analysis-store.ts (via UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN),
- * under a single key so bot state survives restarts and works across
- * multiple/ephemeral hosts (e.g. serverless or container redeploys where
- * local disk isn't persisted).
+ * Each concern gets its own native Redis structure rather than one big JSON
+ * blob read/written on every change:
+ *   - posted tokens      → Set                    (posted:tokens)
+ *   - deployer history    → one Set per deployer   (deployer:<address>)
+ *   - liquidity snapshots → one capped List per pool (liquidity:<pool>)
+ *   - watchlist entries    → one String per token, with a TTL that replaces
+ *                           the old manual age-filtering (watchlist:<token>)
+ *   - last scanned block   → single String          (last-scanned-block)
+ *
+ * Every function that touches Redis is async — callers must await them.
  */
 
 import { Redis } from "@upstash/redis";
 import type { Venue } from "./utils/constants.js";
-import type { BotState, LiquiditySnapshot, WatchlistEntry } from "./utils/interface.js";
+import type { LiquiditySnapshot, WatchlistEntry } from "./utils/interface.js";
 
 // Re-export types for other modules
-export type { BotState, LiquiditySnapshot, WatchlistEntry };
+export type { LiquiditySnapshot, WatchlistEntry };
 
 // ─── Redis client ────────────────────────────────────────────────────────────
-
-const STATE_KEY = "bot:state";
 
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 
 let redisClient: Redis | null = null;
+let warnedMissingCreds = false;
 
 /**
  * Initialize the Upstash Redis client if credentials are available.
  * Returns null if credentials are missing (graceful degradation — the bot
- * still runs, but state will not survive a restart).
+ * still runs, but nothing persists across restarts).
  */
 function getRedisClient(): Redis | null {
   if (redisClient) return redisClient;
 
   if (!UPSTASH_URL || !UPSTASH_TOKEN) {
-    console.warn("[state] Upstash credentials not set — bot state will not persist across restarts");
+    if (!warnedMissingCreds) {
+      console.warn("[state] Upstash credentials not set — bot state will not persist across restarts");
+      warnedMissingCreds = true;
+    }
     return null;
   }
 
@@ -53,119 +61,183 @@ function getRedisClient(): Redis | null {
   }
 }
 
-function emptyState(): BotState {
-  return { postedTokens: [], deployerHistory: {}, liquidityHistory: {}, watchlist: {}, lastScannedBlock: null };
-}
+// ─── Keys ─────────────────────────────────────────────────────────────────────
 
-// ─── Load / save ──────────────────────────────────────────────────────────────
+const POSTED_TOKENS_KEY = "posted:tokens";
+const LAST_SCANNED_BLOCK_KEY = "last-scanned-block";
+const deployerKey = (address: string) => `deployer:${address.toLowerCase()}`;
+const liquidityKey = (poolAddress: string) => `liquidity:${poolAddress.toLowerCase()}`;
+const watchlistKey = (tokenAddress: string) => `watchlist:${tokenAddress.toLowerCase()}`;
 
-export async function loadState(): Promise<BotState> {
+/** Max liquidity snapshots kept per pool — mirrors the old array cap. */
+const MAX_LIQUIDITY_SNAPSHOTS = 5;
+
+/** Default TTL for watchlist entries — matches the old default max-age (2h). */
+const DEFAULT_WATCHLIST_TTL_MINUTES = 120;
+
+// ─── Posted tokens ─────────────────────────────────────────────────────────────
+
+export async function alreadyPosted(tokenAddress: string): Promise<boolean> {
   const client = getRedisClient();
-  if (!client) return emptyState();
+  if (!client) return false;
 
   try {
-    const data = await client.get(STATE_KEY);
-    if (!data) return emptyState();
-
-    // Upstash auto-deserializes plain objects; fall back to JSON.parse in
-    // case a value was ever written as a raw JSON string.
-    const parsed = (typeof data === "string" ? JSON.parse(data) : data) as Partial<BotState>;
-    const watchlist = parsed.watchlist ?? {};
-    // Backwards compatibility: add default venue for existing watchlist entries
-    for (const key in watchlist) {
-      if (!watchlist[key].venue) {
-        watchlist[key].venue = "v3"; // existing entries are V3
-      }
-    }
-    return {
-      postedTokens: parsed.postedTokens ?? [],
-      deployerHistory: parsed.deployerHistory ?? {},
-      liquidityHistory: parsed.liquidityHistory ?? {},
-      watchlist,
-      lastScannedBlock: parsed.lastScannedBlock ?? null
-    };
+    const result = await client.sismember(POSTED_TOKENS_KEY, tokenAddress.toLowerCase());
+    return result === 1;
   } catch (err) {
-    console.warn(`[state] Could not load state from Redis, starting fresh: ${err}`);
-    return emptyState();
+    console.error(`[state] alreadyPosted failed for ${tokenAddress}:`, err);
+    return false;
   }
 }
 
-/**
- * Persist state to Redis.
- *
- * Fire-and-forget by design (same call-site contract as the old synchronous
- * writeFileSync): callers scattered throughout the bot call `saveState()` 
- * without awaiting it. The write happens asynchronously in the background;
- * failures are logged, not thrown. If a caller needs a durability guarantee
- * before proceeding, use `saveStateAsync()` instead and await it.
- */
-export function saveState(s: BotState): void {
-  void saveStateAsync(s);
-}
-
-export async function saveStateAsync(s: BotState): Promise<void> {
+export async function markPosted(tokenAddress: string): Promise<void> {
   const client = getRedisClient();
   if (!client) return;
 
   try {
-    await client.set(STATE_KEY, s);
+    await client.sadd(POSTED_TOKENS_KEY, tokenAddress.toLowerCase());
   } catch (err) {
-    console.error(`[state] Failed to persist state to Redis: ${err}`);
+    console.error(`[state] markPosted failed for ${tokenAddress}:`, err);
   }
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Deployer history ───────────────────────────────────────────────────────────
 
-export function alreadyPosted(state: BotState, tokenAddress: string): boolean {
-  return state.postedTokens.includes(tokenAddress.toLowerCase());
-}
+export async function getDeployerHistory(deployerAddress: string): Promise<string[]> {
+  const client = getRedisClient();
+  if (!client) return [];
 
-export function markPosted(state: BotState, tokenAddress: string): void {
-  const addr = tokenAddress.toLowerCase();
-  if (!state.postedTokens.includes(addr)) state.postedTokens.push(addr);
-  saveState(state);
-}
-
-export function getDeployerHistory(state: BotState, deployerAddress: string): string[] {
-  const key = deployerAddress.toLowerCase();
-  return state.deployerHistory[key] ?? [];
-}
-
-export function recordDeployerToken(state: BotState, deployerAddress: string, tokenAddress: string): void {
-  const key = deployerAddress.toLowerCase();
-  if (!state.deployerHistory[key]) {
-    state.deployerHistory[key] = [];
+  try {
+    return await client.smembers<string[]>(deployerKey(deployerAddress));
+  } catch (err) {
+    console.error(`[state] getDeployerHistory failed for ${deployerAddress}:`, err);
+    return [];
   }
-  const tokenLower = tokenAddress.toLowerCase();
-  if (!state.deployerHistory[key].includes(tokenLower)) {
-    state.deployerHistory[key].push(tokenLower);
+}
+
+export async function recordDeployerToken(deployerAddress: string, tokenAddress: string): Promise<void> {
+  const client = getRedisClient();
+  if (!client) return;
+
+  try {
+    await client.sadd(deployerKey(deployerAddress), tokenAddress.toLowerCase());
+  } catch (err) {
+    console.error(`[state] recordDeployerToken failed for ${deployerAddress}:`, err);
   }
-  saveState(state);
 }
 
-export function recordLiquiditySnapshot(state: BotState, poolAddress: string, snap: LiquiditySnapshot): void {
-  const key = poolAddress.toLowerCase();
-  const arr = state.liquidityHistory[key] ?? (state.liquidityHistory[key] = []);
-  arr.push(snap);
-  if (arr.length > 5) arr.shift(); // keep it small — don't need unbounded history
-  // Note: caller must call saveState() after batch operations
+// ─── Liquidity snapshots ────────────────────────────────────────────────────────
+
+/**
+ * Returns up to the last MAX_LIQUIDITY_SNAPSHOTS snapshots for a pool,
+ * oldest first (same ordering the old array-based history used).
+ */
+export async function getLiquidityHistory(poolAddress: string): Promise<LiquiditySnapshot[]> {
+  const client = getRedisClient();
+  if (!client) return [];
+
+  try {
+    const raw = await client.lrange<LiquiditySnapshot>(liquidityKey(poolAddress), 0, -1);
+    return raw ?? [];
+  } catch (err) {
+    console.error(`[state] getLiquidityHistory failed for ${poolAddress}:`, err);
+    return [];
+  }
 }
 
-export function addToWatchlist(state: BotState, tokenAddress: string, poolAddress: string, pairedAsset: string, venue: Venue): void {
-  const key = tokenAddress.toLowerCase();
-  if (!state.watchlist[key]) {
-    state.watchlist[key] = {
+export async function recordLiquiditySnapshot(poolAddress: string, snap: LiquiditySnapshot): Promise<void> {
+  const client = getRedisClient();
+  if (!client) return;
+
+  const key = liquidityKey(poolAddress);
+  try {
+    await client.rpush(key, snap);
+    // Keep only the most recent MAX_LIQUIDITY_SNAPSHOTS entries — LTRIM keeps
+    // indices [start, end] and drops everything outside that range.
+    await client.ltrim(key, -MAX_LIQUIDITY_SNAPSHOTS, -1);
+  } catch (err) {
+    console.error(`[state] recordLiquiditySnapshot failed for ${poolAddress}:`, err);
+  }
+}
+
+// ─── Watchlist ────────────────────────────────────────────────────────────────
+
+/**
+ * Adds a token to the watchlist if it isn't already on it. The entry
+ * expires automatically after `ttlMinutes` (default 2h) — this replaces the
+ * old manual age-filtering that used to happen at read time.
+ */
+export async function addToWatchlist(
+  tokenAddress: string,
+  poolAddress: string,
+  pairedAsset: string,
+  venue: Venue,
+  ttlMinutes: number = DEFAULT_WATCHLIST_TTL_MINUTES
+): Promise<void> {
+  const client = getRedisClient();
+  if (!client) return;
+
+  const key = watchlistKey(tokenAddress);
+  try {
+    const existing = await client.get(key);
+    if (existing) return; // already on the watchlist — leave its TTL untouched
+
+    const entry: WatchlistEntry = {
       tokenAddress: tokenAddress.toLowerCase(),
       poolAddress: poolAddress.toLowerCase(),
       pairedAsset: pairedAsset.toLowerCase(),
       venue,
       firstPostedTimestamp: Date.now(),
     };
-    saveState(state);
+    await client.set(key, entry, { ex: Math.ceil(ttlMinutes * 60) });
+  } catch (err) {
+    console.error(`[state] addToWatchlist failed for ${tokenAddress}:`, err);
   }
 }
 
-export function getWatchlistTokens(state: BotState, maxAgeMinutes: number): WatchlistEntry[] {
-  const cutoff = Date.now() - (maxAgeMinutes * 60 * 1000);
-  return Object.values(state.watchlist).filter(entry => entry.firstPostedTimestamp > cutoff);
+/**
+ * Returns all current watchlist entries. Expiry is handled entirely by
+ * Redis TTL (set in addToWatchlist), so every key returned here is already
+ * within the max-age window — no filtering needed at read time.
+ */
+export async function getWatchlistTokens(): Promise<WatchlistEntry[]> {
+  const client = getRedisClient();
+  if (!client) return [];
+
+  try {
+    const keys = await client.keys("watchlist:*");
+    if (keys.length === 0) return [];
+
+    const values = await client.mget<WatchlistEntry[]>(...keys);
+    return values.filter((v): v is WatchlistEntry => v != null);
+  } catch (err) {
+    console.error("[state] getWatchlistTokens failed:", err);
+    return [];
+  }
+}
+
+// ─── Last scanned block ──────────────────────────────────────────────────────────
+
+export async function getLastScannedBlock(): Promise<string | null> {
+  const client = getRedisClient();
+  if (!client) return null;
+
+  try {
+    const value = await client.get<string>(LAST_SCANNED_BLOCK_KEY);
+    return value ?? null;
+  } catch (err) {
+    console.error("[state] getLastScannedBlock failed:", err);
+    return null;
+  }
+}
+
+export async function setLastScannedBlock(block: string): Promise<void> {
+  const client = getRedisClient();
+  if (!client) return;
+
+  try {
+    await client.set(LAST_SCANNED_BLOCK_KEY, block);
+  } catch (err) {
+    console.error("[state] setLastScannedBlock failed:", err);
+  }
 }

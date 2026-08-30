@@ -8,7 +8,7 @@
  * Exports:
  *   extractAddress(text)                         — pull first 0x address from string
  *   stripAddress(text, address)                  — remove address from text, return remainder
- *   answerTokenQuestion(client, address, question, mode, state) — run full pipeline, return result or error
+ *   answerTokenQuestion(client, address, question, mode) — run full pipeline, return result or error
  */
 
 import { type Address, type PublicClient } from "viem";
@@ -16,7 +16,6 @@ import { fetchTokenMetadata }                from "./erc20.js";
 import { resolveTokenPool, findContractDeployBlock } from "./scan-engine.js";
 import { runRugCheckLLM }                    from "./rugcheck.js";
 import type { RugCheckResult }               from "./rugcheck-types.js";
-import type { BotState }                     from "./state.js";
 import type { HandlerSuccess, HandlerError, HandlerOutcome, TokenMeta } from "./utils/interface.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -52,7 +51,6 @@ export async function answerTokenQuestion(
   tokenAddress: Address,
   userQuestion?: string,
   mode: "alert" | "chat" = "chat",
-  state?: BotState,
   onProgress?: (step: string, message: string) => void,
   quickMode?: boolean,
   sniperMode?: boolean
@@ -153,7 +151,7 @@ export async function answerTokenQuestion(
       resolved.pairedLabel,
       deployBlock,
       meta,
-      { userQuestion, mode, state, venue: resolved.venue, quickMode, sniperMode }
+      { userQuestion, mode, venue: resolved.venue, quickMode, sniperMode }
     );
     console.log(`[rugcheck-handler] Step 4/4: LLM check completed in ${Date.now() - startTime}ms`);
     console.log(`[rugcheck-handler] Total analysis time: ${Date.now() - startTime}ms`);

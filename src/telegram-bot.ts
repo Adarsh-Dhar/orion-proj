@@ -21,8 +21,14 @@ import { sendReport } from "./lib/telegram.js";
 import { registerChatHandler } from "./lib/chat-handler.js";
 import { registerInlineHandler } from "./lib/inline-handler.js";
 import { formatAlertCard } from "./lib/rugcheck.js";
-import { loadState, saveState, alreadyPosted, markPosted, addToWatchlist, getWatchlistTokens, recordLiquiditySnapshot } from "./lib/state.js";
-import type { BotState } from "./lib/state.js";
+import {
+  alreadyPosted,
+  markPosted,
+  addToWatchlist,
+  getWatchlistTokens,
+  recordLiquiditySnapshot,
+  setLastScannedBlock,
+} from "./lib/state.js";
 import { checkLiquidityDelta } from "./lib/evidence.js";
 import { UNISWAP_V3_FACTORY, UNISWAP_V4_POOL_MANAGER } from "./lib/utils/constants.js";
 import { initQuoteAssets } from "./lib/quote-assets.js";
@@ -101,7 +107,6 @@ async function getBlockNumberWithRetry(maxAttempts = 5): Promise<bigint> {
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
-let state: BotState;
 let lastScannedBlock: bigint | null = 0n;
 let sniperRun = 0;
 
@@ -122,8 +127,7 @@ async function sniperTick(): Promise<void> {
     fromBlock = currentBlock - BLOCKS_PER_INTERVAL;
     if (fromBlock < 0n) fromBlock = 0n;
     lastScannedBlock = fromBlock;
-    state.lastScannedBlock = fromBlock.toString();
-    saveState(state);
+    await setLastScannedBlock(fromBlock.toString());
   }
 
   // Always scan every block produced since the last tick — no artificial cap.
@@ -154,16 +158,16 @@ async function sniperTick(): Promise<void> {
     fromBlock,
     toBlock,
     {
-      shouldSkip: (tokenAddress, poolAddress, pairedAsset) => {
+      shouldSkip: async (tokenAddress, poolAddress, pairedAsset) => {
         // New tokens get full check
-        if (!alreadyPosted(state, tokenAddress)) {
+        if (!(await alreadyPosted(tokenAddress))) {
           return false;
         }
         
         // Backfill: this token was posted before the watchlist existed, or before
         // this restart re-discovered it — make sure it's still being monitored.
         // Default to v3 for backfilled entries (historic tokens are v3)
-        addToWatchlist(state, tokenAddress, poolAddress, pairedAsset, "v3");
+        await addToWatchlist(tokenAddress, poolAddress, pairedAsset, "v3", WATCHLIST_MAX_AGE_MINUTES);
         
         console.log(`  [bot] Already posted ${tokenAddress} — skipping full check (watchlist ensured)`);
         return true;
@@ -179,10 +183,9 @@ async function sniperTick(): Promise<void> {
           process.env.TELEGRAM_NOTIFY_CHAT_ID!,
           formatAlertCard(result, meta)
         );
-        markPosted(state, result.tokenAddress);
-        addToWatchlist(state, result.tokenAddress, result.poolAddress, result.pairedAsset, result.venue);
+        await markPosted(result.tokenAddress);
+        await addToWatchlist(result.tokenAddress, result.poolAddress, result.pairedAsset, result.venue, WATCHLIST_MAX_AGE_MINUTES);
       },
-      state: state,
     }
   );
 
@@ -191,15 +194,14 @@ async function sniperTick(): Promise<void> {
   if (lastScannedBlock > currentBlock) {
     lastScannedBlock = currentBlock;
   }
-  state.lastScannedBlock = lastScannedBlock.toString();
-  saveState(state);
+  await setLastScannedBlock(lastScannedBlock.toString());
 
   if (totalPools > 0) {
     console.log(`  Pools: ${totalPools} found | ${processed} checked | ${skipped} skipped`);
   }
 
   // ── Liquidity recheck for watchlist tokens ────────────────────────────────
-  const watchlistEntries = getWatchlistTokens(state, WATCHLIST_MAX_AGE_MINUTES);
+  const watchlistEntries = await getWatchlistTokens();
   console.log(`  Watchlist check: ${watchlistEntries.length} tokens (max age: ${WATCHLIST_MAX_AGE_MINUTES} min)`);
   if (watchlistEntries.length > 0) {
     console.log(`  Checking liquidity for ${watchlistEntries.length} watchlist tokens...`);
@@ -208,12 +210,11 @@ async function sniperTick(): Promise<void> {
         const deltaResult = await checkLiquidityDelta(
           client as any,
           entry.poolAddress as any,
-          state,
           entry.venue          // V3: reads pool.liquidity(); V4: reads StateView.getLiquidity(poolId)
         );
         // Save the current snapshot for next comparison
         if (deltaResult.currentSnapshot) {
-          recordLiquiditySnapshot(state, entry.poolAddress, deltaResult.currentSnapshot);
+          await recordLiquiditySnapshot(entry.poolAddress, deltaResult.currentSnapshot);
         }
         if (deltaResult.liquidityDeltaPct !== null && deltaResult.liquidityDeltaPct < -30) {
           // Significant liquidity drop detected
@@ -232,8 +233,6 @@ async function sniperTick(): Promise<void> {
         console.error(`  [watchlist] Error checking ${entry.tokenAddress}: ${err}`);
       }
     }
-    // Batch save after the loop to avoid excessive file writes
-    saveState(state);
   } else {
     console.log(`  [watchlist] No tokens to monitor (watchlist empty or all entries expired)`);
   }
@@ -262,28 +261,23 @@ async function loop(fn: () => Promise<void>, intervalMs: number): Promise<void> 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  // Load bot state from Redis (or fallback to empty state if Redis unavailable)
-  state = await loadState();
-  lastScannedBlock = state.lastScannedBlock ? BigInt(state.lastScannedBlock) : 0n;
-
-  // Register chat handlers with the loaded state
-  registerChatHandler(bot, client as any, state);
-  registerInlineHandler(bot, client as any, state);
+  // Register chat handlers
+  registerChatHandler(bot, client as any);
+  registerInlineHandler(bot, client as any);
 
   // Load the live quote-asset list before any scanning starts — near-instant
-  // if a disk cache exists, otherwise does one blocking fetch so the first
+  // if a Redis cache exists, otherwise does one blocking fetch so the first
   // scan still has full coverage. Falls back to the static list on failure.
   await initQuoteAssets();
 
   // Always start from the current block at boot — never resume a historical
-  // backlog from disk. This bot is only meant to watch new pools going
-  // forward; any stored watermark from a previous run is discarded so a
+  // backlog from a previous run. This bot is only meant to watch new pools
+  // going forward; any stored watermark from a previous run is discarded so a
   // restart never triggers a multi-thousand-block backfill scan.
   const currentBlock = await getBlockNumberWithRetry();
   console.log(`[bot] Starting fresh from current block ${currentBlock} (no historical backfill)`);
   lastScannedBlock = currentBlock;
-  state.lastScannedBlock = lastScannedBlock.toString();
-  saveState(state);
+  await setLastScannedBlock(lastScannedBlock.toString());
 
   console.log(`${"═".repeat(66)}`);
   console.log(`  RugHound Telegram Bot`);
@@ -323,8 +317,10 @@ async function main(): Promise<void> {
   );
 
   process.on("SIGINT", () => {
-    console.log("\n[bot] Shutting down — saving state…");
-    saveState(state);
+    console.log("\n[bot] Shutting down…");
+    // Nothing to flush — every state mutation (posted tokens, watchlist,
+    // deployer history, liquidity snapshots, last scanned block) is written
+    // to Redis inline as it happens, not batched.
     process.exit(0);
   });
 }

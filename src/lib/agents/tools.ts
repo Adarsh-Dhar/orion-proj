@@ -108,14 +108,7 @@ export async function dispatchDeployerReputationTool(
   const warnings: string[] = [];
   switch (name) {
     case "getDeployerHistory": {
-      if (!ctx.state) {
-        return {
-          deployerSeenBefore: false,
-          deployerPriorTokens: [],
-          warnings: ["No state available for deployer history"],
-        };
-      }
-      const priorTokens = getDeployerHistory(ctx.state, args.deployerAddress as string);
+      const priorTokens = await getDeployerHistory(args.deployerAddress as string);
       return {
         deployerSeenBefore: priorTokens.length > 0,
         deployerPriorTokens: priorTokens,

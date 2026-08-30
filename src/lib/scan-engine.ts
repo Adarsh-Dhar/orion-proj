@@ -406,7 +406,7 @@ export async function scanBlockRange(
     }
 
     // Early skip check (e.g., already posted) before expensive evidence collection
-    if (opts?.shouldSkip && opts.shouldSkip(newToken, poolAddress, pairedLabel)) {
+    if (opts?.shouldSkip && (await opts.shouldSkip(newToken, poolAddress, pairedLabel))) {
       console.log(`  [scan-engine] Skipping ${newToken} — shouldSkip returned true\n`);
       console.log(`${"─".repeat(66)}\n`);
       skipped++;
@@ -436,7 +436,6 @@ export async function scanBlockRange(
     try {
       rugResult = await runRugCheckLLM(client, newToken, poolAddress, pairedLabel, blockNum, meta, {
         mode: "alert",
-        state: opts?.state,
         venue,
         hookAddress,
         v4PoolParams,

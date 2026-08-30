@@ -5,7 +5,7 @@
  * and sends formatted reports back to the chat.
  *
  * Exports:
- *   registerChatHandler(bot, client, state) — registers the message:text handler
+ *   registerChatHandler(bot, client) — registers the message:text handler
  */
 
 import { Bot, Context, InlineKeyboard } from "grammy";
@@ -14,7 +14,6 @@ import { formatChatReply, formatRugReport } from "./rugcheck.js";
 import { sendReport, sendPlain } from "./telegram.js";
 import { getLatestAnalysis } from "./analysis-store.js";
 import type { PublicClient } from "viem";
-import type { BotState } from "./state.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = PublicClient<any>;
@@ -23,8 +22,7 @@ type AnyClient = PublicClient<any>;
 async function sendFullReport(
   ctx: Context,
   client: AnyClient,
-  address: string,
-  state?: BotState
+  address: string
 ): Promise<void> {
   const chatId = ctx.chat?.id;
   if (!chatId) return;
@@ -46,7 +44,7 @@ async function sendFullReport(
     outcome = await Promise.race([
       // isSniperMode=false so we do a real deploy-block binary search instead
       // of using the current block, which would be wrong for non-fresh tokens.
-      answerTokenQuestion(client, address as `0x${string}`, undefined, "chat", state, onProgress, false, false),
+      answerTokenQuestion(client, address as `0x${string}`, undefined, "chat", onProgress, false, false),
       new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error("Analysis timed out after 5 minutes")), TIMEOUT_MS)
       ),
@@ -71,7 +69,7 @@ async function sendFullReport(
   await sendReport(chatId, formatRugReport(outcome.result, outcome.meta));
 }
 
-export function registerChatHandler(bot: Bot<any>, client: AnyClient, state?: BotState): void {
+export function registerChatHandler(bot: Bot<any>, client: AnyClient): void {
   // Register commands first (order matters - commands get priority)
   bot.command("start", async (ctx) => {
     const chatId = ctx.chat?.id;
@@ -124,7 +122,7 @@ export function registerChatHandler(bot: Bot<any>, client: AnyClient, state?: Bo
         await ctx.api.sendMessage(chatId, "Usage: /full 0x... — sends the complete on-chain report.");
         return;
       }
-      await sendFullReport(ctx, client, address, state);
+      await sendFullReport(ctx, client, address);
       return;
     }
 
@@ -198,7 +196,6 @@ export function registerChatHandler(bot: Bot<any>, client: AnyClient, state?: Bo
           address,
           question.length > 0 ? question : undefined,
           "chat",
-          state,
           onProgress,
           isQuickMode,
           isSniperMode
@@ -255,7 +252,7 @@ export function registerChatHandler(bot: Bot<any>, client: AnyClient, state?: Bo
       await ctx.answerCallbackQuery();
 
       // Send the full report
-      await sendFullReport(ctx, client, address as `0x${string}`, state);
+      await sendFullReport(ctx, client, address as `0x${string}`);
     }
   });
 }

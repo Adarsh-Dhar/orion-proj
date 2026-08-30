@@ -22,7 +22,6 @@ import { collectMinimalEvidence } from "./evidence.js";
 import { scoreWithLLM } from "./llm-score.js";
 import { computeScore, breakdownToFlags, breakdownToSummary } from "./scoring.js";
 import type { TokenEvidence } from "./evidence.js";
-import type { BotState } from "./state.js";
 import { getDeployerHistory, recordDeployerToken } from "./state.js";
 import { runOrchestrator } from "./agents/orchestrator.js";
 import type { ToolContext } from "./utils/interface.js";
@@ -104,7 +103,6 @@ export async function runRugCheckLLM(
   opts?: {
     userQuestion?: string;
     mode?: "alert" | "chat";
-    state?: BotState;
     venue?: Venue;
     /** V4 only: hook contract address from the Initialize event */
     hookAddress?: string | null;
@@ -133,12 +131,12 @@ export async function runRugCheckLLM(
   // Since collectMinimalEvidence no longer populates deployer history,
   // we'll handle this via the agent loop's getDeployerHistory tool instead.
   // For now, set defaults that will be updated if the agent runs.
-  if (opts?.state && evidence.deployerAddress) {
-    const priorTokens = getDeployerHistory(opts.state, evidence.deployerAddress);
+  if (evidence.deployerAddress) {
+    const priorTokens = await getDeployerHistory(evidence.deployerAddress);
     evidence.deployerPriorTokens = priorTokens;
     evidence.deployerSeenBefore = priorTokens.length > 0;
-    // Record this new token for future bot-state lookups
-    recordDeployerToken(opts.state, evidence.deployerAddress, tokenAddress);
+    // Record this new token for future deployer-history lookups
+    await recordDeployerToken(evidence.deployerAddress, tokenAddress);
   }
 
   // Log full evidence block so every on-chain fact is visible in stdout
@@ -181,7 +179,6 @@ export async function runRugCheckLLM(
       tokenAddress,
       poolAddress,
       deployBlock,
-      state: opts?.state,
       ownershipRenounced: evidence.ownershipRenounced,
       ownerAddress: evidence.ownerAddress,
       isProxy: evidence.isProxy,

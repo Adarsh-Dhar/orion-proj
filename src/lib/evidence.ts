@@ -929,6 +929,10 @@ export async function collectMinimalEvidence(
           } else {
             initialLiquidityEth = raw;
           }
+        } else {
+          warnings.push(
+            `[pool.slot0.v4] getSlot0 returned sqrtPriceX96=0 despite liquidity=${poolLiquidityRaw} — hook may not have initialized price yet, initialLiquidityEth left unverified`
+          );
         }
       } catch (err) {
         warn(warnings, "pool.slot0.v4", "StateView.getSlot0 failed", err);
@@ -969,6 +973,10 @@ export async function collectMinimalEvidence(
           } else {
             initialLiquidityEth = raw;
           }
+        } else {
+          warnings.push(
+            `[pool.slot0] slot0 returned sqrtPriceX96=0 despite liquidity=${poolLiquidityRaw} — initialLiquidityEth left unverified`
+          );
         }
       } catch (err) {
         warn(warnings, "pool.slot0", "slot0 read failed", err);
@@ -1159,6 +1167,10 @@ export async function reVerifyEvidence(
               const Q96 = 2n ** 96n;
               const raw = Number(formatEther((poolLiquidityRaw * Q96) / sqrtPriceX96));
               initialLiquidityEth = raw > 100_000 ? null : raw;
+            } else {
+              warnings.push(
+                `[reverify:slot0] V4 getSlot0 returned sqrtPriceX96=0 despite liquidity=${poolLiquidityRaw} — hook may not have initialized price yet, initialLiquidityEth left unverified`
+              );
             }
           } catch (err) {
             warn(warnings, "reverify:slot0", "V4 getSlot0 failed", err);
@@ -1189,6 +1201,10 @@ export async function reVerifyEvidence(
               const Q96 = 2n ** 96n;
               const raw = Number(formatEther((poolLiquidityRaw * Q96) / sqrtPriceX96));
               initialLiquidityEth = raw > 100_000 ? null : raw;
+            } else {
+              warnings.push(
+                `[reverify:slot0] V3 slot0 returned sqrtPriceX96=0 despite liquidity=${poolLiquidityRaw} — initialLiquidityEth left unverified`
+              );
             }
           } catch (err) {
             warn(warnings, "reverify:slot0", "V3 slot0 failed", err);

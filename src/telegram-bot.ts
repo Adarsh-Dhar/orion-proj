@@ -4,8 +4,6 @@
  * Scans new Uniswap V3 pools on Base every 5 min, runs the full LLM rug-check
  * pipeline, and sends HIGH/CRITICAL results to a Telegram channel.
  *
- * Also handles chat messages from users who want to query token addresses.
- *
  * Required env vars:
  *   RPC_URL, GEMINI_API_KEY,
  *   TELEGRAM_BOT_TOKEN,
@@ -18,8 +16,6 @@ import { base } from "viem/chains";
 import { bot } from "./lib/telegram.js";
 import { scanBlockRange } from "./lib/scan-engine.js";
 import { sendReport } from "./lib/telegram.js";
-import { registerChatHandler } from "./lib/chat-handler.js";
-import { registerInlineHandler } from "./lib/inline-handler.js";
 import { formatAlertCard } from "./lib/rugcheck.js";
 import {
   alreadyPosted,
@@ -261,10 +257,6 @@ async function loop(fn: () => Promise<void>, intervalMs: number): Promise<void> 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  // Register chat handlers
-  registerChatHandler(bot, client as any);
-  registerInlineHandler(bot, client as any);
-
   // Load the live quote-asset list before any scanning starts — near-instant
   // if a Redis cache exists, otherwise does one blocking fetch so the first
   // scan still has full coverage. Falls back to the static list on failure.
@@ -292,29 +284,17 @@ async function main(): Promise<void> {
   console.log(`  Started  : ${new Date().toISOString()}`);
   console.log(`${"═".repeat(66)}\n`);
 
-  // Run the first scan immediately, then schedule the recurring loop
-  // Register command menu for Telegram's native "/" autocomplete
-  await bot.api.setMyCommands([
-    { command: "start", description: "Show welcome message" },
-    { command: "help", description: "Show usage instructions" },
-    { command: "full", description: "Get full detailed report" },
-  ]).catch((err) => console.error("[bot] Failed to set commands:", err));
-
-  // Start grammy polling FIRST so chat messages are handled immediately,
-  // even while the sniper is running its first (potentially long) scan.
-  bot.start({
-    allowed_updates: ["message", "callback_query", "inline_query"], // Only process relevant updates
-    drop_pending_updates: true, // Drop any pending updates on startup
-  });
-  console.log("[bot] Telegram polling started");
-
-  // Kick off the recurring sniper loop in the background — do NOT await so
-  // bot.start() can begin receiving messages right away. loop() itself runs
-  // the first tick immediately and then schedules every subsequent tick on
-  // a fixed ~5-min cadence (see loop()'s drift-correction above).
+  // Kick off the recurring sniper loop in the background
   loop(sniperTick, SNIPER_INTERVAL_MS).catch((err) =>
     console.error(`[sniper] Fatal loop error: ${err}`)
   );
+
+  // Start Telegram bot to allow posting to channels
+  bot.start({
+    allowed_updates: [], // No chat/inline updates needed - only channel posting
+    drop_pending_updates: true,
+  });
+  console.log("[bot] Telegram bot started (channel posting only)");
 
   process.on("SIGINT", () => {
     console.log("\n[bot] Shutting down…");

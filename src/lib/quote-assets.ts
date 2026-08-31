@@ -108,6 +108,37 @@ const FETCH_HEADERS = {
   "Accept": "application/json",
 };
 
+/** Retry delay used when a refresh cycle fails — much shorter than the
+ *  normal 6h cache TTL, so a one-off transient blip (DNS not warm yet
+ *  right after process start, a Wi-Fi reconnect, etc.) doesn't leave the
+ *  bot without fresh data for hours. */
+const FAILURE_RETRY_MS = 5 * 60 * 1000; // 5 min
+
+/** Retry a fetch a couple of times with a short backoff before giving up.
+ *  Covers the common transient case (DNS/connection not ready yet at
+ *  process startup) without adding real latency for the normal case. */
+async function fetchWithRetry(fn: () => Promise<Response>, attempts = 3): Promise<Response> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts - 1) {
+        const delayMs = 500 * 2 ** i; // 500ms, 1s, 2s...
+        const cause = err instanceof Error && "cause" in err ? (err as any).cause : undefined;
+        console.debug(
+          `[quote-assets] Fetch attempt ${i + 1}/${attempts} failed: ${err instanceof Error ? err.message : err}` +
+          (cause ? ` | Cause: ${cause instanceof Error ? cause.stack ?? cause.message : cause}` : "") +
+          ` — retrying in ${delayMs}ms`
+        );
+        await new Promise((res) => setTimeout(res, delayMs));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 // ─── Redis client ────────────────────────────────────────────────────────────
 
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
@@ -135,7 +166,12 @@ function getRedisClient(): Redis | null {
     });
     return redisClient;
   } catch (err) {
-    console.error("[quote-assets] Failed to initialize Upstash client:", err);
+    const cause = err instanceof Error && "cause" in err ? (err as any).cause : undefined;
+    console.error(
+      "[quote-assets] Failed to initialize Upstash client:",
+      err instanceof Error ? err.message : err,
+      cause ? `| Cause: ${cause instanceof Error ? cause.stack ?? cause.message : cause}` : ""
+    );
     return null;
   }
 }
@@ -195,7 +231,11 @@ async function loadRedisCache(key: string): Promise<CacheEntry | null> {
       return parsed;
     }
   } catch (err) {
-    console.warn(`[quote-assets] Failed to read cache (${key}) from Redis: ${err instanceof Error ? err.message : err}`);
+    const cause = err instanceof Error && "cause" in err ? (err as any).cause : undefined;
+    console.warn(
+      `[quote-assets] Failed to read cache (${key}) from Redis: ${err instanceof Error ? err.message : err}` +
+      (cause ? ` | Cause: ${cause instanceof Error ? cause.stack ?? cause.message : cause}` : "")
+    );
   }
   return null;
 }
@@ -209,7 +249,11 @@ async function saveRedisCache(key: string, tokens: Array<{ address: string; symb
       ex: Math.ceil((CACHE_TTL_MS * 2) / 1000), // generous TTL safety net; refresh keeps it warm well before this
     });
   } catch (err) {
-    console.warn(`[quote-assets] Failed to write cache (${key}) to Redis: ${err instanceof Error ? err.message : err}`);
+    const cause = err instanceof Error && "cause" in err ? (err as any).cause : undefined;
+    console.warn(
+      `[quote-assets] Failed to write cache (${key}) to Redis: ${err instanceof Error ? err.message : err}` +
+      (cause ? ` | Cause: ${cause instanceof Error ? cause.stack ?? cause.message : cause}` : "")
+    );
   }
 }
 
@@ -333,7 +377,11 @@ async function refreshLabels(): Promise<void> {
     console.log(`[quote-assets] Labels refreshed — ${quoteAssetMap.size} known`);
     setTimeout(() => refreshLabels(), CACHE_TTL_MS);
   } catch (err) {
-    console.error(`[quote-assets] Label refresh failed: ${err instanceof Error ? err.message : err}`);
+    const cause = err instanceof Error && "cause" in err ? (err as any).cause : undefined;
+    console.error(
+      `[quote-assets] Label refresh failed: ${err instanceof Error ? err.message : err}` +
+      (cause ? ` | Cause: ${cause instanceof Error ? cause.stack ?? cause.message : cause}` : "")
+    );
     // Retry in 15 min instead of the full 6-hour TTL so a temporary network
     // blip doesn't leave the label cache stale for hours.
     setTimeout(() => refreshLabels(), 15 * 60_000);
@@ -348,7 +396,11 @@ async function refreshGateAssets(): Promise<void> {
     console.log(`[quote-assets] Gate list refreshed — top ${gateAssetList.length} Base tokens by market cap`);
     setTimeout(() => refreshGateAssets(), CACHE_TTL_MS);
   } catch (err) {
-    console.error(`[quote-assets] Gate refresh failed: ${err instanceof Error ? err.message : err}`);
+    const cause = err instanceof Error && "cause" in err ? (err as any).cause : undefined;
+    console.error(
+      `[quote-assets] Gate refresh failed: ${err instanceof Error ? err.message : err}` +
+      (cause ? ` | Cause: ${cause instanceof Error ? cause.stack ?? cause.message : cause}` : "")
+    );
     // Keep whatever gate list is currently in memory (last-good) rather than
     // clearing it — a transient failure should not empty the gate. Retry
     // sooner than the full TTL.
@@ -391,9 +443,11 @@ export async function initQuoteAssets(): Promise<void> {
       await saveRedisCache(GATE_CACHE_KEY, tokens);
       console.log(`[quote-assets] Gate list fetched — top ${gateAssetList.length} Base tokens by market cap`);
     } catch (err) {
+      const cause = err instanceof Error && "cause" in err ? (err as any).cause : undefined;
       console.warn(
         `[quote-assets] Gate fetch failed — falling back to emergency seed (WETH, USDC only) ` +
-        `until the next refresh succeeds. Error: ${err instanceof Error ? err.message : err}`
+        `until the next refresh succeeds. Error: ${err instanceof Error ? err.message : err}` +
+        (cause ? ` | Cause: ${cause instanceof Error ? cause.stack ?? cause.message : cause}` : "")
       );
       setGateAssets(EMERGENCY_SEED_ASSETS.map((t) => ({ address: t.address, symbol: t.label })));
     }
@@ -419,7 +473,11 @@ export async function initQuoteAssets(): Promise<void> {
     await saveRedisCache(LABEL_CACHE_KEY, tokens);
     console.log(`[quote-assets] Fetched ${quoteAssetMap.size} cosmetic labels from Coingecko`);
   } catch (err) {
-    console.warn(`[quote-assets] Cosmetic label fetch failed — continuing with gate-list labels only. Error: ${err instanceof Error ? err.message : err}`);
+    const cause = err instanceof Error && "cause" in err ? (err as any).cause : undefined;
+    console.warn(
+      `[quote-assets] Cosmetic label fetch failed — continuing with gate-list labels only. Error: ${err instanceof Error ? err.message : err}` +
+      (cause ? ` | Cause: ${cause instanceof Error ? cause.stack ?? cause.message : cause}` : "")
+    );
   }
   setTimeout(() => refreshLabels(), CACHE_TTL_MS);
 }

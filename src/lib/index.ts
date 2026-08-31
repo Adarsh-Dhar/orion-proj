@@ -82,10 +82,9 @@ export type {
 } from "./utils/constants.js";
 
 // Re-export key functions from main modules
-export { runRugCheckLLM, formatRugReport, formatAlertCard, formatChatReply } from "./rugcheck.js";
+export { runRugCheckLLM, formatRugReport, formatAlertCard } from "./rugcheck.js";
 export { fetchTokenMetadata } from "./erc20.js";
 export { resolveTokenPool, findContractDeployBlock, scanBlockRange, shortAddr, formatFee, identifyTokens } from "./scan-engine.js";
-export { answerTokenQuestion, extractAddress, stripAddress } from "./rugcheck-handler.js";
 export { alreadyPosted, markPosted, getDeployerHistory, recordDeployerToken, getLiquidityHistory, recordLiquiditySnapshot, addToWatchlist, getWatchlistTokens, getLastScannedBlock, setLastScannedBlock } from "./state.js";
 export { sendReport, sendPlain, bot } from "./telegram.js";
 export { collectMinimalEvidence, checkLiquidityDelta, runSellTest, checkSourceVerification, reVerifyEvidence } from "./evidence.js";

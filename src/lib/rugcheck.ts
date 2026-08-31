@@ -566,33 +566,3 @@ export function formatAlertCard(
 
   return lines.join("\n");
 }
-
-// ─── Chat reply (chat.ts / Telegram DM) ─────────────────────────────────────────
-
-export function formatChatReply(
-  r: RugCheckResult,
-  meta: { name: string; symbol: string; totalSupplyFormatted: string }
-): string {
-  const v = VERDICT_EMOJI[r.verdict];
-  const lines: string[] = [];
-
-  if (r.answer) {
-    lines.push(r.answer, "");
-  }
-
-  const venueTag = r.venue === "v4" ? " · V4" : " · V3";
-  lines.push(`${v} ${r.verdict}  ·  ${formatScore(r.score)}  ·  ${meta.name} ($${meta.symbol})${venueTag}`);
-
-  const topFlags = [...r.flags].sort((a, b) => b.points - a.points).slice(0, 3);
-  if (topFlags.length > 0) {
-    lines.push("");
-    for (const f of topFlags) lines.push(`${SEVERITY_EMOJI[f.severity]} ${f.label} — ${f.detail}`);
-  }
-
-  if (r.venue === "v4" && r.hookAddress && r.hookAddress !== "0x0000000000000000000000000000000000000000") {
-    lines.push("", `🪝 V4 Hook: ${r.hookAddress}`);
-  }
-
-  lines.push("", r.tokenAddress, `Send /full ${r.tokenAddress} for the complete report.`);
-  return lines.join("\n");
-}

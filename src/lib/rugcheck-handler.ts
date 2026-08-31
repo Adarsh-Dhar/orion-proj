@@ -1,18 +1,13 @@
 /**
- * rugcheck-handler.ts — shared pipeline used by both chat.ts and the
- * Telegram bot's message handler.
+ * rugcheck-handler.ts — shared pipeline used by the Telegram bot's sniper.
  *
- * Extracts the 4-step token-analysis flow that previously lived inline in
- * chat.ts so it can be called from anywhere without copy-pasting.
+ * Extracts the 4-step token-analysis flow that can be called from anywhere.
  *
- * Real-time only: there is no more historical-deploy-block / historical-log
- * variant. Every caller (chat, inline, sniper) gets the same current-block
- * evidence anchor. See the doc comment on answerTokenQuestion() below.
+ * Real-time only: every caller gets the same current-block evidence anchor.
+ * See the doc comment on answerTokenQuestion() below.
  *
  * Exports:
- *   extractAddress(text)                         — pull first 0x address from string
- *   stripAddress(text, address)                  — remove address from text, return remainder
- *   answerTokenQuestion(client, address, question, mode) — run full pipeline, return result or error
+ *   answerTokenQuestion(client, address, onProgress) — run full pipeline, return result or error
  */
 
 import { type Address, type PublicClient } from "viem";
@@ -25,19 +20,6 @@ import type { HandlerSuccess, HandlerError, HandlerOutcome, TokenMeta } from "./
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = PublicClient<any>;
 
-// ─── Address extractor ────────────────────────────────────────────────────────
-
-/** Returns the first 0x-prefixed 40-hex-char address found in a string, or null. */
-export function extractAddress(text: string): Address | null {
-  const match = text.match(/0x[a-fA-F0-9]{40}/);
-  return match ? (match[0] as Address) : null;
-}
-
-/** Removes the first occurrence of `address` from `text`, trimmed. */
-export function stripAddress(text: string, address: Address): string {
-  return text.replace(address, "").trim();
-}
-
 // ─── Main pipeline ────────────────────────────────────────────────────────────
 
 /**
@@ -45,19 +27,18 @@ export function stripAddress(text: string, address: Address): string {
  *   1. Resolve Uniswap V3/V4 pool for the token
  *   2. Fetch ERC-20 metadata (name, symbol, supply)
  *   3. Use the current block as the evidence-collection anchor
- *   4. Run LLM rug check (optionally answering userQuestion, in alert or chat mode)
+ *   4. Run LLM rug check in alert mode
  *
  * This used to binary-search the token's exact historical deploy block
  * (~26 RPC calls) and then have evidence.ts scan Etherscan logs all the way
  * back to it. That historical-log path is now removed: Base is on
  * Etherscan's free tier, which blocks the `logs` module entirely
  * ("Free API access is not supported for this chain"), so wide historical
- * scans just failed and returned empty evidence anyway. Every query — chat,
- * inline, and the sniper — now uses the same real-time approach: anchor on
- * the current block and let evidence.ts pull whatever is reachable from
- * there (current owner/balances/LP state, etc.) via live reads instead of
- * historical log reconstruction. The report format is unchanged — it's the
- * same formatRugReport() output either way.
+ * scans just failed and returned empty evidence anyway. Every query now
+ * uses the same real-time approach: anchor on the current block and let
+ * evidence.ts pull whatever is reachable from there (current owner/balances/LP
+ * state, etc.) via live reads instead of historical log reconstruction.
+ * The report format is unchanged — it's the same formatRugReport() output.
  *
  * Returns either { result, meta } on success or { error } on failure so
  * callers can pattern-match without try/catch.
@@ -65,12 +46,9 @@ export function stripAddress(text: string, address: Address): string {
 export async function answerTokenQuestion(
   client: AnyClient,
   tokenAddress: Address,
-  userQuestion?: string,
-  mode: "alert" | "chat" = "chat",
-  onProgress?: (step: string, message: string) => void,
-  quickMode?: boolean
+  onProgress?: (step: string, message: string) => void
 ): Promise<HandlerOutcome> {
-  console.log(`[rugcheck-handler] Starting analysis for ${tokenAddress} in ${mode} mode`);
+  console.log(`[rugcheck-handler] Starting analysis for ${tokenAddress} in alert mode`);
   const startTime = Date.now();
 
   // Quick validation: check if contract exists
@@ -163,7 +141,7 @@ export async function answerTokenQuestion(
       resolved.pairedLabel,
       deployBlock,
       meta,
-      { userQuestion, mode, venue: resolved.venue, quickMode }
+      { mode: "alert", venue: resolved.venue }
     );
     console.log(`[rugcheck-handler] Step 4/4: LLM check completed in ${Date.now() - startTime}ms`);
     console.log(`[rugcheck-handler] Total analysis time: ${Date.now() - startTime}ms`);

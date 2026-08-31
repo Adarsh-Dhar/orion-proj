@@ -15,7 +15,10 @@ Score using this guide:
 - Buy/sell ratio wildly skewed toward sells early: +15 pts, MEDIUM (possible dump in progress)
 - Trade scan data unverified (tradeScanPartial=true): +10 pts, MEDIUM (incomplete analysis)
 
-Call getTradeHistory to get fresh swap-event data before scoring.`;
+There is no tool available to fetch swap-event data — score directly off totalSwaps,
+uniqueTraders, buyCount, sellCount, roundTripTraderPct, and topTraderSwapSharePct already
+present in the evidence (trade history requires historical event data this app no longer
+collects, so these fields will read as zero/unverified for now).`;
 
 export const tradingActivityAgent: SpecialistAgent = {
   name: "trading-activity-agent",

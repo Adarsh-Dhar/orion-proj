@@ -10,15 +10,11 @@
 import type { Address, PublicClient } from "viem";
 import type { ToolContext } from "../utils/interface.js";
 import {
-  scanHolderBalances,
   checkSourceVerification,
   runSellTest as runSellTestEvidence,
-  checkLpLockStatus,
-  scanTradeActivity,
   checkDeployerVelocity,
 } from "../evidence.js";
 import { getDeployerHistory } from "../state.js";
-import { POOL_TOKENS_ABI, ERC20_ABI } from "../utils/constants.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = PublicClient<any>;
@@ -139,78 +135,29 @@ export async function dispatchDeployerReputationTool(
   }
 }
 
-// ─── holder-distribution-agent: getHolderLedger ─────────────────────────────
+// ─── holder-distribution-agent: no tools — DELETED (real-time-only mode) ────
+// getHolderLedger used to call scanHolderBalances (a historical Transfer-log
+// walk); both are gone. The agent now scores directly off the
+// empty/unverified defaults already present in TokenEvidence
+// (deployerPct, top5HoldersPct, top5Holders, preSeededWallets, preSeededPct).
 
-export const HOLDER_DISTRIBUTION_TOOLS = [
-  {
-    name: "getHolderLedger",
-    tier: 4,
-    description:
-      "Fetch top holder balances and % of supply for the token. Returns a map of addresses to balances and percentage breakdown.",
-    parameters: {
-      type: "object",
-      properties: {
-        tokenAddress: { type: "string", description: "The token contract address" },
-        poolAddress: { type: "string", description: "The pool address to exclude from holder analysis" },
-      },
-      required: ["tokenAddress", "poolAddress"],
-    },
-  },
-] as const;
+export const HOLDER_DISTRIBUTION_TOOLS = [] as const;
 
 export async function dispatchHolderDistributionTool(
   name: string,
   _args: Record<string, unknown>,
-  ctx: ToolContext
+  _ctx: ToolContext
 ): Promise<unknown> {
-  switch (name) {
-    case "getHolderLedger": {
-      const warnings: string[] = [];
-      // Scan from deployBlock - 10,000 blocks to capture early distribution
-      // The scanHolderBalances function itself caps the total range to 50,000 blocks
-      const fromBlock = ctx.deployBlock > 10_000n ? ctx.deployBlock - 10_000n : 0n;
-      const result = await scanHolderBalances(ctx.client as AnyClient, ctx.tokenAddress, fromBlock, warnings);
-
-      const totalSupply = (await (ctx.client as AnyClient).readContract({
-        address: ctx.tokenAddress,
-        abi: ERC20_ABI,
-        functionName: "totalSupply",
-      })) as bigint;
-
-      const holders: Array<{ address: string; balance: string; pct: number }> = [];
-      for (const [addr, bal] of result.balances.entries()) {
-        if (addr.toLowerCase() !== ctx.poolAddress.toLowerCase() && bal > 0n) {
-          holders.push({
-            address: addr,
-            balance: bal.toString(),
-            pct: totalSupply > 0n ? Number((bal * 10_000n) / totalSupply) / 100 : 0,
-          });
-        }
-      }
-      holders.sort((a, b) => (BigInt(b.balance) > BigInt(a.balance) ? 1 : -1));
-
-      return {
-        topHolders: holders.slice(0, 10),
-        scanPartial: result.partial,
-        scanFailed: result.failed,
-        warnings,
-      };
-    }
-    default:
-      throw new Error(`Unknown tool for holder-distribution-agent: ${name}`);
-  }
+  throw new Error(`Unknown tool for holder-distribution-agent: ${name}`);
 }
 
-// ─── lp-honeypot-agent: checkLpLock + runSellTest ───────────────────────────
+// ─── lp-honeypot-agent: runSellTest ──────────────────────────────────────────
+// checkLpLock — DELETED (real-time-only mode). Used to call checkLpLockStatus
+// (a historical Mint/ModifyLiquidity-log scan); both are gone. The agent now
+// scores directly off the "unverified" default already present in
+// TokenEvidence.lpPositionStatus.
 
 export const LP_HONEYPOT_TOOLS = [
-  {
-    name: "checkLpLock",
-    tier: 2,
-    description:
-      "Check whether the LP position is burned, locked, or held by an EOA. Returns the LP token ID, position owner, and lock status.",
-    parameters: { type: "object", properties: {}, required: [] },
-  },
   {
     name: "runSellTest",
     tier: 6,
@@ -237,10 +184,6 @@ export async function dispatchLpHoneypotTool(
 ): Promise<unknown> {
   const warnings: string[] = [];
   switch (name) {
-    case "checkLpLock": {
-      const result = await checkLpLockStatus(ctx.client as AnyClient, ctx.poolAddress, ctx.deployBlock, warnings);
-      return { ...result, warnings };
-    }
     case "runSellTest": {
       const result = await runSellTestEvidence(
         ctx.client as AnyClient,
@@ -257,64 +200,18 @@ export async function dispatchLpHoneypotTool(
   }
 }
 
-// ─── trading-activity-agent: getTradeHistory ────────────────────────────────
+// ─── trading-activity-agent: no tools — DELETED (real-time-only mode) ───────
+// getTradeHistory used to call scanTradeActivity (a historical Swap-log
+// walk); both are gone. The agent now scores directly off the zeroed
+// defaults already present in TokenEvidence (totalSwaps, uniqueTraders,
+// buyCount, sellCount, roundTripTraderPct, topTraderSwapSharePct).
 
-export const TRADING_ACTIVITY_TOOLS = [
-  {
-    name: "getTradeHistory",
-    tier: 5,
-    description:
-      "Scan swap events for wash-trading / bot-volume patterns. Returns total swaps, unique traders, buy/sell counts, and round-trip analysis.",
-    parameters: { type: "object", properties: {}, required: [] },
-  },
-] as const;
+export const TRADING_ACTIVITY_TOOLS = [] as const;
 
 export async function dispatchTradingActivityTool(
   name: string,
   _args: Record<string, unknown>,
-  ctx: ToolContext
+  _ctx: ToolContext
 ): Promise<unknown> {
-  switch (name) {
-    case "getTradeHistory": {
-      const warnings: string[] = [];
-      let token0IsTarget = false;
-      try {
-        const token0 = (await (ctx.client as AnyClient).readContract({
-          address: ctx.poolAddress,
-          abi: POOL_TOKENS_ABI,
-          functionName: "token0",
-        })) as string;
-        token0IsTarget = token0.toLowerCase() === ctx.tokenAddress.toLowerCase();
-      } catch (err) {
-        warnings.push(`Failed to read pool token0/token1: ${err instanceof Error ? err.message : String(err)}`);
-      }
-
-      const result = await scanTradeActivity(
-        ctx.client as AnyClient,
-        ctx.poolAddress,
-        ctx.deployBlock,
-        token0IsTarget,
-        warnings
-      );
-
-      const buySellRatio = result.sellCount > 0 ? result.buyCount / result.sellCount : null;
-      const roundTripTraderPct =
-        result.uniqueTraders > 0 ? (result.roundTripTraders.length / result.uniqueTraders) * 100 : null;
-
-      return {
-        totalSwaps: result.totalSwaps,
-        uniqueTraders: result.uniqueTraders,
-        buyCount: result.buyCount,
-        sellCount: result.sellCount,
-        buySellRatio,
-        roundTripTraderCount: result.roundTripTraders.length,
-        roundTripTraderPct,
-        topTraderSwapShare: result.topTraderSwapShare,
-        scanPartial: result.scanPartial,
-        warnings,
-      };
-    }
-    default:
-      throw new Error(`Unknown tool for trading-activity-agent: ${name}`);
-  }
+  throw new Error(`Unknown tool for trading-activity-agent: ${name}`);
 }

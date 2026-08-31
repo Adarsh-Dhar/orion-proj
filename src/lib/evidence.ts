@@ -2,14 +2,11 @@
  * evidence.ts — pure on-chain data collection, no scoring.
  *
  * REAL-TIME ONLY. Every function that used to scan a historical block range
- * via client.getLogs or Etherscan's `logs` module (findDeployer,
- * scanHolderBalances, checkLpLockStatus, checkLiquidityPullHistory,
- * scanTradeActivity, checkPreLiquidityDistribution) has been removed and
- * replaced with a same-signature stub that returns an honest
- * null/empty/"unverified" result immediately — see the "REMOVED" comment
- * above each one. That data is inherently historical (who minted the
- * token, who has held it over time, whether liquidity was ever pulled) and
- * there is no real-time substitute for it; this app no longer tries.
+ * via client.getLogs or Etherscan's `logs` module (checkPreLiquidityDistribution)
+ * has been deleted outright — see the "DELETED" comment above each one. That data is
+ * inherently historical (who minted the token, who has held it over time,
+ * whether liquidity was ever pulled) and there is no real-time substitute
+ * for it; this app no longer tries.
  *
  * Exports:
  *   collectMinimalEvidence(client, tokenAddress, poolAddress, pairedAsset, deployBlock)
@@ -58,12 +55,12 @@ import {
   V4_QUOTER_EXACT_INPUT_SINGLE_ABI,
   type Venue,
 } from "./utils/constants.js";
-import type { TokenEvidence, DeployerResult, HolderScanResult, TradeActivity, ReVerifyResult } from "./utils/interface.js";
+import type { TokenEvidence, ReVerifyResult } from "./utils/interface.js";
 import { analyzeSourceWithLLM } from "./source-audit.js";
 import type { FunctionAudit, SourceAuditMethod } from "./llm-types.js";
 
 // Re-export types that are used by other modules
-export type { TokenEvidence, DeployerResult, HolderScanResult, TradeActivity, ReVerifyResult };
+export type { TokenEvidence, ReVerifyResult };
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = PublicClient<any>;
@@ -108,14 +105,13 @@ async function safeReadNullable<T>(
   catch (err) { warn(warnings, tag, "read failed", err); return null; }
 }
 
-// ─── (Etherscan log-indexing helper — REMOVED, real-time-only mode) ────────
+// ─── (Etherscan log-indexing helper — DELETED, real-time-only mode) ────────
 // This used to fetch ERC-20 Transfer logs from Etherscan's `logs` module for
-// findDeployer / scanHolderBalances / checkPreLiquidityDistribution. Base's
-// free-tier Etherscan key returns "Free API access is not supported for
+// checkPreLiquidityDistribution. Base's free-tier Etherscan key returns "Free API access is not supported for
 // this chain" for every call to that module, and there's no raw-RPC fallback
-// that stays under the free-tier eth_getLogs block-range cap either. All
-// three callers are gone (see below), so this helper is gone too — it only
-// existed to serve them.
+// that stays under the free-tier eth_getLogs block-range cap either. The
+// caller is gone (see below), so this helper is gone too — it only
+// existed to serve it.
 
 // ─── Etherscan deployer tx history helper ────────────────────────────────────
 
@@ -248,52 +244,30 @@ export async function checkDeployerWalletAge(
   return { walletAgeAtDeploySeconds, fundingGapSeconds, fundingSourceAddress };
 }
 
-// ─── New signal: pre-liquidity distribution — REMOVED (real-time-only mode) ──
+// ─── New signal: pre-liquidity distribution — DELETED (real-time-only mode) ──
 // Historically walked Transfer events between mintBlock and scanToBlock to
-// find pre-launch recipients. Same historical-scan problem as findDeployer
-// above; this field isn't wired into any tool or the default evidence
+// find pre-launch recipients. Same historical-scan problem as other
+// deleted functions; this field isn't wired into any tool or the default evidence
 // object today, so it's removed rather than stubbed.
 
-// ─── Deployer finder — REMOVED (real-time-only mode) ─────────────────────────
+// ─── Deployer finder — DELETED (real-time-only mode) ─────────────────────────
+// Used to scan Transfer-from-0x0 (mint) events across a wide historical
+// window — either via Etherscan's `logs` module (blocked on Base's free
+// tier: "Free API access is not supported for this chain") or, as a
+// fallback, raw chunked eth_getLogs (capped too low by free RPC tiers to be
+// practical). Deployer identity is inherently historical — there is no
+// real-time equivalent — so this is deleted outright. It was never called
+// from collectMinimalEvidence (deployerAddress is set to a literal `null` 
+// there) and had no live tool wired to it, so nothing else needs updating.
 
-
-export async function findDeployer(
-  _client: AnyClient,
-  _tokenAddress: Address,
-  _deployBlock: bigint,
-  warnings: string[]
-): Promise<DeployerResult> {
-  // REMOVED (real-time-only mode): this used to scan Transfer-from-0x0 (mint)
-  // events across a wide historical window — either via Etherscan's `logs` 
-  // module (blocked on Base's free tier: "Free API access is not supported
-  // for this chain") or, as a fallback, raw chunked eth_getLogs (capped at
-  // 10 blocks/call on free RPC tiers, making a real deploy-block-to-now scan
-  // impractical). Deployer identity is inherently historical — there is no
-  // real-time equivalent — so this now returns an honest "unknown" instead
-  // of burning calls against a wall that always fails the same way.
-  warn(warnings, "findDeployer", "historical deployer/mint scan removed", "real-time-only mode — deployer identity requires historical event data");
-  return { address: null, mintBlock: null, mintAmount: null, source: "unknown" };
-}
-
-
-
-// ─── Holder balance scan — REMOVED (real-time-only mode) ────────────────────
+// ─── Holder balance scan — DELETED (real-time-only mode) ────────────────────
 // Historically this walked every Transfer event from a wide starting block
 // to the chain head — via Etherscan's `logs` module (blocked on Base's free
-// tier) or, as a fallback, raw chunked eth_getLogs (capped far too low by
-// RPC providers to be practical). Both are gone. getHolderLedger now returns
-// an honest empty/failed result instantly instead of trying and failing.
-
-
-export async function scanHolderBalances(
-  _client: AnyClient,
-  _tokenAddress: Address,
-  fromBlock: bigint,
-  warnings: string[]
-): Promise<HolderScanResult> {
-  warn(warnings, "holderScan", "historical holder scan removed", "real-time-only mode — holder distribution requires historical event data");
-  return { balances: new Map(), partial: false, failed: true, scanFrom: fromBlock, scanTo: fromBlock };
-}
+// tier) or, as a fallback, raw chunked eth_getLogs (capped far too low by RPC
+// providers to be practical). Deleted; the getHolderLedger tool that called
+// this has also been removed (see tools.ts) — holder-distribution-agent now
+// scores directly off the empty/unverified defaults already present in
+// TokenEvidence.
 
 // ─── Liquidity delta check ────────────────────────────────────────────────────
 
@@ -576,74 +550,32 @@ export async function runSellTest(
   }
 }
 
-// ── 2. LP position lock/burn status — REMOVED (real-time-only mode) ─────────
+// ── 2. LP position lock/burn status — DELETED (real-time-only mode) ─────────
 //
 // Historically this scanned Mint/ModifyLiquidity events with client.getLogs
 // over a wide block window to find the LP position and its owner (burned /
-// locked / held by an EOA). That requires walking historical logs, which is
-// exactly the wide-range eth_getLogs / Etherscan `logs`-module pattern this
-// app no longer does (Base's free tier blocks the `logs` module; RPC
-// providers cap block ranges too low to make the raw fallback practical).
-// Kept as a same-signature stub so checkLpLock still "runs" (satisfying the
-// orchestrator's mandatory-tool check) and returns an honest "unverified"
-// instead of quietly failing or spending RPC calls that would fail anyway.
+// locked / held by an EOA). That requires walking historical logs — exactly
+// the wide-range eth_getLogs / Etherscan `logs`-module pattern this app no
+// longer does. Deleted rather than stubbed; lp-honeypot-agent no longer has
+// a checkLpLock tool to call, and scores directly off the "unverified"
+// default already present in TokenEvidence.lpPositionStatus. The
+// orchestrator's mandatory-tool-owner entry for checkLpLock has been removed
+// to match (see orchestrator.ts).
 
-export async function checkLpLockStatus(
-  _client: AnyClient,
-  _poolIdOrAddress: Address,
-  _deployBlock: bigint,
-  warnings: string[],
-  _venue: Venue = "v3"
-): Promise<{ lpTokenId: string | null; lpPositionOwner: string | null; lpPositionStatus: TokenEvidence["lpPositionStatus"] }> {
-  warn(warnings, "lpLock", "historical LP-lock scan removed", "real-time-only mode — LP lock status requires historical event data");
-  return { lpTokenId: null, lpPositionOwner: null, lpPositionStatus: "unverified" };
-}
-
-// ── 3. Liquidity pull history — REMOVED (real-time-only mode) ───────────────
+// ── 3. Liquidity pull history — DELETED (real-time-only mode) ───────────────
 // Historically this counted Burn / negative-liquidityDelta events across the
 // pool's whole history via client.getLogs. Same historical-scan problem as
-// everything else in this section — removed, not just "made to fail".
+// everything else in this section. This was already dead code (never wired
+// into any tool) even as a stub, so it's just gone now.
 
-export async function checkLiquidityPullHistory(
-  _client: AnyClient,
-  _poolIdOrAddress: Address,
-  _deployBlock: bigint,
-  _currentBlock: bigint,
-  _warnings: string[],
-  _venue: Venue = "v3"
-): Promise<{ liquidityEverPulled: boolean; burnEventCount: number }> {
-  return { liquidityEverPulled: false, burnEventCount: 0 };
-}
-
-// ── Trade activity scan — REMOVED (real-time-only mode) ─────────────────────
+// ── Trade activity scan — DELETED (real-time-only mode) ─────────────────────
 // Historically this scanned every Swap event from deployBlock to the current
-// head via client.getLogs to detect wash trading / bot volume. Same
-// historical-scan problem — removed. getTradeHistory now returns an honest
-// empty/unverified result instead of failing chunk-by-chunk against a block
-// range limit.
-
-
-export async function scanTradeActivity(
-  _client: AnyClient,
-  _poolIdOrAddress: Address,
-  _fromBlock: bigint,
-  _token0IsTarget: boolean,
-  warnings: string[],
-  _venue: Venue = "v3"
-): Promise<TradeActivity> {
-  warn(warnings, "tradeScan", "historical trade-activity scan removed", "real-time-only mode — trade history requires historical event data");
-  return {
-    totalSwaps: 0,
-    uniqueTraders: 0,
-    buyCount: 0,
-    sellCount: 0,
-    buyerAddresses: new Set(),
-    sellerAddresses: new Set(),
-    roundTripTraders: [],
-    topTraderSwapShare: 0,
-    scanPartial: true,
-  };
-}
+// head via client.getLogs to detect wash trading / bot volume. That's
+// inherently historical — no real-time equivalent exists — so the function
+// (and its getTradeHistory tool) has been removed entirely rather than kept
+// as a stub. trading-activity-agent now scores directly off the zeroed
+// defaults already present in TokenEvidence (totalSwaps, uniqueTraders, etc.)
+// with no tool call involved.
 
 // ── 4. Source verification — fetch + LLM rubric audit ─────────────────────────
 // Keyword-grep replaced by analyzeSourceWithLLM() (src/lib/source-audit.ts).
@@ -884,7 +816,8 @@ export async function collectMinimalEvidence(
   }
 
   // ── 4. Deployer (removed in real-time-only mode) ─────────────────────────
-  // Deployer identity is inherently historical — see findDeployer() above.
+  // Deployer identity is inherently historical — there is no real-time
+  // equivalent, so it's set to null here.
   const deployer = { address: null, mintBlock: null, mintAmount: null, source: "unknown" };
 
   // ── 5. Pool liquidity + initial ETH value ─────────────────────────────────

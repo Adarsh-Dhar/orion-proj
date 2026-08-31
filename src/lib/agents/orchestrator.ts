@@ -45,9 +45,12 @@ const SPECIALISTS: SpecialistAgent[] = [
  *  that correctly sat out (e.g. lp-honeypot-agent when hasLiquidity=false). */
 const MANDATORY_TOOL_OWNERS: Record<string, string> = {
   getSourceCode: "source-owner-agent",
-  checkLpLock: "lp-honeypot-agent",
   getDeployerHistory: "deployer-reputation-agent",
 };
+// checkLpLock removed: the tool it referred to no longer exists
+// (checkLpLockStatus was deleted along with the other historical-scan
+// stubs). lp-honeypot-agent still runs and still scores lpPositionStatus,
+// it just no longer has a mandatory tool call to satisfy.
 
 /** Flag ids/labels that specifically claim the *deployer's own* wallet holds
  *  a large share of supply — the highest-severity holder-concentration

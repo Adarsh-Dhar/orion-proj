@@ -15,8 +15,9 @@ Score using this guide (all of these apply regardless of hasLiquidity):
 - Total supply = 0 (broken contract): +20 pts, HIGH
 
 Use deployerPct, top5HoldersPct, preSeededWallets, and preSeededPct already present in the
-evidence as your primary signal; only call getHolderLedger if you need the current top-holder
-breakdown to confirm or refine those numbers.`;
+evidence — there is no tool available to refine these further, so score directly off what's
+given (holder distribution requires historical event data this app no longer collects, so
+these fields will read as unverified/empty for now).`;
 
 export const holderDistributionAgent: SpecialistAgent = {
   name: "holder-distribution-agent",

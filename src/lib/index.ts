@@ -20,14 +20,11 @@ export type {
   TokenEvidence,
   TokenMeta,
   ReVerifyResult,
-  HolderScanResult,
   V3PoolLog,
   V4PoolLog,
   ToolCall,
   ToolCallResponse,
   FinalResponse,
-  DeployerResult,
-  TradeActivity,
   MessagePart,
   Message,
   HandlerSuccess,
@@ -91,7 +88,7 @@ export { resolveTokenPool, findContractDeployBlock, scanBlockRange, shortAddr, f
 export { answerTokenQuestion, extractAddress, stripAddress } from "./rugcheck-handler.js";
 export { alreadyPosted, markPosted, getDeployerHistory, recordDeployerToken, getLiquidityHistory, recordLiquiditySnapshot, addToWatchlist, getWatchlistTokens, getLastScannedBlock, setLastScannedBlock } from "./state.js";
 export { sendReport, sendPlain, bot } from "./telegram.js";
-export { collectMinimalEvidence, findDeployer, scanHolderBalances, checkLiquidityDelta, runSellTest, checkLpLockStatus, checkLiquidityPullHistory, scanTradeActivity, checkSourceVerification, reVerifyEvidence } from "./evidence.js";
+export { collectMinimalEvidence, checkLiquidityDelta, runSellTest, checkSourceVerification, reVerifyEvidence } from "./evidence.js";
 export { computeScore, attachComputedScore } from "./scoring.js";
 export { storeAnalysis, getAnalysis, getLatestAnalysis, getAllAnalysisIds, getMultipleAnalyses, updateAnalysis } from "./analysis-store.js";
 export { runOrchestrator } from "./agents/orchestrator.js";

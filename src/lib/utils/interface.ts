@@ -304,14 +304,6 @@ export interface ReVerifyResult {
   warnings: string[];
 }
 
-export interface HolderScanResult {
-  balances: Map<string, bigint>;
-  partial: boolean;   // some chunks failed but we have some data
-  failed: boolean;    // all chunks failed, map is empty
-  scanFrom: bigint;
-  scanTo: bigint;
-}
-
 export interface V3PoolLog {
     venue: "v3";
     args: { token0: Address; token1: Address; fee: number; tickSpacing: number; pool: Address };
@@ -341,25 +333,6 @@ export interface FinalResponse {
   type: "final";
   json: unknown;
   raw: string;
-}
-
-export interface DeployerResult {
-  address: string | null;
-  mintBlock: bigint | null;
-  mintAmount: bigint | null;
-  source: "tight" | "wide" | "unknown";
-}
-
-export interface TradeActivity {
-  totalSwaps: number;
-  uniqueTraders: number;
-  buyCount: number;
-  sellCount: number;
-  buyerAddresses: Set<string>;
-  sellerAddresses: Set<string>;
-  roundTripTraders: string[];
-  topTraderSwapShare: number; // % of total swaps done by the single busiest address
-  scanPartial: boolean;
 }
 
 export interface MessagePart {

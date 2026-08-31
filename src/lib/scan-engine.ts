@@ -560,6 +560,8 @@ export async function scanBlockRange(
       rugResult = await runRugCheckLLM(client, newToken, poolAddress, pairedLabel, blockNum, meta, {
         mode: "alert",
         venue,
+        hookAddress,
+        v4PoolParams,
       });
       const rugCheckDuration = Date.now() - rugCheckStart;
       console.log(`[timing] Rug check completed in ${rugCheckDuration}ms`);

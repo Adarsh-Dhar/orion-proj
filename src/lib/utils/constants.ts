@@ -283,6 +283,16 @@ export const ERC20_TRANSFER_ABI = [{
   outputs: [{ name: "", type: "bool" }],
 }] as const;
 
+export const ERC20_TRANSFER_EVENT_ABI = [{
+  type: "event",
+  name: "Transfer",
+  inputs: [
+    { name: "from",  type: "address", indexed: true },
+    { name: "to",    type: "address", indexed: true },
+    { name: "value", type: "uint256", indexed: false },
+  ],
+}] as const;
+
 export const SUSPICIOUS_SOURCE_KEYWORDS = [
   "blacklist", "_isBlacklisted", "isBlacklisted",
   "setFee", "setTax", "excludeFromFee",

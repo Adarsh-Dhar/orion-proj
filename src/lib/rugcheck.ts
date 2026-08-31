@@ -127,6 +127,7 @@ export async function runRugCheckLLM(
     ownershipRenounced: evidence.ownershipRenounced,
     ownerAddress: evidence.ownerAddress,
     isProxy: evidence.isProxy,
+    candidateHolder: evidence.candidateHolder,
   };
 
   const { result, transcript } = await runOrchestrator(evidence, toolContext, { maxIterations: 12 });

@@ -46,6 +46,7 @@ import {
   ETHERSCAN_API_BASE,
   BASE_CHAIN_ID,
   ERC20_TRANSFER_ABI,
+  ERC20_TRANSFER_EVENT_ABI,
   // V4-specific
   UNISWAP_V4_POOL_MANAGER,
   UNISWAP_V4_STATE_VIEW,
@@ -242,6 +243,53 @@ export async function checkDeployerWalletAge(
   }
 
   return { walletAgeAtDeploySeconds, fundingGapSeconds, fundingSourceAddress };
+}
+
+// ─── Find candidate holder for sell test ────────────────────────────────────
+
+/**
+ * Find a real holder for the sell test by scanning Transfer events from deployBlock
+ * to current block. Uses bounded chunking (10-block chunks) to respect RPC limits.
+ * Returns the first address that currently holds a nonzero balance (excluding null address
+ * and deployer if known), or null if no suitable holder found.
+ */
+async function findCandidateHolder(
+  client: AnyClient,
+  tokenAddress: Address,
+  deployBlock: bigint,
+  deployerAddress: string | null,
+  warnings: string[]
+): Promise<string | null> {
+  const currentBlock = await client.getBlockNumber();
+  const scanTo = currentBlock;
+  const CHUNK = 10n;
+
+  for (let chunkStart = deployBlock; chunkStart <= scanTo; chunkStart += CHUNK) {
+    const chunkEnd = chunkStart + CHUNK - 1n < scanTo ? chunkStart + CHUNK - 1n : scanTo;
+    try {
+      const logs = await client.getLogs({
+        address: tokenAddress,
+        event: ERC20_TRANSFER_EVENT_ABI[0],
+        fromBlock: chunkStart,
+        toBlock: chunkEnd,
+      });
+      for (const log of logs) {
+        const { to } = log.args as { from: Address; to: Address; value: bigint };
+        const toLower = to.toLowerCase();
+        if (toLower === NULL_ADDRESS.toLowerCase()) continue;
+        if (deployerAddress && toLower === deployerAddress.toLowerCase()) continue;
+        // Confirm it still holds a nonzero balance right now
+        const bal = await client.readContract({
+          address: tokenAddress, abi: ERC20_ABI, functionName: "balanceOf", args: [to],
+        }) as bigint;
+        if (bal > 0n) return to;
+      }
+    } catch (err) {
+      warn(warnings, "findCandidateHolder", `chunk ${chunkStart}-${chunkEnd} failed`, err);
+    }
+    await new Promise(resolve => setTimeout(resolve, 150));
+  }
+  return null;
 }
 
 // ─── New signal: pre-liquidity distribution — DELETED (real-time-only mode) ──
@@ -820,7 +868,18 @@ export async function collectMinimalEvidence(
   // equivalent, so it's set to null here.
   const deployer = { address: null, mintBlock: null, mintAmount: null, source: "unknown" };
 
-  // ── 5. Pool liquidity + initial ETH value ─────────────────────────────────
+  // ── 5. Find candidate holder for sell test ───────────────────────────────
+  let candidateHolder: string | null = null;
+  try {
+    candidateHolder = await findCandidateHolder(client, tokenAddress, deployBlock, null, warnings);
+    if (candidateHolder) {
+      console.log(`[evidence] Found candidate holder for sell test: ${candidateHolder}`);
+    }
+  } catch (err) {
+    warn(warnings, "candidateHolder", "failed to find candidate holder", err);
+  }
+
+  // ── 6. Pool liquidity + initial ETH value ─────────────────────────────────
   let poolLiquidityRaw: bigint | null = null;
   let liquidityLocked: boolean | null = null;
   let initialLiquidityEth: number | null = null;
@@ -926,7 +985,7 @@ export async function collectMinimalEvidence(
   // individual null field.
   const hasLiquidity = poolLiquidityRaw !== null && poolLiquidityRaw > 0n;
 
-  // ── 6. Assemble minimal evidence ────────────────────────────────────────────
+  // ── 7. Assemble minimal evidence ────────────────────────────────────────────
   return {
     tokenAddress,
     poolAddress,
@@ -951,6 +1010,8 @@ export async function collectMinimalEvidence(
     deployerMintAmount:     null,
     deployerCurrentBalance: null,
     deployerPct: null,
+
+    candidateHolder:        candidateHolder,
 
     holderScanFrom:    deployBlock.toString(),
     holderScanTo:      deployBlock.toString(),

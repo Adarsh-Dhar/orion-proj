@@ -90,20 +90,25 @@ export async function runSpecialistToolLoop(opts: RunSpecialistOpts): Promise<Sp
   }
 
   const evidenceJson = JSON.stringify(evidence, null, 2);
+  let evidenceText = `${domainPrompt}\n\nTOKEN EVIDENCE:\n${evidenceJson}\n\n`;
+  
+  if (ctx.candidateHolder) {
+    evidenceText += `Candidate holder for sell test: ${ctx.candidateHolder}\n\n`;
+  }
+  
+  evidenceText += `Use your tool if the evidence above doesn't already answer your domain's ` +
+    `questions. When you're done, return ONLY valid JSON of the shape ` +
+    `{ "flags": [ { "id": string, "label": string, "detail": string, ` +
+    `"severity": "LOW"|"MEDIUM"|"HIGH"|"CRITICAL", "points": integer } ] } — ` +
+    `an empty flags array is a valid, expected answer when nothing in your ` +
+    `domain looks risky. No markdown, no prose outside the JSON.`;
+  
   let messages: Message[] = [
     {
       role: "user",
       parts: [
         {
-          text:
-            `${domainPrompt}\n\n` +
-            `TOKEN EVIDENCE:\n${evidenceJson}\n\n` +
-            `Use your tool if the evidence above doesn't already answer your domain's ` +
-            `questions. When you're done, return ONLY valid JSON of the shape ` +
-            `{ "flags": [ { "id": string, "label": string, "detail": string, ` +
-            `"severity": "LOW"|"MEDIUM"|"HIGH"|"CRITICAL", "points": integer } ] } — ` +
-            `an empty flags array is a valid, expected answer when nothing in your ` +
-            `domain looks risky. No markdown, no prose outside the JSON.`,
+          text: evidenceText,
         },
       ],
     },

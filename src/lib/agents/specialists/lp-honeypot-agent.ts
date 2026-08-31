@@ -21,6 +21,8 @@ Score using this guide:
 - Sell test failed (confirmed honeypot): +50 pts, CRITICAL
 - Sell test unverifiable (no suitable holder): +5 pts, LOW (inconclusive)
 
+Use evidence.candidateHolder as the holderAddress for runSellTest. If candidateHolder is null, do not call runSellTest — return a LOW-severity 'sell test unverifiable (no holder found)' flag instead of guessing an address.
+
 If initialLiquidityEth is implausibly large (>1,000,000 ETH), treat it as a math artifact —
 the same as null — and flag it rather than treating it as evidence of healthy liquidity.`;
 

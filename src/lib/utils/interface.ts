@@ -28,6 +28,7 @@ export interface ToolContext {
   ownershipRenounced: boolean | null;
   ownerAddress: string | null;
   isProxy: boolean | null;
+  candidateHolder: string | null;
 }
 
 export interface StoredAnalysis {
@@ -169,6 +170,7 @@ export interface TokenEvidence {
   deployerMintAmount: string | null;  // bigint as string — original mint qty
   deployerCurrentBalance: string | null; // bigint as string — from holder scan
   deployerPct: number | null;         // % of total supply; null = unverified
+  candidateHolder: string | null;    // address with nonzero balance for sell test
 
   // Holder scan metadata
   holderScanFrom: string;    // bigint as string
